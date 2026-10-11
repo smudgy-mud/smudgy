@@ -1,22 +1,26 @@
-//! Sharing a clan folder, or every map in a clan, with the clan's groups.
+//! Sharing a clan folder with the clan's groups.
 //!
-//! A clan folder's Share… (or the clan header's, for every map in the clan)
-//! gives the clan's groups access in the same dialog as a folder share:
-//! recipients are Everyone and the clan's own groups, given one of the map
-//! presets (Reader, Contributor, Editor). It reaches the clan's Clan-owned
-//! maps; a Member-owned map is shared one map at a time by its owners.
+//! A clan folder's Share… gives the clan's groups access in the same dialog
+//! as a folder share: recipients are Everyone and the clan's own groups,
+//! given the map actions, each a checkbox with a preset picker that sets
+//! them (Reader, Contributor, Editor). It reaches the clan's Clan-owned
+//! maps; a Member-owned map is shared one map at a time by its owners. A
+//! group holds one grant over the folder (clans.md §5.3), changed in place
+//! from Who has access.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use iced::Task;
 use iced::alignment::Vertical;
-use iced::widget::{Column, button, checkbox, column, pick_list, row, space, text};
+use iced::widget::{Column, button, checkbox, column, row, space, text};
+use smudgy_cloud::clan_access::{GrantBody, GrantChange};
 use smudgy_cloud::clans::{ClanGrant, ClanGrantFilter, ClanGroup, GrantRecipient, GrantScope};
 use smudgy_cloud::{AtlasId, CloudError, Uuid};
 
 use crate::components::cloud_errors::display_error;
-use crate::presets::{self, Kind, Preset};
+use crate::components::preset_picker::Picker;
+use crate::presets::{self, Facet, Kind, Preset, PresetPick};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
@@ -31,27 +35,38 @@ fn muted(theme: &crate::Theme) -> iced::widget::text::Style {
 }
 
 // ===========================================================================
-// A clan folder's, or the whole clan's, Share dialog
+// A clan folder's Share dialog
 // ===========================================================================
 
-/// State of a clan folder's or clan's Share dialog.
+/// A group's grant over the folder being changed.
+#[derive(Debug, Clone)]
+pub struct FolderEdit {
+    pub grant_id: Uuid,
+    /// The grant's actions before the edit.
+    pub before: BTreeSet<String>,
+    /// The actions it holds once saved.
+    pub actions: BTreeSet<String>,
+    pub busy: bool,
+}
+
+/// State of a clan folder's Share dialog.
 #[derive(Debug, Clone)]
 pub struct ClanShareDialog {
     pub clan_id: Uuid,
-    pub clan_name: String,
-    /// The folder shared; `None` shares every map in the clan.
-    pub folder: Option<(AtlasId, String)>,
+    /// The folder shared.
+    pub folder: (AtlasId, String),
     /// `None` while loading.
     pub groups: Option<Result<Vec<ClanGroup>, String>>,
     pub filter: String,
     pub selected: HashSet<Uuid>,
-    /// What the picked groups are given: a map preset.
-    pub preset: Preset,
+    /// What the picked groups are given.
+    pub actions: BTreeSet<String>,
     pub submitting: bool,
     pub results: Vec<(String, Result<(), CloudError>)>,
     pub close_pending: bool,
-    /// Grants to groups that reach the shared folder or clan.
+    /// Grants to groups that reach the folder.
     pub grants: Option<Result<Vec<ClanGrant>, String>>,
+    pub editing: Option<FolderEdit>,
     pub revoking: Option<Uuid>,
     pub revoke_busy: bool,
     pub manage_error: Option<String>,
@@ -63,10 +78,18 @@ pub enum ClanShareMessage {
     GrantsLoaded(Result<Vec<ClanGrant>, CloudError>),
     FilterChanged(String),
     GroupToggled(Uuid, bool),
-    PresetPicked(Preset),
+    /// What the picked groups are given: a preset, or one action.
+    Preset(PresetPick),
+    ActionToggled(&'static str, bool),
     Submit,
     Submitted(Vec<(String, Result<(), CloudError>)>),
     CloseTick,
+    EditRequested(Uuid),
+    EditPreset(PresetPick),
+    EditToggled(&'static str, bool),
+    EditCancelled,
+    EditSaved,
+    EditResult(Result<(), CloudError>),
     RevokeRequested(Uuid),
     RevokeCancelled,
     RevokeConfirmed,
@@ -77,13 +100,42 @@ fn share(message: ClanShareMessage) -> Message {
     Message::Clan(ClanMessage::Share(message))
 }
 
+/// The map actions the dialog gives, each a checkbox.
+fn shown_actions() -> Vec<&'static str> {
+    Kind::Map.actions().collect()
+}
+
+/// The map preset picker over `actions`.
+fn picker(actions: &BTreeSet<String>) -> Picker {
+    let facet = Facet::of(Preset::MapReader);
+    Picker::new(
+        facet,
+        actions.iter().map(String::as_str),
+        facet.presets(),
+        |_| true,
+    )
+}
+
+/// `actions` with `pick`'s actions checked and the rest of its facet's
+/// unchecked.
+fn apply(actions: &mut BTreeSet<String>, pick: PresetPick) {
+    for (action, on) in pick.changes() {
+        toggle(actions, action, on);
+    }
+}
+
+fn toggle(actions: &mut BTreeSet<String>, action: &str, on: bool) {
+    if on {
+        actions.insert(action.to_string());
+    } else {
+        actions.remove(action);
+    }
+}
+
 impl ClanShareDialog {
     fn scope(&self) -> GrantScope {
-        match &self.folder {
-            Some((atlas_id, _)) => GrantScope::Atlases {
-                ids: vec![*atlas_id],
-            },
-            None => GrantScope::Clan,
+        GrantScope::Atlases {
+            ids: vec![self.folder.0],
         }
     }
 
@@ -114,29 +166,40 @@ impl ClanShareDialog {
             .map_or_else(|| crate::i18n::t!("clan-maps-a-group"), |(_, label)| label)
     }
 
-    /// The grants of this dialog's scope to groups that give map access.
-    fn shown_grants(&self) -> Vec<&ClanGrant> {
+    /// The groups' grants over exactly this folder, whatever they give:
+    /// each group's own, changed here.
+    fn own_grants(&self) -> Vec<&ClanGrant> {
         let Some(Ok(grants)) = &self.grants else {
             return Vec::new();
         };
         let scope = self.scope();
         grants
             .iter()
-            .filter(|grant| grant.recipient.group().is_some() && grant.gives_map_access())
-            .filter(|grant| match (&scope, &grant.scope) {
-                (GrantScope::Clan, GrantScope::Clan) => true,
-                (GrantScope::Atlases { ids: wanted }, GrantScope::Atlases { ids }) => {
-                    wanted.iter().all(|id| ids.contains(id))
-                }
-                _ => false,
+            .filter(|grant| grant.recipient.group().is_some() && grant.scope == scope)
+            .collect()
+    }
+
+    /// Grants to groups naming this folder beside others, which reach it
+    /// but are changed where they were made.
+    fn wider_grants(&self) -> Vec<&ClanGrant> {
+        let Some(Ok(grants)) = &self.grants else {
+            return Vec::new();
+        };
+        grants
+            .iter()
+            .filter(|grant| {
+                grant.recipient.group().is_some()
+                    && grant.gives_map_access()
+                    && matches!(&grant.scope, GrantScope::Atlases { ids }
+                        if ids.len() > 1 && ids.contains(&self.folder.0))
             })
             .collect()
     }
 
-    /// Whether a group already holds a grant here: sharing again would add a
-    /// second one, so changes go through Who has access.
+    /// Whether a group already holds a grant over this folder: sharing
+    /// again would only add to it, so changes go through Who has access.
     fn has_access(&self, group_id: Uuid) -> bool {
-        self.shown_grants()
+        self.own_grants()
             .iter()
             .any(|grant| grant.recipient.group() == Some(group_id))
     }
@@ -153,17 +216,17 @@ impl ClanShareDialog {
 fn dialog_mut(window: &mut MapEditorWindow) -> Option<&mut ClanShareDialog> {
     match &mut window.modal {
         Some(modals::Modal::Clan(modal)) => match modal.as_mut() {
-            ClanModal::Share(dialog) => Some(dialog),
+            ClanModal::Share(dialog) => Some(dialog.as_mut()),
             _ => None,
         },
         _ => None,
     }
 }
 
-fn fetch_grants(window: &MapEditorWindow, clan_id: Uuid, folder: Option<AtlasId>) -> Task<Message> {
+fn fetch_grants(window: &MapEditorWindow, clan_id: Uuid, folder: AtlasId) -> Task<Message> {
     let client = window.cloud.client.clone();
     let filter = ClanGrantFilter {
-        atlas_id: folder,
+        atlas_id: Some(folder),
         ..ClanGrantFilter::default()
     };
     Task::perform(
@@ -182,42 +245,38 @@ pub(super) fn open(
     let Some(atlas_id) = folder else {
         return Update::none();
     };
-    let folder = Some(atlas_id).map(|atlas_id| {
-        let name = window
-            .atlases
-            .iter()
-            .find(|atlas| atlas.id == atlas_id)
-            .map_or_else(
-                || crate::i18n::t!("mapper-this-folder"),
-                |atlas| atlas.name.clone(),
-            );
-        (atlas_id, name)
-    });
-    let folder_id = folder.as_ref().map(|(id, _)| *id);
-    window.modal = Some(modals::Modal::Clan(Box::new(ClanModal::Share(
+    let name = window
+        .atlases
+        .iter()
+        .find(|atlas| atlas.id == atlas_id)
+        .map_or_else(
+            || crate::i18n::t!("mapper-this-folder"),
+            |atlas| atlas.name.clone(),
+        );
+    window.modal = Some(modals::Modal::Clan(Box::new(ClanModal::Share(Box::new(
         ClanShareDialog {
             clan_id,
-            clan_name: window.clans.name(clan_id).unwrap_or_default(),
-            folder,
+            folder: (atlas_id, name),
             groups: None,
             filter: String::new(),
             selected: HashSet::new(),
-            preset: Preset::MapReader,
+            actions: Preset::MapReader.action_set(),
             submitting: false,
             results: Vec::new(),
             close_pending: false,
             grants: None,
+            editing: None,
             revoking: None,
             revoke_busy: false,
             manage_error: None,
         },
-    ))));
+    )))));
     let client = window.cloud.client.clone();
     Update::with_task(Task::batch([
         Task::perform(async move { client.clan_groups(clan_id).await }, |result| {
             share(ClanShareMessage::GroupsLoaded(result))
         }),
-        fetch_grants(window, clan_id, folder_id),
+        fetch_grants(window, clan_id, atlas_id),
     ]))
 }
 
@@ -230,6 +289,7 @@ pub(super) fn update(
     let Some(dialog) = dialog_mut(window) else {
         return Update::none();
     };
+    let (clan_id, folder) = (dialog.clan_id, dialog.folder.0);
     match message {
         ClanShareMessage::GroupsLoaded(result) => {
             dialog.groups = Some(result.map_err(|error| display_error(&error)));
@@ -238,11 +298,16 @@ pub(super) fn update(
         ClanShareMessage::GrantsLoaded(result) => {
             match result {
                 Ok(grants) => {
-                    if dialog
-                        .revoking
-                        .is_some_and(|id| !grants.iter().any(|grant| grant.id == id))
-                    {
+                    let gone = |id: Uuid| !grants.iter().any(|grant| grant.id == id);
+                    if dialog.revoking.is_some_and(gone) {
                         dialog.revoking = None;
+                    }
+                    if dialog
+                        .editing
+                        .as_ref()
+                        .is_some_and(|edit| gone(edit.grant_id))
+                    {
+                        dialog.editing = None;
                     }
                     dialog.grants = Some(Ok(grants));
                     dialog.manage_error = None;
@@ -270,33 +335,37 @@ pub(super) fn update(
             }
             Update::none()
         }
-        ClanShareMessage::PresetPicked(preset) => {
-            if preset.kind() == Kind::Map {
-                dialog.preset = preset;
-            }
+        ClanShareMessage::Preset(pick) => {
+            apply(&mut dialog.actions, pick);
+            Update::none()
+        }
+        ClanShareMessage::ActionToggled(action, on) => {
+            toggle(&mut dialog.actions, action, on);
             Update::none()
         }
         ClanShareMessage::Submit => {
             let picked = dialog.picked();
-            if dialog.submitting || picked.is_empty() {
+            if dialog.submitting || picked.is_empty() || dialog.actions.is_empty() {
                 return Update::none();
             }
             dialog.submitting = true;
             dialog.results.clear();
             dialog.close_pending = false;
-            let clan_id = dialog.clan_id;
             let scope = dialog.scope();
-            let access = dialog.preset;
+            let body = GrantBody {
+                actions: dialog.actions.iter().cloned().collect(),
+                may_grant: None,
+            };
             Update::with_task(Task::perform(
                 async move {
                     let mut results = Vec::with_capacity(picked.len());
                     for (label, group_id) in picked {
                         let result = client
-                            .create_clan_grant(
+                            .grant_in_clan(
                                 clan_id,
                                 GrantRecipient::Group { group_id },
                                 &scope,
-                                access.actions(),
+                                &body,
                             )
                             .await
                             .map(|_| ());
@@ -311,7 +380,6 @@ pub(super) fn update(
             dialog.submitting = false;
             let all_ok = !results.is_empty() && results.iter().all(|(_, result)| result.is_ok());
             dialog.results = results;
-            let (clan_id, folder) = (dialog.clan_id, dialog.folder.as_ref().map(|(id, _)| *id));
             let mut tasks = vec![fetch_grants(window, clan_id, folder)];
             if all_ok {
                 if let Some(dialog) = dialog_mut(window) {
@@ -332,9 +400,77 @@ pub(super) fn update(
             }
             Update::none()
         }
+        ClanShareMessage::EditRequested(id) => {
+            if let Some(grant) = dialog.own_grants().into_iter().find(|grant| grant.id == id) {
+                dialog.editing = Some(FolderEdit {
+                    grant_id: id,
+                    before: grant.actions.clone(),
+                    actions: grant.actions.clone(),
+                    busy: false,
+                });
+                dialog.revoking = None;
+            }
+            Update::none()
+        }
+        ClanShareMessage::EditPreset(pick) => {
+            if let Some(edit) = &mut dialog.editing {
+                apply(&mut edit.actions, pick);
+            }
+            Update::none()
+        }
+        ClanShareMessage::EditToggled(action, on) => {
+            if let Some(edit) = &mut dialog.editing {
+                toggle(&mut edit.actions, action, on);
+            }
+            Update::none()
+        }
+        ClanShareMessage::EditCancelled => {
+            dialog.editing = None;
+            Update::none()
+        }
+        ClanShareMessage::EditSaved => {
+            let Some(edit) = &mut dialog.editing else {
+                return Update::none();
+            };
+            // Exactly the boxes changed, so others' changes meanwhile stay.
+            let change = GrantChange::between(
+                &edit.before,
+                &BTreeSet::new(),
+                &edit.actions,
+                &BTreeSet::new(),
+            );
+            if edit.busy || change.is_empty() {
+                return Update::none();
+            }
+            edit.busy = true;
+            let grant_id = edit.grant_id;
+            Update::with_task(Task::perform(
+                async move {
+                    client
+                        .change_clan_grant(clan_id, grant_id, &change)
+                        .await
+                        .map(|_| ())
+                },
+                |result| share(ClanShareMessage::EditResult(result)),
+            ))
+        }
+        ClanShareMessage::EditResult(result) => {
+            match result {
+                Ok(()) => dialog.editing = None,
+                Err(error) => {
+                    if let Some(edit) = &mut dialog.editing {
+                        edit.busy = false;
+                    }
+                    dialog.manage_error = Some(display_error(&error));
+                }
+            }
+            window.mapper.sync_now();
+            Update::with_task(fetch_grants(window, clan_id, folder))
+        }
         ClanShareMessage::RevokeRequested(id) => {
             dialog.revoking = Some(id);
             dialog.revoke_busy = false;
+            dialog.editing = None;
             Update::none()
         }
         ClanShareMessage::RevokeCancelled => {
@@ -350,7 +486,6 @@ pub(super) fn update(
                 return Update::none();
             }
             dialog.revoke_busy = true;
-            let clan_id = dialog.clan_id;
             Update::with_task(Task::perform(
                 async move { client.delete_clan_grant(clan_id, grant_id).await },
                 |result| share(ClanShareMessage::RevokeResult(result)),
@@ -365,23 +500,38 @@ pub(super) fn update(
                     other => display_error(&other),
                 });
             }
-            let (clan_id, folder) = (dialog.clan_id, dialog.folder.as_ref().map(|(id, _)| *id));
             window.mapper.sync_now();
             Update::with_task(fetch_grants(window, clan_id, folder))
         }
     }
 }
 
+/// The preset picker and a checkbox per map action, over `actions`.
+fn actions_editor<'a>(
+    actions: &BTreeSet<String>,
+    enabled: bool,
+    pick: impl Fn(PresetPick) -> Message + 'a,
+    toggled: impl Fn(&'static str, bool) -> Message + Copy + 'a,
+) -> ThemedElement<'a, Message> {
+    let picker = picker(actions);
+    let mut col = column![picker.view(crate::i18n::t!("mapper-they-can"), enabled.then_some(pick))]
+        .spacing(4);
+    for action in shown_actions() {
+        col = col.push(
+            checkbox(actions.contains(action))
+                .label(presets::action_label(action))
+                .size(13)
+                .text_size(12)
+                .on_toggle_maybe(enabled.then_some(move |on| toggled(action, on))),
+        );
+    }
+    col.into()
+}
+
 /// The dialog's title and body, laid out as a folder share.
 pub(super) fn view(dialog: &ClanShareDialog) -> (String, ThemedElement<'_, Message>) {
-    let title = match &dialog.folder {
-        Some((_, name)) => crate::i18n::t!("mapper-share-folder-title", "name" => name),
-        None => crate::i18n::t!("clan-maps-share-clan-title", "clan" => &dialog.clan_name),
-    };
-    let help = match &dialog.folder {
-        Some(_) => crate::i18n::t!("clan-maps-share-folder-help"),
-        None => crate::i18n::t!("clan-maps-share-clan-help"),
-    };
+    let title = crate::i18n::t!("mapper-share-folder-title", "name" => &dialog.folder.1);
+    let help = crate::i18n::t!("clan-maps-share-folder-help");
 
     let mut list = Column::new().spacing(2);
     match &dialog.groups {
@@ -442,15 +592,12 @@ pub(super) fn view(dialog: &ClanShareDialog) -> (String, ThemedElement<'_, Messa
         list,
     );
 
-    let they_can = column![
-        modals::section_label(crate::i18n::t!("mapper-they-can")),
-        pick_list(Kind::Map.presets(), Some(dialog.preset), |preset| {
-            share(ClanShareMessage::PresetPicked(preset))
-        })
-        .text_size(13),
-    ]
-    .spacing(6)
-    .into();
+    let they_can = actions_editor(
+        &dialog.actions,
+        !dialog.submitting,
+        |pick| share(ClanShareMessage::Preset(pick)),
+        |action, on| share(ClanShareMessage::ActionToggled(action, on)),
+    );
 
     let mut extra: Vec<ThemedElement<'_, Message>> = Vec::new();
     if !dialog.results.is_empty() {
@@ -478,7 +625,7 @@ pub(super) fn view(dialog: &ClanShareDialog) -> (String, ThemedElement<'_, Messa
     }
 
     let manage = access_section(dialog);
-    let enabled = !dialog.submitting && !dialog.picked().is_empty();
+    let enabled = !dialog.submitting && !dialog.picked().is_empty() && !dialog.actions.is_empty();
     let body = modals::folder_share_layout(
         help,
         recipients,
@@ -491,8 +638,18 @@ pub(super) fn view(dialog: &ClanShareDialog) -> (String, ThemedElement<'_, Messa
     (title, body)
 }
 
-/// Who has access: each group holding a grant here, Read or Edit, with
-/// Revoke.
+/// A grant's actions as chips.
+fn badge(grant: &ClanGrant) -> String {
+    presets::chips(grant.actions.iter().map(String::as_str))
+        .into_iter()
+        .map(presets::Chip::label)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Who has access: each group's grant over the folder, with Edit and
+/// Revoke, then the grants naming it beside other folders, changed where
+/// they were made.
 fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
     let mut section = column![text(crate::i18n::t!("mapper-who-has-access")).size(13)].spacing(6);
     if let Some(error) = &dialog.manage_error {
@@ -510,8 +667,9 @@ fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
             section = section.push(text(error.clone()).size(12).style(builtins::text::danger));
         }
         Some(Ok(_)) => {
-            let grants = dialog.shown_grants();
-            if grants.is_empty() {
+            let grants = dialog.own_grants();
+            let wider = dialog.wider_grants();
+            if grants.is_empty() && wider.is_empty() {
                 section = section.push(
                     text(crate::i18n::t!("mapper-not-shared"))
                         .size(12)
@@ -519,11 +677,6 @@ fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
                 );
             }
             for grant in grants {
-                let badge = presets::chips(grant.actions.iter().map(String::as_str))
-                    .into_iter()
-                    .map(presets::Chip::label)
-                    .collect::<Vec<_>>()
-                    .join(" · ");
                 let label = grant.recipient.group().map_or_else(
                     || crate::i18n::t!("clan-maps-a-group"),
                     |group| dialog.group_label(group),
@@ -531,8 +684,11 @@ fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
                 section = section.push(
                     row![
                         text(label).size(13),
-                        text(badge).size(11).style(muted),
+                        text(badge(grant)).size(11).style(muted),
                         space::horizontal(),
+                        button(text(crate::i18n::t!("mapper-edit-flags")).size(11))
+                            .style(builtins::button::secondary)
+                            .on_press(share(ClanShareMessage::EditRequested(grant.id))),
                         button(text(crate::i18n::t!("mapper-revoke")).size(11))
                             .style(builtins::button::secondary)
                             .on_press(share(ClanShareMessage::RevokeRequested(grant.id))),
@@ -540,6 +696,13 @@ fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
                     .spacing(8)
                     .align_y(Vertical::Center),
                 );
+                if let Some(edit) = dialog
+                    .editing
+                    .as_ref()
+                    .filter(|edit| edit.grant_id == grant.id)
+                {
+                    section = section.push(edit_view(edit));
+                }
                 if dialog.revoking == Some(grant.id) {
                     section = section.push(revoke_confirm(
                         dialog.revoke_busy,
@@ -548,9 +711,60 @@ fn access_section(dialog: &ClanShareDialog) -> ThemedElement<'_, Message> {
                     ));
                 }
             }
+            for grant in wider {
+                let label = grant.recipient.group().map_or_else(
+                    || crate::i18n::t!("clan-maps-a-group"),
+                    |group| dialog.group_label(group),
+                );
+                section = section.push(
+                    row![
+                        text(label).size(13),
+                        text(badge(grant)).size(11).style(muted),
+                        space::horizontal(),
+                        text(crate::i18n::t!("clan-share-from-several-folders"))
+                            .size(11)
+                            .style(muted),
+                    ]
+                    .spacing(8)
+                    .align_y(Vertical::Center),
+                );
+            }
         }
     }
     section.into()
+}
+
+/// Changing a group's grant over the folder in place.
+fn edit_view(edit: &FolderEdit) -> ThemedElement<'_, Message> {
+    let unchanged = edit.before == edit.actions;
+    column![
+        actions_editor(
+            &edit.actions,
+            !edit.busy,
+            |pick| share(ClanShareMessage::EditPreset(pick)),
+            |action, on| share(ClanShareMessage::EditToggled(action, on)),
+        ),
+        row![
+            space::horizontal(),
+            button(text(crate::i18n::t!("action-cancel")).size(11))
+                .style(builtins::button::secondary)
+                .on_press_maybe((!edit.busy).then_some(share(ClanShareMessage::EditCancelled))),
+            button(text(crate::i18n::t!("action-save")).size(11))
+                .style(builtins::button::primary)
+                .on_press_maybe(
+                    (!edit.busy && !unchanged).then_some(share(ClanShareMessage::EditSaved))
+                ),
+        ]
+        .spacing(8),
+    ]
+    .spacing(6)
+    .padding(iced::Padding {
+        top: 2.0,
+        bottom: 4.0,
+        left: 12.0,
+        right: 0.0,
+    })
+    .into()
 }
 
 fn revoke_confirm<'a>(busy: bool, cancel: Message, confirm: Message) -> ThemedElement<'a, Message> {
@@ -587,26 +801,48 @@ mod tests {
             builtin: builtin.map(ToString::to_string),
             is_member: true,
             created_by_me: false,
-            actions: std::collections::BTreeSet::new(),
+            actions: BTreeSet::new(),
         }
     }
 
     fn dialog(groups: Vec<ClanGroup>) -> ClanShareDialog {
         ClanShareDialog {
             clan_id: Uuid::from_u128(1),
-            clan_name: "Lantern Company".to_string(),
-            folder: Some((AtlasId(Uuid::from_u128(2)), "Roads".to_string())),
+            folder: (AtlasId(Uuid::from_u128(2)), "Roads".to_string()),
             groups: Some(Ok(groups)),
             filter: String::new(),
             selected: HashSet::new(),
-            preset: Preset::MapReader,
+            actions: Preset::MapReader.action_set(),
             submitting: false,
             results: Vec::new(),
             close_pending: false,
             grants: Some(Ok(Vec::new())),
+            editing: None,
             revoking: None,
             revoke_busy: false,
             manage_error: None,
+        }
+    }
+
+    fn grant(id: u128, group: u128, actions: &[&str], folders: &[u128]) -> ClanGrant {
+        ClanGrant {
+            id: Uuid::from_u128(id),
+            clan_id: Uuid::from_u128(1),
+            recipient: GrantRecipient::Group {
+                group_id: Uuid::from_u128(group),
+            },
+            actions: actions.iter().map(ToString::to_string).collect(),
+            may_grant: None,
+            scope: GrantScope::Atlases {
+                ids: folders
+                    .iter()
+                    .map(|folder| AtlasId(Uuid::from_u128(*folder)))
+                    .collect(),
+            },
+            delegated: Vec::new(),
+            issuer_id: Uuid::from_u128(5),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }
     }
 
@@ -625,27 +861,49 @@ mod tests {
     }
 
     #[test]
-    fn a_group_holding_a_grant_here_is_not_picked_again() {
+    fn a_group_holding_any_grant_over_the_folder_is_edited_not_picked_again() {
         let mut dialog = dialog(vec![group(11, "All clan members", Some("members"))]);
         dialog.selected.insert(Uuid::from_u128(11));
         assert_eq!(dialog.picked().len(), 1);
-        dialog.grants = Some(Ok(vec![ClanGrant {
-            id: Uuid::from_u128(30),
-            clan_id: Uuid::from_u128(1),
-            recipient: GrantRecipient::Group {
-                group_id: Uuid::from_u128(11),
-            },
-            actions: ["area.read".to_string()].into(),
-            may_grant: None,
-            scope: GrantScope::Atlases {
-                ids: vec![AtlasId(Uuid::from_u128(2))],
-            },
-            issuer_id: Uuid::from_u128(5),
-            parent_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }]));
+        // Folder upkeep alone, with no map access, is still its grant here.
+        dialog.grants = Some(Ok(vec![grant(30, 11, &["atlas.rename"], &[2])]));
         assert!(dialog.has_access(Uuid::from_u128(11)));
         assert!(dialog.picked().is_empty());
+    }
+
+    #[test]
+    fn a_grant_naming_several_folders_is_shown_but_not_this_folders_own() {
+        let mut dialog = dialog(vec![group(11, "All clan members", Some("members"))]);
+        dialog.grants = Some(Ok(vec![grant(31, 11, &["area.read"], &[2, 3])]));
+        assert!(!dialog.has_access(Uuid::from_u128(11)));
+        assert_eq!(dialog.wider_grants().len(), 1);
+    }
+
+    #[test]
+    fn a_preset_sets_the_map_boxes_and_leaves_the_rest() {
+        let mut actions: BTreeSet<String> = ["area.read", "area.copy"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        apply(&mut actions, PresetPick::Preset(Preset::MapEditor));
+        assert_eq!(
+            actions,
+            [
+                "area.read",
+                "area.add",
+                "area.edit",
+                "area.remove_content",
+                "area.copy"
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+        );
+        assert_eq!(
+            picker(&actions).state,
+            presets::FacetState::Preset(Preset::MapEditor)
+        );
+        toggle(&mut actions, "area.edit", false);
+        assert_eq!(picker(&actions).state, presets::FacetState::Custom);
     }
 }

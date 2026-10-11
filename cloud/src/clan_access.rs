@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::clans::{ClanGrant, ClanSummary, GrantRecipient, GrantScope};
+use crate::clans::{self, ClanGrant, ClanSummary, DelegatedActions, GrantRecipient, GrantScope};
 use crate::cloud_api::{Auth, CloudApiClient};
 use crate::{AreaId, AtlasId, CloudResult};
 
@@ -79,10 +79,29 @@ pub struct ResourceGrant {
     pub recipient: GrantRecipient,
     /// The actions it gives on this resource.
     pub actions: BTreeSet<String>,
+    /// Those of `actions` that came through a delegation, by delegation.
+    #[serde(default)]
+    pub delegated: Vec<DelegatedActions>,
     pub through: GrantThrough,
     /// The folder, for a grant reaching a map through its folder.
     #[serde(default)]
     pub atlas_id: Option<AtlasId>,
+}
+
+impl ResourceGrant {
+    /// The grant's own actions on this resource: those that came through no
+    /// delegation.
+    #[must_use]
+    pub fn direct_actions(&self) -> BTreeSet<&str> {
+        clans::direct(&self.actions, &self.delegated)
+    }
+
+    /// The delegations `action` came through: empty for one of the grant's
+    /// own actions, or one it does not give here.
+    #[must_use]
+    pub fn delegations_of(&self, action: &str) -> Vec<Uuid> {
+        clans::delegations(&self.delegated, action)
+    }
 }
 
 /// One of a Clan-owned map's outside shares: view only, with a friend
@@ -182,8 +201,9 @@ impl ClanProfilePatch {
     }
 }
 
-/// A clan grant to write: what it gives, and, on a grant that hands out
-/// access (`grant.manage`), what its holder may hand out.
+/// What `POST /clans/{c}/grants` adds to a recipient's grant: actions, and,
+/// on a grant that hands out access (`grant.manage`), what its holder may
+/// hand out.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GrantBody {
     pub actions: Vec<String>,
@@ -211,6 +231,74 @@ impl GrantBody {
             body.insert("may_grant".to_string(), json!(may_grant));
         }
     }
+}
+
+/// A change to a clan grant (`PATCH /clans/{c}/grants/{g}`): actions to add
+/// and remove, and entries of its ceiling (`may_grant`) to add and remove.
+/// The actions it does not name stay as they are, with the delegation each
+/// came through, so changes two editors make to different actions both
+/// land. A grant holding `grant.manage` needs a ceiling and one without it
+/// has none, so a change removing `grant.manage` also removes the ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GrantChange {
+    pub add: BTreeSet<String>,
+    pub remove: BTreeSet<String>,
+    pub ceiling_add: BTreeSet<String>,
+    pub ceiling_remove: BTreeSet<String>,
+}
+
+impl GrantChange {
+    /// The change taking a grant from `before_actions` and `before_ceiling`
+    /// to `after_actions` and `after_ceiling`: what an editor sends for the
+    /// switches it changed. A grant without a ceiling has an empty one.
+    #[must_use]
+    pub fn between(
+        before_actions: &BTreeSet<String>,
+        before_ceiling: &BTreeSet<String>,
+        after_actions: &BTreeSet<String>,
+        after_ceiling: &BTreeSet<String>,
+    ) -> Self {
+        Self {
+            add: after_actions.difference(before_actions).cloned().collect(),
+            remove: before_actions.difference(after_actions).cloned().collect(),
+            ceiling_add: after_ceiling.difference(before_ceiling).cloned().collect(),
+            ceiling_remove: before_ceiling.difference(after_ceiling).cloned().collect(),
+        }
+    }
+
+    /// Whether it names nothing. The server refuses such a change, so an
+    /// editor with nothing changed sends none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty()
+            && self.remove.is_empty()
+            && self.ceiling_add.is_empty()
+            && self.ceiling_remove.is_empty()
+    }
+
+    fn to_body(&self) -> Value {
+        let mut body = Map::new();
+        if let Some(part) = change_part(&self.add, &self.remove) {
+            body.insert("actions".to_string(), part);
+        }
+        if let Some(part) = change_part(&self.ceiling_add, &self.ceiling_remove) {
+            body.insert("may_grant".to_string(), part);
+        }
+        Value::Object(body)
+    }
+}
+
+/// One `{"add", "remove"}` part of a change, without its empty lists; `None`
+/// when it names nothing.
+fn change_part(add: &BTreeSet<String>, remove: &BTreeSet<String>) -> Option<Value> {
+    let mut part = Map::new();
+    if !add.is_empty() {
+        part.insert("add".to_string(), json!(add));
+    }
+    if !remove.is_empty() {
+        part.insert("remove".to_string(), json!(remove));
+    }
+    (!part.is_empty()).then_some(Value::Object(part))
 }
 
 impl CloudApiClient {
@@ -250,10 +338,13 @@ impl CloudApiClient {
             .await
     }
 
-    /// `POST /clans/{c}/grants`: a grant of `body` to `recipient` over
-    /// `scope`. A grant carrying `grant.manage` names its `may_grant`, and
-    /// only clan owners write one; anyone else writes within their own
-    /// delegation.
+    /// `POST /clans/{c}/grants`: gives `recipient` what `body` names over
+    /// `scope`. A recipient holds one grant over a scope: when they already
+    /// hold one, the actions and ceiling join it (200) instead of making
+    /// another (201), and posting never removes anything. A grant carrying
+    /// `grant.manage` names its `may_grant`, and only clan owners write one;
+    /// anyone else adds actions within their delegations, each recorded as
+    /// coming through one.
     ///
     /// # Errors
     /// [`CloudError::InvalidInput`](crate::CloudError::InvalidInput) for
@@ -280,22 +371,26 @@ impl CloudApiClient {
         .await
     }
 
-    /// `PATCH /clans/{c}/grants/{g}`: replaces what the grant gives with
-    /// `body`. Recipient and scope stay.
+    /// `PATCH /clans/{c}/grants/{g}`: applies `change`, leaving the actions
+    /// it does not name as they are; recipient and scope stay. An action it
+    /// removes goes whoever added it. `None` when the change left the grant
+    /// no action, and it went.
     ///
     /// # Errors
-    /// As [`Self::grant_in_clan`].
+    /// [`CloudError::InvalidInput`](crate::CloudError::InvalidInput) for a
+    /// change naming nothing, an action both added and removed, a ceiling
+    /// naming `grant.manage`, or one left without `grant.manage` beside it
+    /// (or `grant.manage` left without one); the uniform 404 for a change
+    /// beyond the caller's authority; otherwise as [`Self::grant_in_clan`].
     pub async fn change_clan_grant(
         &self,
         clan_id: Uuid,
         grant_id: Uuid,
-        body: &GrantBody,
-    ) -> CloudResult<ClanGrant> {
-        let mut request = Map::new();
-        body.insert_into(&mut request);
+        change: &GrantChange,
+    ) -> CloudResult<Option<ClanGrant>> {
         self.patch(
             &format!("/clans/{clan_id}/grants/{grant_id}"),
-            &Value::Object(request),
+            &change.to_body(),
         )
         .await
     }
@@ -327,7 +422,11 @@ mod tests {
                 "grants": [{
                     "grant_id": "33333333-3333-4333-8333-333333333333",
                     "recipient": { "group_id": "44444444-4444-4444-8444-444444444444" },
-                    "actions": ["area.read"],
+                    "actions": ["area.read", "area.edit"],
+                    "delegated": [{
+                        "delegation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "actions": ["area.edit"]
+                    }],
                     "through": "atlas",
                     "atlas_id": "22222222-2222-4222-8222-222222222222"
                 }]
@@ -354,6 +453,11 @@ mod tests {
         .unwrap();
         let grants = rows[0].grants.as_ref().unwrap();
         assert_eq!(grants[0].through, GrantThrough::Atlas);
+        assert_eq!(grants[0].direct_actions(), ["area.read"].into());
+        assert_eq!(
+            grants[0].delegations_of("area.edit"),
+            [Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap()]
+        );
         assert!(rows[0].clan_owned());
         assert!(rows[0].can("area.read"));
         let shares = rows[0].outside_shares.as_ref().unwrap();
@@ -383,6 +487,58 @@ mod tests {
                 "actions": ["grant.inspect", "grant.manage"],
                 "may_grant": ["area.read"]
             })
+        );
+    }
+
+    fn set(actions: &[&str]) -> BTreeSet<String> {
+        actions.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn grant_changes_name_only_what_an_editor_changed() {
+        let unchanged = GrantChange::between(
+            &set(&["area.read"]),
+            &BTreeSet::new(),
+            &set(&["area.read"]),
+            &BTreeSet::new(),
+        );
+        assert!(unchanged.is_empty());
+        assert_eq!(unchanged.to_body(), json!({}));
+
+        let edit = GrantChange::between(
+            &set(&["area.read", "area.add", "secret.read"]),
+            &BTreeSet::new(),
+            &set(&["area.read", "area.edit", "secret.read"]),
+            &BTreeSet::new(),
+        );
+        assert!(!edit.is_empty());
+        assert_eq!(
+            edit.to_body(),
+            json!({ "actions": { "add": ["area.edit"], "remove": ["area.add"] } })
+        );
+
+        // Ending a delegation removes its ceiling with it.
+        let undelegate = GrantChange::between(
+            &set(&["grant.inspect", "grant.manage"]),
+            &set(&["area.read", "area.edit"]),
+            &set(&["grant.inspect"]),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            undelegate.to_body(),
+            json!({
+                "actions": { "remove": ["grant.manage"] },
+                "may_grant": { "remove": ["area.edit", "area.read"] }
+            })
+        );
+
+        let widen = GrantChange {
+            ceiling_add: set(&["area.add"]),
+            ..GrantChange::default()
+        };
+        assert_eq!(
+            widen.to_body(),
+            json!({ "may_grant": { "add": ["area.add"] } })
         );
     }
 

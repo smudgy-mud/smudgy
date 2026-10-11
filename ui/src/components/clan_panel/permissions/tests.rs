@@ -37,10 +37,14 @@ fn fixture() -> (ClanPage, ClanGroup) {
 fn grant(scope: GrantScope, actions: &[&str], ceiling: Option<&[&str]>) -> ClanGrant {
     serde_json::from_value(json!({"id": Uuid::new_v4(), "clan_id": id(1),
         "recipient": {"group_id": id(3)}, "scope": scope, "actions": actions,
-        "may_grant": ceiling, "issuer_id": id(2), "parent_id": null,
+        "may_grant": ceiling, "delegated": [], "issuer_id": id(2),
         "created_at": "2026-10-07T00:00:00Z", "updated_at": "2026-10-07T00:00:00Z"
     }))
     .unwrap()
+}
+
+fn names(actions: &[&str]) -> BTreeSet<String> {
+    actions.iter().map(ToString::to_string).collect()
 }
 
 fn select(editor: &mut Permissions, page: &ClanPage, kind: ScopeKind, n: u128) -> Target {
@@ -60,49 +64,70 @@ fn select(editor: &mut Permissions, page: &ClanPage, kind: ScopeKind, n: u128) -
     target
 }
 
+/// A viewer who is not a clan owner, holding `ceiling` on the package
+/// through a delegation to themselves.
+fn delegate_on_package(page: &mut ClanPage, ceiling: &[&str]) {
+    page.clan.is_owner = false;
+    let mut held = grant(
+        GrantScope::Packages { ids: vec![id(13)] },
+        &[action::MANAGE_GRANTS],
+        Some(ceiling),
+    );
+    held.recipient = GrantRecipient::User { user_id: id(2) };
+    page.grants.push(held);
+}
+
 #[test]
-fn opening_duplicate_delegations_never_merges_their_ceilings() {
+fn an_addition_changes_the_groups_grant_over_the_resource() {
     let (mut page, group) = fixture();
-    let scope = GrantScope::Packages { ids: vec![id(13)] };
-    page.grants = vec![
-        grant(
-            scope.clone(),
-            &[action::MANAGE_GRANTS],
-            Some(&["package.read"]),
-        ),
-        grant(scope, &[action::MANAGE_GRANTS], Some(&["package.publish"])),
-    ];
+    let original = grant(
+        GrantScope::Packages { ids: vec![id(13)] },
+        &["package.read"],
+        None,
+    );
+    page.grants = vec![original.clone()];
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     select(&mut editor, &page, ScopeKind::Packages, 13);
-    assert!(editor.writes(&page).is_empty());
+    assert!(editor.writes().is_empty());
     editor.update(Message::Toggle("package.edit_draft", true), &page);
-    assert!(
-        matches!(editor.writes(&page).as_slice(), [Write::Create(GrantScope::Packages {..}, body)] if body.actions == ["package.edit_draft"] && body.may_grant.is_none())
+    assert_eq!(
+        editor.writes(),
+        [Write::Change(
+            original.id,
+            GrantChange {
+                add: names(&["package.edit_draft"]),
+                ..GrantChange::default()
+            }
+        )]
     );
 }
 
 #[test]
-fn narrowing_one_delegation_does_not_give_it_another_delegations_actions() {
+fn narrowing_a_ceiling_names_only_what_it_removes() {
     let (mut page, group) = fixture();
-    let scope = GrantScope::Packages { ids: vec![id(13)] };
-    let first = grant(
-        scope.clone(),
+    let delegation = grant(
+        GrantScope::Packages { ids: vec![id(13)] },
         &[action::MANAGE_GRANTS],
-        Some(&["package.read"]),
+        Some(&["package.read", "package.publish"]),
     );
-    let second = grant(scope, &[action::MANAGE_GRANTS], Some(&["package.publish"]));
-    page.grants = vec![first, second.clone()];
+    page.grants = vec![delegation.clone()];
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     select(&mut editor, &page, ScopeKind::Packages, 13);
     editor.update(Message::Ceiling("package.publish", false), &page);
-    assert!(
-        matches!(editor.writes(&page).as_slice(), [Write::Patch(key, body)]
-        if *key == second.id && body.may_grant == Some(Vec::new()))
+    assert_eq!(
+        editor.writes(),
+        [Write::Change(
+            delegation.id,
+            GrantChange {
+                ceiling_remove: names(&["package.publish"]),
+                ..GrantChange::default()
+            }
+        )]
     );
 }
 
 #[test]
-fn edits_stay_on_the_selected_resource_and_preserve_unknown_actions() {
+fn edits_stay_on_the_selected_resource_and_leave_unknown_actions_alone() {
     let (mut page, group) = fixture();
     let scope = GrantScope::Areas {
         ids: vec![smudgy_cloud::AreaId(id(11))],
@@ -111,20 +136,54 @@ fn edits_stay_on_the_selected_resource_and_preserve_unknown_actions() {
     page.grants = vec![original.clone()];
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     editor.update(Message::Toggle("area.read", true), &page);
-    assert!(
-        editor.writes(&page).is_empty(),
-        "no global resource permission"
-    );
+    assert!(editor.writes().is_empty(), "no global resource permission");
     select(&mut editor, &page, ScopeKind::Maps, 11);
     editor.update(Message::Toggle("area.read", false), &page);
     select(&mut editor, &page, ScopeKind::Maps, 12);
     editor.update(Message::Toggle("area.read", true), &page);
-    let writes = editor.writes(&page);
-    assert!(
-        matches!(&writes[0], Write::Patch(key, body) if *key == original.id && body.actions == ["area.future"])
+    let writes = editor.writes();
+    assert_eq!(
+        writes[0],
+        Write::Change(
+            original.id,
+            GrantChange {
+                remove: names(&["area.read"]),
+                ..GrantChange::default()
+            }
+        )
     );
     assert!(
         matches!(&writes[1], Write::Create(GrantScope::Areas {ids}, body) if ids == &[smudgy_cloud::AreaId(id(12))] && body.actions == ["area.read"])
+    );
+}
+
+#[test]
+fn a_preset_sets_its_switches_and_leaves_the_rest() {
+    let (page, group) = fixture();
+    let mut editor = Permissions::new(&group, &page, Some(id(2)));
+    let folder = select(&mut editor, &page, ScopeKind::Folders, 10);
+    editor.update(Message::Toggle("area.copy", true), &page);
+    editor.update(
+        Message::Preset(PresetPick::Preset(presets::Preset::MapEditor)),
+        &page,
+    );
+    assert_eq!(
+        editor.drafts[&folder].actions,
+        names(&[
+            "area.read",
+            "area.add",
+            "area.edit",
+            "area.remove_content",
+            "area.copy"
+        ])
+    );
+    editor.update(
+        Message::Preset(PresetPick::Preset(presets::Preset::MapReader)),
+        &page,
+    );
+    assert_eq!(
+        editor.drafts[&folder].actions,
+        names(&["area.read", "area.copy"])
     );
 }
 
@@ -152,7 +211,7 @@ fn broader_grants_cannot_be_silently_removed_from_one_resource() {
     for action in ["area.read", "area.edit"] {
         editor.update(Message::Toggle(action, false), &page);
     }
-    assert!(editor.writes(&page).is_empty());
+    assert!(editor.writes().is_empty());
 }
 
 #[test]
@@ -182,7 +241,7 @@ fn pending_folder_changes_update_inheritance_without_overwriting_direct_map_acce
             .all(|(_, actions, _)| !actions.contains("area.read"))
     );
     editor.update(Message::Toggle("area.read", true), &page);
-    assert!(editor.writes(&page).iter().any(|write| matches!(write, Write::Create(GrantScope::Areas {..}, body) if body.actions == ["area.read"])));
+    assert!(editor.writes().iter().any(|write| matches!(write, Write::Create(GrantScope::Areas {..}, body) if body.actions == ["area.read"])));
 }
 
 #[test]
@@ -193,7 +252,7 @@ fn owner_authority_excludes_member_owned_maps_and_delegates_stay_bounded() {
     let clan_map = select(&mut editor, &page, ScopeKind::Maps, 11);
     assert!(editor.implicit(clan_map, &page));
     editor.update(Message::Toggle("area.read", false), &page);
-    assert!(editor.writes(&page).is_empty());
+    assert!(editor.writes().is_empty());
     page.maps[0].ownership = Some("members".into());
     assert!(!editor.implicit(clan_map, &page));
     assert!(!editor.allowed(clan_map, "area.read", &page));
@@ -214,7 +273,7 @@ fn owner_authority_excludes_member_owned_maps_and_delegates_stay_bounded() {
     assert!(!editor.allowed(package, "package.publish", &page));
     editor.update(Message::Ceiling("package.read", false), &page);
     assert!(
-        editor.writes(&page).is_empty(),
+        editor.writes().is_empty(),
         "delegates cannot change a ceiling"
     );
 }
@@ -230,88 +289,99 @@ fn member_map_edits_keep_the_read_permission_the_server_requires() {
     editor.update(Message::Toggle("area.read", false), &page);
     assert!(editor.drafts[&target].actions.contains("area.read"));
     assert!(
-        matches!(editor.writes(&page).as_slice(), [Write::Create(_, body)]
+        matches!(editor.writes().as_slice(), [Write::Create(_, body)]
         if body.actions == ["area.edit", "area.read"])
     );
     editor.update(Message::Toggle("area.edit", false), &page);
     editor.update(Message::Toggle("area.read", false), &page);
-    assert!(editor.writes(&page).is_empty());
+    assert!(editor.writes().is_empty());
 }
 
 #[test]
-fn separate_delegations_create_separately_bounded_grants() {
+fn a_delegate_adds_through_any_of_their_delegations_in_one_request() {
     let (mut page, group) = fixture();
-    page.clan.is_owner = false;
-    let scope = GrantScope::Packages { ids: vec![id(13)] };
-    for permission in ["package.read", "package.publish"] {
-        let mut held = grant(scope.clone(), &[action::MANAGE_GRANTS], Some(&[permission]));
-        held.recipient = GrantRecipient::User { user_id: id(2) };
-        page.grants.push(held);
-    }
+    delegate_on_package(&mut page, &["package.read"]);
+    delegate_on_package(&mut page, &["package.publish"]);
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     select(&mut editor, &page, ScopeKind::Packages, 13);
     editor.update(Message::Toggle("package.read", true), &page);
     editor.update(Message::Toggle("package.publish", true), &page);
-    let writes = editor.writes(&page);
-    assert_eq!(writes.len(), 2);
-    let mut actions = BTreeSet::new();
-    for write in writes {
-        let Write::Create(_, body) = write else {
-            panic!("expected a new grant")
-        };
-        assert_eq!(body.actions.len(), 1, "each request must fit one ceiling");
-        assert!(body.may_grant.is_none());
-        actions.extend(body.actions);
-    }
-    assert_eq!(
-        actions,
-        BTreeSet::from(["package.read".into(), "package.publish".into()])
+    // The server records which delegation each action came through.
+    assert!(
+        matches!(editor.writes().as_slice(), [Write::Create(_, body)]
+        if body.actions == ["package.publish", "package.read"] && body.may_grant.is_none())
     );
 }
 
 #[test]
-fn a_delegate_cannot_toggle_part_of_an_unmanageable_grant() {
+fn a_delegate_changes_only_the_actions_within_their_ceiling() {
+    let (mut page, group) = fixture();
+    delegate_on_package(&mut page, &["package.read"]);
+    let owners = grant(
+        GrantScope::Packages { ids: vec![id(13)] },
+        &["package.read", "package.publish"],
+        None,
+    );
+    page.grants.push(owners.clone());
+    let mut editor = Permissions::new(&group, &page, Some(id(2)));
+    let target = select(&mut editor, &page, ScopeKind::Packages, 13);
+    assert!(editor.allowed(target, "package.read", &page));
+    assert!(!editor.allowed(target, "package.publish", &page));
+    editor.update(Message::Toggle("package.publish", false), &page);
+    assert!(editor.writes().is_empty());
+    editor.update(Message::Toggle("package.read", false), &page);
+    assert_eq!(
+        editor.writes(),
+        [Write::Change(
+            owners.id,
+            GrantChange {
+                remove: names(&["package.read"]),
+                ..GrantChange::default()
+            }
+        )]
+    );
+}
+
+#[test]
+fn a_delegate_leaves_a_delegating_grants_own_actions() {
     let (mut page, group) = fixture();
     page.clan.is_owner = false;
-    let scope = GrantScope::Packages { ids: vec![id(13)] };
-    let mut held = grant(
-        scope.clone(),
-        &[action::MANAGE_GRANTS],
-        Some(&["package.read"]),
+    page.clan.group_ids = vec![group.id];
+    let delegation = grant(
+        GrantScope::Packages { ids: vec![id(13)] },
+        &[action::MANAGE_GRANTS, "package.read"],
+        Some(&["package.read", "package.publish"]),
     );
-    held.recipient = GrantRecipient::User { user_id: id(2) };
-    page.grants = vec![
-        held,
-        grant(scope, &["package.read", "package.publish"], None),
-    ];
+    page.grants = vec![delegation];
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     let target = select(&mut editor, &page, ScopeKind::Packages, 13);
     assert!(!editor.allowed(target, "package.read", &page));
-    editor.update(Message::Toggle("package.read", false), &page);
-    assert!(editor.writes(&page).is_empty());
+    assert!(editor.allowed(target, "package.publish", &page));
 }
 
 #[test]
-fn refresh_preserves_only_our_changes_and_retry_does_not_duplicate_writes() {
+fn refresh_keeps_our_changes_over_others_and_retry_sends_only_whats_left() {
     let (mut page, group) = fixture();
     let scope = GrantScope::Packages { ids: vec![id(13)] };
-    let original = grant(scope.clone(), &["package.read"], None);
-    page.grants = vec![original];
+    let original = grant(scope, &["package.read"], None);
+    page.grants = vec![original.clone()];
     let mut editor = Permissions::new(&group, &page, Some(id(2)));
     select(&mut editor, &page, ScopeKind::Packages, 13);
     editor.update(Message::Toggle("package.read", false), &page);
     editor.update(Message::Toggle("package.publish", true), &page);
-    // The server applied the addition before another request failed, and
-    // another owner independently granted metadata access.
-    page.grants
-        .push(grant(scope.clone(), &["package.publish"], None));
-    page.grants
-        .push(grant(scope, &["package.edit_metadata"], None));
+    // Another owner granted metadata access meanwhile: our change keeps it.
+    page.grants[0].actions = names(&["package.read", "package.edit_metadata"]);
     editor.refresh(&page);
-    assert!(matches!(
-        editor.writes(&page).as_slice(),
-        [Write::Delete(_)]
-    ));
+    let change = GrantChange {
+        add: names(&["package.publish"]),
+        remove: names(&["package.read"]),
+        ..GrantChange::default()
+    };
+    assert_eq!(editor.writes(), [Write::Change(original.id, change)]);
+    // Once the server has applied it, there is nothing left to send.
+    page.grants[0].actions = names(&["package.publish", "package.edit_metadata"]);
+    editor.refresh(&page);
+    assert!(editor.writes().is_empty());
 }
 
 #[tokio::test]

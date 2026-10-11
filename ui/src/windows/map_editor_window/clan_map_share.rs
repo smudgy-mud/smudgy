@@ -23,7 +23,7 @@ use iced::widget::{
     Column, button, checkbox, column, container, pick_list, row, scrollable, space, text,
 };
 use iced::{Length, Padding};
-use smudgy_cloud::clan_access::GrantBody;
+use smudgy_cloud::clan_access::{GrantBody, GrantChange};
 use smudgy_cloud::clan_maps::{
     AreaOwnershipOffer, MAX_OFFER_RECIPIENTS, MapOwner, MapOwnership, OutsideShare,
 };
@@ -34,7 +34,8 @@ use smudgy_cloud::cloud_api::{FriendView, GrantTreeNode};
 use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, SourceId, Uuid};
 
 use crate::components::cloud_errors::display_error;
-use crate::presets::{self, Kind, Preset};
+use crate::components::preset_picker::Picker;
+use crate::presets::{self, Facet, Kind, Preset, PresetPick};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
@@ -99,9 +100,10 @@ fn map_action(action: &str) -> bool {
 
 /// The rows of who has access to `map`, from the grants the viewer may see:
 /// on a Member-owned map, only the grants naming it alone; on a Clan-owned
-/// one, also those naming it beside other maps, those on its `folder`, and
-/// those on the whole clan. The map's own grants come first and are
-/// editable when the viewer `manages` its access; inherited rows never are.
+/// one, also those naming it beside other maps and giving something on it,
+/// those on its `folder`, and those on the whole clan. The map's own grants
+/// come first and are editable when the viewer `manages` its access;
+/// inherited rows never are.
 #[must_use]
 pub fn access_rows(
     grants: &[ClanGrant],
@@ -129,7 +131,9 @@ pub fn access_rows(
                 .filter(|action| map_action(action))
                 .cloned()
                 .collect();
-            (!actions.is_empty()).then(|| AccessRow {
+            // The map's own grant is listed whatever it gives, so it is
+            // changed rather than given a second time.
+            (!actions.is_empty() || source == RowSource::Map).then(|| AccessRow {
                 grant: grant.clone(),
                 source,
                 editable: manages && source == RowSource::Map,
@@ -206,16 +210,6 @@ pub fn chooser(group: &ClanGroup, all_grants: Option<&[ClanGrant]>) -> Chooser {
 // State
 // ===========================================================================
 
-/// A preset in a pick list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PresetChoice(pub Preset);
-
-impl std::fmt::Display for PresetChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.label())
-    }
-}
-
 /// A recipient in a pick list: a group or a member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecipientChoice {
@@ -232,48 +226,49 @@ impl std::fmt::Display for RecipientChoice {
 pub use super::clan_maps::FolderChoice;
 
 /// A grant being written: a new one ("+ Group / member") or a change to one
-/// of the map's own.
+/// of the map's own. The dialog shows the map actions, each a checkbox with
+/// a preset picker that sets them; what else the grant carries (renaming
+/// and refiling the map, its Clan-owned Secret actions, seeing and handing
+/// out access, actions this client does not know) stays as it is, since a
+/// change names only the boxes changed.
 #[derive(Debug, Clone)]
 pub struct GrantDraft {
     /// The grant changed; `None` for a new one.
     pub grant_id: Option<Uuid>,
+    /// The recipient is picked ("+ Group / member"), not the edited
+    /// grant's.
+    pub picked: bool,
     pub recipient: Option<RecipientChoice>,
-    /// `None` keeps a Custom grant's core actions as they are.
-    pub preset: Option<Preset>,
-    /// The grant's core actions when no preset is picked.
-    pub core: BTreeSet<String>,
-    /// The actions no preset holds, checked.
-    pub separate: BTreeSet<String>,
-    /// What the grant carries that no Map preset or checkbox holds
-    /// (renaming and refiling the map, its Clan-owned Secret actions,
-    /// seeing and handing out access, actions this client does not know),
-    /// kept as they are whatever preset is picked.
-    pub kept: BTreeSet<String>,
-    /// What a grant that hands out access may hand out, kept as it is.
-    pub may_grant: Option<BTreeSet<String>>,
+    /// The actions the grant holds once saved.
+    pub actions: BTreeSet<String>,
+    /// The grant's actions before the edit; empty for a new grant.
+    pub before: BTreeSet<String>,
     pub error: Option<String>,
 }
 
 impl GrantDraft {
-    /// The actions the grant carries once saved.
-    #[must_use]
-    pub fn actions(&self) -> BTreeSet<String> {
-        let mut actions: BTreeSet<String> = match self.preset {
-            Some(preset) => preset.action_set(),
-            None => self.core.clone(),
-        };
-        actions.extend(self.separate.iter().cloned());
-        actions.extend(self.kept.iter().cloned());
-        actions
+    /// A new grant, with `actions` checked to start.
+    fn new(actions: BTreeSet<String>) -> Self {
+        Self {
+            grant_id: None,
+            picked: true,
+            recipient: None,
+            actions,
+            before: BTreeSet::new(),
+            error: None,
+        }
     }
 
-    /// What the grant hands out once saved: what it may hand out now, while
-    /// it keeps handing out access.
+    /// The change a save sends for an edited grant: exactly the boxes
+    /// changed.
     #[must_use]
-    pub fn may_grant(&self) -> Option<Vec<String>> {
-        self.kept
-            .contains(action::MANAGE_GRANTS)
-            .then(|| self.may_grant.iter().flatten().cloned().collect())
+    pub fn change(&self) -> GrantChange {
+        GrantChange::between(
+            &self.before,
+            &BTreeSet::new(),
+            &self.actions,
+            &BTreeSet::new(),
+        )
     }
 }
 
@@ -429,8 +424,7 @@ impl ClanMapShareDialog {
             grants
                 .iter()
                 .filter(|grant| {
-                    grant.parent_id.is_none()
-                        && grant.actions.contains(action::MANAGE_GRANTS)
+                    grant.actions.contains(action::MANAGE_GRANTS)
                         && self.is_mine(grant.recipient)
                         && self.covers_map(&grant.scope)
                 })
@@ -439,40 +433,74 @@ impl ClanMapShareDialog {
         )
     }
 
-    /// Whether the viewer may give a grant on the map `actions`: a delegate
-    /// only actions a delegation hands out, within one of their
-    /// delegations covering the map.
+    /// Whether the viewer may give or take away `action` on the map's own
+    /// grants: a delegate only an action one of their delegations covering
+    /// the map hands out, whoever gave it (clans.md §1.2).
     #[must_use]
-    pub fn may_hand_out(&self, actions: &BTreeSet<String>) -> bool {
+    pub fn may_toggle(&self, action: &str) -> bool {
         self.ceilings().is_none_or(|ceilings| {
-            actions.iter().all(|action| presets::delegable(action))
-                && ceilings.iter().any(|ceiling| actions.is_subset(ceiling))
+            presets::delegable(action) && ceilings.iter().any(|ceiling| ceiling.contains(action))
         })
     }
 
-    /// Whether the viewer may change or remove `grant`, one of the map's
-    /// own: a delegate only one that hands nothing out and lies within one
-    /// of their delegations.
-    fn may_change(&self, grant: &ClanGrant) -> bool {
-        self.ceilings().is_none()
-            || (grant.may_grant.is_none()
-                && !grant.actions.contains(action::MANAGE_GRANTS)
-                && self.may_hand_out(&grant.actions))
+    /// Whether the draft's box for `action` may change: as
+    /// [`Self::may_toggle`], and never `area.read` on a Member-owned map,
+    /// which its grants always give.
+    fn toggles(&self, action: &str) -> bool {
+        self.may_toggle(action) && !(self.member_owned() && action == action::READ_AREA)
     }
 
-    /// The presets a grant here may take beside what it `kept`.
+    /// Whether the viewer may change `grant`, one of the map's own: a
+    /// delegate not one that hands out access.
+    fn may_change(&self, grant: &ClanGrant) -> bool {
+        self.ceilings().is_none() || !grant.actions.contains(action::MANAGE_GRANTS)
+    }
+
+    /// Whether the viewer may remove `grant`, one of the map's own: a
+    /// delegate only one whose every action they could take away.
+    fn may_remove(&self, grant: &ClanGrant) -> bool {
+        self.may_change(grant) && grant.actions.iter().all(|action| self.may_toggle(action))
+    }
+
+    /// The map actions a draft shows as checkboxes: on a Member-owned map,
+    /// those its own grants take.
     #[must_use]
-    pub fn preset_choices(&self, kept: &BTreeSet<String>) -> Vec<Preset> {
+    pub fn shown_actions(&self) -> Vec<&'static str> {
         Kind::Map
-            .presets()
-            .iter()
-            .copied()
-            .filter(|preset| {
-                let mut actions = preset.action_set();
-                actions.extend(kept.iter().cloned());
-                self.may_hand_out(&actions)
-            })
+            .actions()
+            .filter(|action| !self.member_owned() || presets::takes_on_member_map(action))
             .collect()
+    }
+
+    /// The draft's preset picker, offering the choices whose boxes the
+    /// viewer may set.
+    #[must_use]
+    pub fn picker(&self, draft: &GrantDraft) -> Picker {
+        let facet = Facet::of(Preset::MapReader);
+        Picker::new(
+            facet,
+            draft.actions.iter().map(String::as_str),
+            facet.presets(),
+            |pick| {
+                pick.changes().all(|(action, on)| {
+                    draft.actions.contains(action) == on || self.toggles(action)
+                })
+            },
+        )
+    }
+
+    /// The map's own grant to `recipient`, if they hold one.
+    fn own_grant(&self, recipient: GrantRecipient) -> Option<&ClanGrant> {
+        match &self.grants {
+            Some(Ok(grants)) => grants.iter().find(|grant| {
+                grant.recipient == recipient
+                    && grant.scope
+                        == GrantScope::Areas {
+                            ids: vec![self.area_id],
+                        }
+            }),
+            _ => None,
+        }
     }
 
     fn group(&self, id: Uuid) -> Option<&ClanGroup> {
@@ -524,15 +552,9 @@ impl ClanMapShareDialog {
 
     /// Who "+ Group / member" may pick: the clan's groups (Everyone first,
     /// then the custom groups) and, when the member list is readable, its
-    /// members; none that already holds the map's own grant.
+    /// members. Picking one who holds the map's own grant edits it.
     #[must_use]
     pub fn recipient_choices(&self) -> Vec<RecipientChoice> {
-        let own: Vec<GrantRecipient> = self
-            .rows()
-            .into_iter()
-            .filter(|row| row.source == RowSource::Map)
-            .map(|row| row.grant.recipient)
-            .collect();
         let mut choices = Vec::new();
         if let Some(Ok(groups)) = &self.groups {
             let mut ordered: Vec<&ClanGroup> = groups
@@ -563,22 +585,7 @@ impl ClanMapShareDialog {
                 });
             }
         }
-        choices.retain(|choice| !own.contains(&choice.recipient));
         choices
-    }
-
-    /// The actions no preset holds that a grant here may carry: on a
-    /// Member-owned map, those its own grants take; for a delegate, those
-    /// a delegation of theirs hands out.
-    #[must_use]
-    pub fn separate_actions(&self) -> Vec<&'static str> {
-        Kind::Map
-            .separate()
-            .iter()
-            .copied()
-            .filter(|action| !self.member_owned() || presets::takes_on_member_map(action))
-            .filter(|action| self.may_hand_out(&BTreeSet::from([(*action).to_string()])))
-            .collect()
     }
 
     /// Whether `member` reads the map, as far as the grants and groups the
@@ -616,51 +623,37 @@ impl ClanMapShareDialog {
     }
 
     /// The draft that changes `grant_id`, one of the map's own grants the
-    /// viewer may change: what the dialog shows of it (the Map preset's
-    /// actions and the checkboxes), and everything else it carries (renaming
-    /// and refiling, Clan-owned Secret actions, seeing and handing out
-    /// access, actions this client does not know, and what the grant may
-    /// hand out) kept as it is.
+    /// viewer may change.
     #[must_use]
     pub fn edit_draft(&self, grant_id: Uuid) -> Option<GrantDraft> {
         let row = self
             .rows()
             .into_iter()
             .find(|row| row.grant.id == grant_id && row.editable)?;
-        let separate_ok = self.separate_actions();
-        let separate: BTreeSet<String> = row
-            .actions
-            .iter()
-            .filter(|action| separate_ok.contains(&action.as_str()))
-            .cloned()
-            .collect();
-        let core: BTreeSet<String> = row
-            .actions
-            .iter()
-            .filter(|action| Kind::Map.core().contains(&action.as_str()))
-            .cloned()
-            .collect();
-        let kept: BTreeSet<String> = row
-            .grant
-            .actions
-            .iter()
-            .filter(|action| !core.contains(*action) && !separate.contains(*action))
-            .cloned()
-            .collect();
         Some(GrantDraft {
             grant_id: Some(grant_id),
+            picked: false,
             recipient: Some(RecipientChoice {
                 recipient: row.grant.recipient,
                 label: self.recipient_label(row.grant.recipient),
             }),
-            preset: presets::core_preset(Kind::Map, core.iter().map(String::as_str))
-                .filter(|preset| preset.action_set() == core),
-            core,
-            separate,
-            kept,
-            may_grant: row.grant.may_grant.clone(),
+            actions: row.grant.actions.clone(),
+            before: row.grant.actions.clone(),
             error: None,
         })
+    }
+
+    /// A new grant's draft: Reader when the viewer may give it, which a
+    /// Member-owned map's grants always are.
+    #[must_use]
+    pub fn new_draft(&self) -> GrantDraft {
+        let reader = Preset::MapReader.action_set();
+        let start = if self.member_owned() || reader.iter().all(|action| self.may_toggle(action)) {
+            reader
+        } else {
+            BTreeSet::new()
+        };
+        GrantDraft::new(start)
     }
 
     /// The members who could own the map with the viewer: the clan's
@@ -695,8 +688,8 @@ pub enum ClanMapShareMessage {
     AddStarted,
     EditStarted(Uuid),
     DraftRecipient(RecipientChoice),
-    DraftPreset(PresetChoice),
-    DraftSeparate(&'static str, bool),
+    DraftPreset(PresetPick),
+    DraftAction(&'static str, bool),
     DraftCancelled,
     DraftSaved,
     RemoveRequested(Uuid),
@@ -1116,6 +1109,20 @@ fn refused(error: CloudError, refusal: String) -> String {
 // Update
 // ===========================================================================
 
+/// Checks or unchecks one of the draft's boxes, when the viewer may.
+fn draft_toggle(dialog: &mut ClanMapShareDialog, action: &'static str, on: bool) {
+    if !dialog.toggles(action) {
+        return;
+    }
+    if let Some(draft) = &mut dialog.draft {
+        if on {
+            draft.actions.insert(action.to_string());
+        } else {
+            draft.actions.remove(action);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn update(
     window: &mut MapEditorWindow,
@@ -1159,16 +1166,7 @@ pub(super) fn update(
     let (clan_id, area_id) = (dialog.clan_id, dialog.area_id);
     match message {
         ClanMapShareMessage::AddStarted => {
-            dialog.draft = Some(GrantDraft {
-                grant_id: None,
-                recipient: None,
-                preset: dialog.preset_choices(&BTreeSet::new()).first().copied(),
-                core: BTreeSet::new(),
-                separate: BTreeSet::new(),
-                kept: BTreeSet::new(),
-                may_grant: None,
-                error: None,
-            });
+            dialog.draft = Some(dialog.new_draft());
             dialog.removing = None;
         }
         ClanMapShareMessage::EditStarted(grant_id) => {
@@ -1179,24 +1177,36 @@ pub(super) fn update(
             dialog.removing = None;
         }
         ClanMapShareMessage::DraftRecipient(choice) => {
+            // A recipient holds one grant over the map: picking one who
+            // does edits it instead (clans.md §5.3).
+            let loaded = dialog
+                .own_grant(choice.recipient)
+                .map(|grant| grant.id)
+                .and_then(|grant_id| dialog.edit_draft(grant_id));
+            let fresh = dialog.new_draft();
             if let Some(draft) = &mut dialog.draft {
-                draft.recipient = Some(choice);
-            }
-        }
-        ClanMapShareMessage::DraftPreset(PresetChoice(preset)) => {
-            if let Some(draft) = &mut dialog.draft {
-                draft.preset = Some(preset);
-            }
-        }
-        ClanMapShareMessage::DraftSeparate(action, on) => {
-            if let Some(draft) = &mut dialog.draft {
-                if on {
-                    draft.separate.insert(action.to_string());
-                } else {
-                    draft.separate.remove(action);
+                match loaded {
+                    Some(mut loaded) => {
+                        loaded.recipient = Some(choice);
+                        loaded.picked = true;
+                        *draft = loaded;
+                    }
+                    None if draft.grant_id.is_some() => {
+                        *draft = GrantDraft {
+                            recipient: Some(choice),
+                            ..fresh
+                        };
+                    }
+                    None => draft.recipient = Some(choice),
                 }
             }
         }
+        ClanMapShareMessage::DraftPreset(pick) => {
+            for (action, on) in pick.changes() {
+                draft_toggle(dialog, action, on);
+            }
+        }
+        ClanMapShareMessage::DraftAction(action, on) => draft_toggle(dialog, action, on),
         ClanMapShareMessage::DraftCancelled => dialog.draft = None,
         ClanMapShareMessage::DraftSaved => {
             let Some(draft) = &mut dialog.draft else {
@@ -1206,10 +1216,10 @@ pub(super) fn update(
                 return Update::none();
             };
             draft.error = None;
-            let actions: Vec<String> = draft.actions().into_iter().collect();
-            let may_grant = draft.may_grant();
-            // The answer to a change can name another grant than the one
-            // edited (clans.md §1.2); the result refetches the grants.
+            let actions: Vec<String> = draft.actions.iter().cloned().collect();
+            let change = draft.change();
+            // A change can leave the grant deleted (clans.md §5.3); the
+            // result refetches the grants.
             let grant_id = draft.grant_id;
             return Update::with_task(perform(
                 dialog,
@@ -1217,15 +1227,18 @@ pub(super) fn update(
                 async move {
                     match grant_id {
                         Some(grant_id) => client
-                            .change_clan_grant(clan_id, grant_id, &GrantBody { actions, may_grant })
+                            .change_clan_grant(clan_id, grant_id, &change)
                             .await
                             .map(|_| ()),
                         None => client
-                            .create_clan_grant(
+                            .grant_in_clan(
                                 clan_id,
                                 recipient.recipient,
                                 &GrantScope::Areas { ids: vec![area_id] },
-                                &actions.iter().map(String::as_str).collect::<Vec<_>>(),
+                                &GrantBody {
+                                    actions,
+                                    may_grant: None,
+                                },
                             )
                             .await
                             .map(|_| ()),
@@ -1698,16 +1711,15 @@ fn access_section(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
                 );
             }
         } else if row_state.editable {
-            line = line
-                .push(
-                    button(text(crate::i18n::t!("mapper-edit-flags")).size(11))
-                        .style(builtins::button::secondary)
-                        .on_press_maybe(
-                            (!dialog.busy())
-                                .then_some(msg(ClanMapShareMessage::EditStarted(grant_id))),
-                        ),
-                )
-                .push(
+            line = line.push(
+                button(text(crate::i18n::t!("mapper-edit-flags")).size(11))
+                    .style(builtins::button::secondary)
+                    .on_press_maybe(
+                        (!dialog.busy()).then_some(msg(ClanMapShareMessage::EditStarted(grant_id))),
+                    ),
+            );
+            if dialog.may_remove(&row_state.grant) {
+                line = line.push(
                     button(text(crate::i18n::t!("clan-share-remove")).size(11))
                         .style(builtins::button::secondary)
                         .on_press_maybe(
@@ -1715,6 +1727,7 @@ fn access_section(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
                                 .then_some(msg(ClanMapShareMessage::RemoveRequested(grant_id))),
                         ),
                 );
+            }
         }
         let mut item = column![line].spacing(2);
         if let GrantRecipient::Group { group_id } = row_state.grant.recipient
@@ -1734,7 +1747,7 @@ fn access_section(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
         if dialog
             .draft
             .as_ref()
-            .is_some_and(|draft| draft.grant_id == Some(grant_id))
+            .is_some_and(|draft| !draft.picked && draft.grant_id == Some(grant_id))
         {
             section = section.push(draft_view(dialog));
         }
@@ -1761,7 +1774,7 @@ fn access_section(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
     }
     if dialog.manages() {
         match &dialog.draft {
-            Some(draft) if draft.grant_id.is_none() => section = section.push(draft_view(dialog)),
+            Some(draft) if draft.picked => section = section.push(draft_view(dialog)),
             _ => {
                 section = section.push(
                     button(text(crate::i18n::t!("clan-share-add-recipient")).size(12))
@@ -1779,19 +1792,14 @@ fn access_section(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
     section.into()
 }
 
-/// The form writing a grant: recipient (for a new one), preset, and the
-/// actions no preset holds.
+/// The form writing a grant: recipient (for a new one), a preset picker,
+/// and every map action as a checkbox the picker sets.
 fn draft_view(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
     let Some(draft) = &dialog.draft else {
         return column![].into();
     };
-    let presets: Vec<PresetChoice> = dialog
-        .preset_choices(&draft.kept)
-        .into_iter()
-        .map(PresetChoice)
-        .collect();
-    let mut first = row![].spacing(8).align_y(Vertical::Center);
-    if draft.grant_id.is_none() {
+    let mut first = column![].spacing(6);
+    if draft.picked {
         first = first.push(share_picker(
             dialog.recipient_choices(),
             draft.recipient.clone(),
@@ -1800,36 +1808,39 @@ fn draft_view(dialog: &ClanMapShareDialog) -> ThemedElement<'_, Message> {
             200,
             |choice| msg(ClanMapShareMessage::DraftRecipient(choice)),
         ));
+        // Who already holds the map's own grant has it edited.
+        if draft.grant_id.is_some() {
+            first = first.push(note(crate::i18n::t!("clan-share-existing")));
+        }
     }
-    first = first.push(share_picker(
-        presets,
-        draft.preset.map(PresetChoice),
-        dialog.busy(),
-        presets::custom_label(),
-        150,
-        |choice| msg(ClanMapShareMessage::DraftPreset(choice)),
+    let picker = dialog.picker(draft);
+    let usable = !dialog.busy() && picker.choices.len() > 1;
+    first = first.push(picker.view(
+        crate::i18n::t!("mapper-they-can"),
+        usable.then_some(|pick| msg(ClanMapShareMessage::DraftPreset(pick))),
     ));
-    let mut separate = Column::new().spacing(2);
-    for action in dialog.separate_actions() {
-        separate = separate.push(
-            checkbox(draft.separate.contains(action))
+    let mut boxes = Column::new().spacing(2);
+    for action in dialog.shown_actions() {
+        boxes = boxes.push(
+            checkbox(draft.actions.contains(action))
                 .label(presets::action_label(action))
                 .size(13)
                 .text_size(12)
                 .on_toggle_maybe(
-                    (!dialog.busy())
-                        .then_some(move |on| msg(ClanMapShareMessage::DraftSeparate(action, on))),
+                    (!dialog.busy() && dialog.toggles(action))
+                        .then_some(move |on| msg(ClanMapShareMessage::DraftAction(action, on))),
                 ),
         );
     }
-    let actions = draft.actions();
     let ready = draft.recipient.is_some()
         && !dialog.busy()
-        && !actions.is_empty()
-        && dialog.may_hand_out(&actions);
+        && match draft.grant_id {
+            Some(_) => !draft.change().is_empty(),
+            None => !draft.actions.is_empty(),
+        };
     let mut block = column![
         first,
-        separate,
+        boxes,
         row![
             space::horizontal(),
             button(text(crate::i18n::t!("action-cancel")).size(11))
@@ -2631,7 +2642,7 @@ mod tests {
             may_grant: None,
             scope,
             issuer_id: id(2),
-            parent_id: None,
+            delegated: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2766,30 +2777,45 @@ mod tests {
         assert_eq!(chooser(&custom, Some(&led)), Chooser::OwnersAndLeads);
     }
 
+    fn names(actions: &[&str]) -> BTreeSet<String> {
+        actions.iter().map(ToString::to_string).collect()
+    }
+
+    /// The draft with `pick` made, as the dialog makes it: box by box.
+    fn picked(mut draft: GrantDraft, pick: PresetPick) -> GrantDraft {
+        for (action, on) in pick.changes() {
+            if on {
+                draft.actions.insert(action.to_string());
+            } else {
+                draft.actions.remove(action);
+            }
+        }
+        draft
+    }
+
     #[test]
-    fn a_draft_is_its_preset_plus_the_separate_actions() {
-        let mut draft = GrantDraft {
-            grant_id: None,
-            recipient: None,
-            preset: Some(Preset::MapContributor),
-            core: BTreeSet::new(),
-            separate: ["area.copy".to_string()].into(),
-            kept: BTreeSet::new(),
-            may_grant: None,
-            error: None,
-        };
-        assert_eq!(
-            draft.actions(),
-            ["area.read", "area.add", "area.edit", "area.copy"]
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+    fn a_new_draft_sends_its_boxes_and_an_edit_only_what_changed() {
+        let draft = picked(
+            GrantDraft::new(names(&["area.copy"])),
+            PresetPick::Preset(Preset::MapContributor),
         );
-        // A Custom grant keeps its core actions as they are.
-        draft.preset = None;
-        draft.core = ["area.read".to_string(), "area.remove_content".to_string()].into();
-        assert!(draft.actions().contains("area.remove_content"));
-        assert!(!draft.actions().contains("area.add"));
+        assert_eq!(
+            draft.actions,
+            names(&["area.read", "area.add", "area.edit", "area.copy"])
+        );
+        let edited = GrantDraft {
+            grant_id: Some(id(30)),
+            before: draft.actions.clone(),
+            ..draft
+        };
+        let edited = picked(edited, PresetPick::Preset(Preset::MapReader));
+        assert_eq!(
+            edited.change(),
+            GrantChange {
+                remove: names(&["area.add", "area.edit"]),
+                ..GrantChange::default()
+            }
+        );
     }
 
     fn dialog(ownership: MapOwnership) -> ClanMapShareDialog {
@@ -2973,8 +2999,8 @@ mod tests {
             ClanMapShareMessage::DraftCancelled,
             ClanMapShareMessage::AddStarted,
             ClanMapShareMessage::EditStarted(id(13)),
-            ClanMapShareMessage::DraftPreset(PresetChoice(Preset::MapReader)),
-            ClanMapShareMessage::DraftSeparate("area.copy", true),
+            ClanMapShareMessage::DraftPreset(PresetPick::Preset(Preset::MapReader)),
+            ClanMapShareMessage::DraftAction("area.copy", true),
             ClanMapShareMessage::RemoveRequested(id(13)),
             ClanMapShareMessage::RemoveConfirmed,
             ClanMapShareMessage::OutsideShare,
@@ -3291,9 +3317,9 @@ mod tests {
         );
     }
 
-    /// Editing one of the map's own grants keeps what the dialog does not
-    /// show: seeing and handing out access, what it may hand out, and
-    /// actions this client does not know, through Save.
+    /// Editing one of the map's own grants names only the boxes changed,
+    /// so what the dialog does not show stays: seeing and handing out
+    /// access, what it may hand out, and actions this client does not know.
     #[test]
     fn editing_a_grant_keeps_what_the_dialog_does_not_show() {
         let mut clan_owned = dialog(MapOwnership::Clan);
@@ -3314,31 +3340,22 @@ mod tests {
         administered.may_grant = Some(["area.read".to_string()].into());
         clan_owned.grants = Some(Ok(vec![administered]));
 
-        let mut draft = clan_owned.edit_draft(id(30)).expect("the map's own grant");
-        assert_eq!(draft.preset, Some(Preset::MapContributor));
-        draft.preset = Some(Preset::MapReader);
+        let draft = clan_owned.edit_draft(id(30)).expect("the map's own grant");
         assert_eq!(
-            draft.actions(),
-            ["area.read", "grant.inspect", "grant.manage", "lore.read"]
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+            clan_owned.picker(&draft).state,
+            presets::FacetState::Preset(Preset::MapContributor)
         );
-        assert_eq!(draft.may_grant(), Some(vec!["area.read".to_string()]));
-
-        // A grant that hands nothing out sends no ceiling.
-        clan_owned.grants = Some(Ok(vec![grant(
-            31,
-            group(101),
-            GrantScope::Areas { ids: vec![MAP] },
-            &["area.read", "grant.inspect"],
-        )]));
-        let draft = clan_owned.edit_draft(id(31)).expect("the map's own grant");
-        assert!(draft.actions().contains("grant.inspect"));
-        assert_eq!(draft.may_grant(), None);
+        let draft = picked(draft, PresetPick::Preset(Preset::MapReader));
+        assert_eq!(
+            draft.change(),
+            GrantChange {
+                remove: names(&["area.add", "area.edit"]),
+                ..GrantChange::default()
+            }
+        );
     }
 
-    /// Picking a preset replaces only the Map preset's actions: renaming,
+    /// Picking a preset changes only the Map preset's actions: renaming,
     /// Clan-owned Secret actions and the rest the grant carries stay.
     #[test]
     fn a_preset_pick_keeps_what_no_preset_holds() {
@@ -3350,27 +3367,35 @@ mod tests {
             GrantScope::Areas { ids: vec![MAP] },
             &["area.read", "area.rename", "secret.read"],
         )]));
-        let mut draft = clan_owned.edit_draft(id(32)).expect("the map's own grant");
-        assert_eq!(draft.preset, Some(Preset::MapReader));
-        draft.preset = Some(Preset::MapContributor);
+        let draft = clan_owned.edit_draft(id(32)).expect("the map's own grant");
         assert_eq!(
-            draft.actions(),
-            BTreeSet::from(
-                [
-                    "area.read",
-                    "area.add",
-                    "area.edit",
-                    "area.rename",
-                    "secret.read"
-                ]
-                .map(String::from)
-            )
+            clan_owned.picker(&draft).state,
+            presets::FacetState::Preset(Preset::MapReader)
+        );
+        let draft = picked(draft, PresetPick::Preset(Preset::MapContributor));
+        assert_eq!(
+            draft.actions,
+            names(&[
+                "area.read",
+                "area.add",
+                "area.edit",
+                "area.rename",
+                "secret.read"
+            ])
+        );
+        assert_eq!(
+            draft.change(),
+            GrantChange {
+                add: names(&["area.add", "area.edit"]),
+                ..GrantChange::default()
+            }
         );
     }
 
     /// A delegate is offered only what one of their delegations covering
-    /// the map hands out, and changes only the map's own grants within it
-    /// that hand nothing out; a clan owner is bound by none.
+    /// the map hands out: they change the boxes within it on any of the
+    /// map's own grants that hands nothing out, and remove only one whose
+    /// every action is within it; a clan owner is bound by none.
     #[test]
     fn a_delegate_is_offered_only_what_their_delegation_hands_out() {
         let mut clan_owned = dialog(MapOwnership::Clan);
@@ -3416,27 +3441,39 @@ mod tests {
             delegating,
         ]));
 
+        let facet = Facet::of(Preset::MapReader);
         assert_eq!(
-            clan_owned.preset_choices(&BTreeSet::new()),
-            [Preset::MapReader, Preset::MapContributor]
+            clan_owned.picker(&clan_owned.new_draft()).choices,
+            [
+                PresetPick::None(facet),
+                PresetPick::Preset(Preset::MapReader),
+                PresetPick::Preset(Preset::MapContributor)
+            ]
         );
-        assert_eq!(clan_owned.separate_actions(), [action::COPY_AREA]);
+        assert!(clan_owned.may_toggle(action::COPY_AREA));
+        assert!(!clan_owned.may_toggle(action::DELETE_AREA));
         let editable: Vec<Uuid> = clan_owned
             .rows()
             .into_iter()
             .filter(|row| row.editable)
             .map(|row| row.grant.id)
             .collect();
-        assert_eq!(editable, [id(41)]);
-        assert!(clan_owned.edit_draft(id(42)).is_none());
+        assert_eq!(editable, [id(41), id(42)]);
+        let rows = clan_owned.rows();
+        let removable = |n: u128| {
+            clan_owned.may_remove(&rows.iter().find(|row| row.grant.id == id(n)).unwrap().grant)
+        };
+        assert!(removable(41));
+        assert!(!removable(42), "Remove content is beyond the delegation");
 
         clan_owned.clan_owner = true;
-        assert_eq!(clan_owned.preset_choices(&BTreeSet::new()).len(), 3);
-        assert_eq!(
-            clan_owned.separate_actions().len(),
-            Kind::Map.separate().len()
+        assert_eq!(clan_owned.picker(&clan_owned.new_draft()).choices.len(), 4);
+        assert!(
+            clan_owned
+                .shown_actions()
+                .iter()
+                .all(|action| clan_owned.may_toggle(action))
         );
-        assert!(clan_owned.edit_draft(id(42)).is_some());
         assert!(clan_owned.edit_draft(id(43)).is_some());
     }
 
@@ -3537,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn recipients_leave_out_the_owner_group_and_who_holds_the_maps_own_access() {
+    fn recipients_leave_out_the_owner_group_and_the_viewer() {
         let mut clan_owned = dialog(MapOwnership::Clan);
         clan_owned.members = Some(Ok(vec![
             ClanMember {
@@ -3568,34 +3605,56 @@ mod tests {
             .map(|choice| choice.label)
             .collect();
         // Everyone first, then the custom groups, then members; not the
-        // viewer, and not member 7, who holds the map's own grant.
+        // viewer. Member 7 holds the map's own grant, which picking them
+        // edits.
         assert_eq!(
             labels,
             [
                 crate::i18n::t!("clan-maps-everyone"),
                 "Scouts".to_string(),
+                "tomas".to_string(),
                 "kai".to_string()
             ]
+        );
+        assert!(
+            clan_owned
+                .own_grant(GrantRecipient::User { user_id: id(7) })
+                .is_some()
         );
     }
 
     #[test]
-    fn a_member_owned_maps_separate_actions_are_its_own() {
+    fn a_member_owned_maps_boxes_are_its_own_and_always_read() {
         let mut clan_owned = dialog(MapOwnership::Clan);
         clan_owned.clan_owner = true;
         assert!(
             clan_owned
-                .separate_actions()
+                .shown_actions()
                 .contains(&action::SHARE_AREA_EXTERNALLY)
         );
         let member_owned = dialog(MapOwnership::Members);
         assert_eq!(
-            member_owned.separate_actions(),
+            member_owned.shown_actions(),
             [
+                action::READ_AREA,
+                action::ADD_TO_AREA,
+                action::EDIT_AREA,
+                action::REMOVE_FROM_AREA,
                 action::COPY_AREA,
                 action::DELETE_AREA,
                 action::CREATE_MEMBER_OWNED_SECRET
             ]
+        );
+        assert!(!member_owned.toggles(action::READ_AREA));
+        let draft = member_owned.new_draft();
+        assert!(draft.actions.contains(action::READ_AREA));
+        assert!(
+            !member_owned
+                .picker(&draft)
+                .choices
+                .iter()
+                .any(|pick| matches!(pick, PresetPick::None(_))),
+            "no choice leaves Read off"
         );
     }
 

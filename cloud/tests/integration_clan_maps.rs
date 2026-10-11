@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use smudgy_cloud::clan_access::{GrantBody, GrantChange};
 use smudgy_cloud::clan_maps::MapOwnership;
 use smudgy_cloud::clans::{
     ClanGrantFilter, GrantRecipient, GrantScope, MAP_CREATOR_ACTIONS, action,
@@ -166,13 +167,13 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
     let members = everyone(&mira, clan).await;
     let grant = mira
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             clan,
             GrantRecipient::Group { group_id: members },
             &GrantScope::Atlases {
                 ids: vec![roads.id],
             },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -195,11 +196,21 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
             .is_some_and(|held| held.contains(action::READ_AREA))
     );
 
-    // Edit replaces Read.
-    mira.api
-        .update_clan_grant(clan, grant.id, MAP_CREATOR_ACTIONS)
+    // Edit joins Read.
+    let edit = GrantChange {
+        add: MAP_CREATOR_ACTIONS
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        ..GrantChange::default()
+    };
+    let changed = mira
+        .api
+        .change_clan_grant(clan, grant.id, &edit)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the grant stays");
+    assert_eq!(changed.id, grant.id);
     let row = find_map(&tomas, solace.id).await.unwrap();
     assert!(row.effective_access().can_edit);
     assert!(!row.can(action::DELETE_AREA));
@@ -215,13 +226,13 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
     assert!(is_not_found(
         &tomas
             .api
-            .create_clan_grant(
+            .grant_in_clan(
                 clan,
                 GrantRecipient::Group { group_id: members },
                 &GrantScope::Atlases {
                     ids: vec![roads.id]
                 },
-                &[action::READ_AREA],
+                &GrantBody::of([action::READ_AREA]),
             )
             .await
     ));
@@ -229,7 +240,7 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
     // Map access goes to groups, never to one member.
     let to_member = mira
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             clan,
             GrantRecipient::User {
                 user_id: tomas.user.id,
@@ -237,7 +248,7 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
             &GrantScope::Atlases {
                 ids: vec![roads.id],
             },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await;
     assert!(
@@ -250,11 +261,11 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
     assert!(find_map(&tomas, solace.id).await.is_none());
     assert!(matches!(
         mira.api
-            .create_clan_grant(
+            .grant_in_clan(
                 clan,
                 GrantRecipient::Group { group_id: members },
                 &GrantScope::Clan,
-                &[action::READ_AREA]
+                &GrantBody::of([action::READ_AREA])
             )
             .await,
         Err(CloudError::InvalidInput(_))
@@ -267,13 +278,13 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
         .unwrap();
     assert!(find_map(&tomas, later.id).await.is_none());
     mira.api
-        .create_clan_grant(
+        .grant_in_clan(
             clan,
             GrantRecipient::Group { group_id: members },
             &GrantScope::Atlases {
                 ids: vec![roads.id, towns.id],
             },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -429,13 +440,13 @@ async fn a_new_clan_map_assumes_its_creators_access_until_the_servers_copy() {
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
     let members = everyone(&mira, clan).await;
     mira.api
-        .create_clan_grant(
+        .grant_in_clan(
             clan,
             GrantRecipient::Group { group_id: members },
             &GrantScope::Atlases {
                 ids: vec![roads.id],
             },
-            &[action::READ_AREA, action::CREATE_AREA],
+            &GrantBody::of([action::READ_AREA, action::CREATE_AREA]),
         )
         .await
         .unwrap();
@@ -525,13 +536,13 @@ async fn the_mapper_makes_a_member_owned_map_its_creator_owns() {
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
     let everyone = everyone(&mira, clan).await;
     mira.api
-        .create_clan_grant(
+        .grant_in_clan(
             clan,
             GrantRecipient::Group { group_id: everyone },
             &GrantScope::Atlases {
                 ids: vec![roads.id],
             },
-            &[action::READ_AREA, action::CREATE_MEMBER_OWNED_AREA],
+            &GrantBody::of([action::READ_AREA, action::CREATE_MEMBER_OWNED_AREA]),
         )
         .await
         .unwrap();

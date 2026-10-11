@@ -1,13 +1,19 @@
 //! A clan's permissions end to end over real HTTP against the contract-shaped
 //! mock (`tests/support/clans.rs`, `tests/support/clan_resources.rs`):
-//! groups their creators join and govern, inline grants without roles,
-//! delegation that never reaches clan administration, package scopes, the
-//! access index, invitations that propose groups, and the clan's profile.
+//! groups their creators join and govern, inline grants without roles, one
+//! grant per recipient and scope edited by change sets, delegation that never
+//! reaches clan administration and whose additions end with it, package
+//! scopes, the access index, invitations that propose groups, and the clan's
+//! profile.
 #![allow(clippy::too_many_lines)]
 
 mod support;
 
-use smudgy_cloud::clan_access::{ClanProfilePatch, GrantBody, GrantThrough, ResourceKind};
+use std::collections::BTreeSet;
+
+use smudgy_cloud::clan_access::{
+    ClanProfilePatch, GrantBody, GrantChange, GrantThrough, ResourceKind,
+};
 use smudgy_cloud::clan_secrets::{NewSecret, NewSecretOwner};
 use smudgy_cloud::clans::{ClanGrantFilter, GrantRecipient, GrantScope, action};
 use smudgy_cloud::{
@@ -70,6 +76,27 @@ async fn clan() -> Clan {
 
 fn group(id: Uuid) -> GrantRecipient {
     GrantRecipient::Group { group_id: id }
+}
+
+fn set(actions: &[&str]) -> BTreeSet<String> {
+    actions.iter().map(ToString::to_string).collect()
+}
+
+/// A grant change adding `add` and removing `remove`.
+fn change(add: &[&str], remove: &[&str]) -> GrantChange {
+    GrantChange {
+        add: set(add),
+        remove: set(remove),
+        ..GrantChange::default()
+    }
+}
+
+/// A delegating grant of `actions` that may hand out `ceiling`.
+fn delegating(actions: &[&str], ceiling: &[&str]) -> GrantBody {
+    GrantBody {
+        actions: actions.iter().map(ToString::to_string).collect(),
+        may_grant: Some(ceiling.iter().map(ToString::to_string).collect()),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -263,37 +290,49 @@ async fn grants_carry_inline_actions_and_owners_alone_delegate() {
             c.id,
             group(scouts.id),
             &folder,
-            &GrantBody {
-                actions: vec!["grant.inspect".into(), "grant.manage".into()],
-                may_grant: Some(vec!["area.read".into()]),
-            },
+            &delegating(&["grant.inspect", "grant.manage"], &["area.read"]),
         )
         .await
         .expect("an owner delegates");
-    assert_eq!(delegation.may_grant, Some(["area.read".to_string()].into()));
+    assert_eq!(delegation.may_grant, Some(set(&["area.read"])));
+    assert!(delegation.delegated.is_empty());
+    let readers = c
+        .mira
+        .api
+        .create_clan_group(c.id, "DV readers", None)
+        .await
+        .unwrap();
+    let on_dv = GrantScope::Areas { ids: vec![area] };
     let issued = c
         .nessa
         .api
         .grant_in_clan(
             c.id,
-            group(scouts.id),
-            &folder,
+            group(readers.id),
+            &on_dv,
             &GrantBody::of(["area.read"]),
         )
         .await
         .expect("within the delegation");
-    assert_eq!(issued.parent_id, Some(delegation.id));
+    assert!(issued.direct_actions().is_empty());
+    assert_eq!(issued.delegations_of("area.read"), [delegation.id]);
     let wider = c
         .nessa
         .api
         .grant_in_clan(
             c.id,
-            group(scouts.id),
-            &folder,
-            &GrantBody::of(["area.read", "area.edit"]),
+            group(readers.id),
+            &on_dv,
+            &GrantBody::of(["area.edit"]),
         )
         .await;
     assert!(is_not_found(&wider), "beyond may_grant: {wider:?}");
+    assert!(is_not_found(
+        &c.nessa
+            .api
+            .change_clan_grant(c.id, issued.id, &change(&["area.edit"], &[]))
+            .await
+    ));
     // A delegate never delegates further, nor gives themselves administration.
     let further = c
         .nessa
@@ -303,11 +342,8 @@ async fn grants_carry_inline_actions_and_owners_alone_delegate() {
             GrantRecipient::User {
                 user_id: c.arun.user.id,
             },
-            &GrantScope::Areas { ids: vec![area] },
-            &GrantBody {
-                actions: vec!["grant.manage".into()],
-                may_grant: Some(vec!["area.read".into()]),
-            },
+            &on_dv,
+            &delegating(&["grant.manage"], &["area.read"]),
         )
         .await;
     assert!(is_not_found(&further), "{further:?}");
@@ -327,18 +363,26 @@ async fn grants_carry_inline_actions_and_owners_alone_delegate() {
         .await;
     assert!(admin.is_err(), "{admin:?}");
 
-    // The delegate changes what they issued, within bounds.
-    c.nessa
+    // Taking grant.manage away, with the ceiling it needs no more, deletes
+    // what came through it, and the grant that left empty.
+    let narrowed = c
+        .mira
         .api
-        .change_clan_grant(c.id, issued.id, &GrantBody::of(["area.read"]))
+        .change_clan_grant(
+            c.id,
+            delegation.id,
+            &GrantChange::between(
+                &delegation.actions,
+                &set(&["area.read"]),
+                &set(&["grant.inspect"]),
+                &BTreeSet::new(),
+            ),
+        )
         .await
-        .expect("change within bounds");
-    // Taking grant.manage away deletes what was issued under it.
-    c.mira
-        .api
-        .change_clan_grant(c.id, delegation.id, &GrantBody::of(["grant.inspect"]))
-        .await
-        .expect("an owner narrows the delegation");
+        .expect("an owner narrows the delegation")
+        .expect("it keeps grant.inspect");
+    assert_eq!(narrowed.actions, set(&["grant.inspect"]));
+    assert_eq!(narrowed.may_grant, None);
     let left = c
         .mira
         .api
@@ -355,18 +399,466 @@ async fn grants_carry_inline_actions_and_owners_alone_delegate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_delegate_widens_a_grant_they_did_not_issue_only_under_their_delegation() {
+async fn posting_again_over_a_scope_adds_to_the_recipients_grant() {
     let c = clan().await;
     let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    let folder = GrantScope::Atlases {
+        ids: vec![AtlasId(atlas)],
+    };
+    let first = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    let second = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.edit", "area.add"]),
+        )
+        .await
+        .expect("the same recipient and scope");
+    assert_eq!(second.id, first.id, "one grant per recipient and scope");
+    assert_eq!(second.actions, set(&["area.read", "area.add", "area.edit"]));
+    assert_eq!(second.created_at, first.created_at);
+
+    // A new grant answers 201 and an addition 200; neither removes anything.
+    let post = |recipient: Uuid, actions: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("{}/clans/{}/grants", c.server.base_url, c.id))
+            .bearer_auth(&c.mira.user.session_token)
+            .json(&serde_json::json!({
+                "recipient": { "group_id": recipient },
+                "scope": { "kind": "atlases", "ids": [atlas] },
+                "actions": actions,
+            }))
+            .send()
+    };
+    let added = post(wardens.id, serde_json::json!(["area.read"]))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
     let scouts = c
         .mira
         .api
         .create_clan_group(c.id, "Scouts", None)
         .await
         .unwrap();
+    let fresh = post(scouts.id, serde_json::json!(["area.read"]))
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), 201);
+    let to_wardens = c
+        .mira
+        .api
+        .clan_grants(
+            c.id,
+            ClanGrantFilter {
+                group_id: Some(wardens.id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(to_wardens.len(), 1);
+    assert_eq!(
+        to_wardens[0].actions,
+        set(&["area.read", "area.add", "area.edit"])
+    );
+
+    // An overlapping scope is another grant.
+    let other = c.server.create_clan_atlas(c.id, "Legendary");
+    let wider = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &GrantScope::Atlases {
+                ids: vec![AtlasId(atlas), AtlasId(other)],
+            },
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    assert_ne!(wider.id, first.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_set_leaves_the_actions_it_does_not_name() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    let grant = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &GrantScope::Atlases {
+                ids: vec![AtlasId(atlas)],
+            },
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+
+    // Two editors open the same grant and each ticks a different switch:
+    // both land.
+    let none = BTreeSet::new();
+    let mut theirs = grant.actions.clone();
+    theirs.insert("area.edit".to_string());
+    let mut mine = grant.actions.clone();
+    mine.insert("area.add".to_string());
+    c.mira
+        .api
+        .change_clan_grant(
+            c.id,
+            grant.id,
+            &GrantChange::between(&grant.actions, &none, &theirs, &none),
+        )
+        .await
+        .unwrap();
+    let both = c
+        .mira
+        .api
+        .change_clan_grant(
+            c.id,
+            grant.id,
+            &GrantChange::between(&grant.actions, &none, &mine, &none),
+        )
+        .await
+        .unwrap()
+        .expect("the grant stays");
+    assert_eq!(both.actions, set(&["area.read", "area.add", "area.edit"]));
+
+    // Unticking one leaves the other editor's.
+    let mut unticked = mine.clone();
+    unticked.remove("area.read");
+    let fewer = c
+        .mira
+        .api
+        .change_clan_grant(
+            c.id,
+            grant.id,
+            &GrantChange::between(&mine, &none, &unticked, &none),
+        )
+        .await
+        .unwrap()
+        .expect("the grant stays");
+    assert_eq!(fewer.actions, set(&["area.add", "area.edit"]));
+
+    // A change that leaves it no action deletes it.
+    let emptied = c
+        .mira
+        .api
+        .change_clan_grant(c.id, grant.id, &change(&[], &["area.add", "area.edit"]))
+        .await
+        .unwrap();
+    assert_eq!(emptied, None);
+    assert!(
+        c.mira
+            .api
+            .clan_grants(
+                c.id,
+                ClanGrantFilter {
+                    group_id: Some(wardens.id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_changes_are_refused_for_their_shape() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
     let folder = GrantScope::Atlases {
         ids: vec![AtlasId(atlas)],
     };
+    let grant = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    let url = format!("{}/clans/{}/grants/{}", c.server.base_url, c.id, grant.id);
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "actions": ["area.edit"] }),
+        serde_json::json!({ "actions": { "add": ["area.edit"], "remove": ["area.edit"] } }),
+        serde_json::json!({ "may_grant": { "add": ["grant.manage"] } }),
+        serde_json::json!({ "actions": { "add": ["grant.manage"] } }),
+        serde_json::json!({ "may_grant": { "add": ["area.read"] } }),
+        serde_json::json!({ "actions": { "add": ["clan.invite"] } }),
+        serde_json::json!({ "actions": { "add": ["area.fly"] } }),
+    ] {
+        let response = reqwest::Client::new()
+            .patch(&url)
+            .bearer_auth(&c.mira.user.session_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{body}");
+    }
+    let unchanged = c
+        .mira
+        .api
+        .change_clan_grant(c.id, grant.id, &GrantChange::default())
+        .await;
+    assert!(is_bad_request(&unchanged), "{unchanged:?}");
+
+    // A delegation needs a ceiling, and keeps one while it delegates.
+    let ceilingless = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &delegating(&["grant.manage"], &[]),
+        )
+        .await;
+    assert!(is_bad_request(&ceilingless), "{ceilingless:?}");
+    let delegation = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &delegating(&["grant.manage"], &["area.read"]),
+        )
+        .await
+        .expect("the delegation joins the grant");
+    assert_eq!(delegation.id, grant.id);
+    let bare = c
+        .mira
+        .api
+        .change_clan_grant(
+            c.id,
+            delegation.id,
+            &GrantChange {
+                ceiling_remove: set(&["area.read"]),
+                ..GrantChange::default()
+            },
+        )
+        .await;
+    assert!(is_bad_request(&bare), "{bare:?}");
+    let leftover = c
+        .mira
+        .api
+        .change_clan_grant(c.id, delegation.id, &change(&[], &["grant.manage"]))
+        .await;
+    assert!(is_bad_request(&leftover), "{leftover:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegates_additions_come_through_their_oldest_fitting_delegation() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let dv = c.server.create_clan_area(c.id, atlas, "DV");
+    let folder = GrantScope::Atlases {
+        ids: vec![AtlasId(atlas)],
+    };
+    let scouts = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Scouts", None)
+        .await
+        .unwrap();
+    let leads = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Leads", None)
+        .await
+        .unwrap();
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    for (joining, user) in [
+        (scouts.id, c.nessa.user.id),
+        (leads.id, c.nessa.user.id),
+        (leads.id, c.arun.user.id),
+    ] {
+        c.mira
+            .api
+            .add_clan_group_member(c.id, joining, user)
+            .await
+            .unwrap();
+    }
+    let older = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(scouts.id),
+            &folder,
+            &delegating(&["grant.manage"], &["area.read", "area.edit"]),
+        )
+        .await
+        .unwrap();
+    let newer = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(leads.id),
+            &folder,
+            &delegating(&["grant.manage"], &["area.read", "area.edit", "area.add"]),
+        )
+        .await
+        .unwrap();
+    let owners = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+
+    // Nessa's additions join the owner's grant: area.read stays its own,
+    // area.edit comes through the older delegation that hands it out, and
+    // area.add through the only one that does.
+    let joined = c
+        .nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read", "area.edit", "area.add"]),
+        )
+        .await
+        .expect("within her delegations");
+    assert_eq!(joined.id, owners.id);
+    assert_eq!(joined.direct_actions(), ["area.read"].into());
+    assert_eq!(joined.delegations_of("area.edit"), [older.id]);
+    assert_eq!(joined.delegations_of("area.add"), [newer.id]);
+
+    // Arun adds area.edit through his only delegation: a second source.
+    let again = c
+        .arun
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.edit"]),
+        )
+        .await
+        .unwrap();
+    let sources: BTreeSet<Uuid> = again.delegations_of("area.edit").into_iter().collect();
+    assert_eq!(sources, [older.id, newer.id].into());
+
+    // The access index shows where each action on the map came from.
+    let maps = c
+        .mira
+        .api
+        .clan_resources(c.id, ResourceKind::Areas)
+        .await
+        .unwrap();
+    let dv_row = maps.iter().find(|row| row.id == dv.0).unwrap();
+    let reaching = dv_row
+        .grants
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|row| row.grant_id == owners.id)
+        .expect("the wardens' grant reaches DV");
+    assert_eq!(reaching.through, GrantThrough::Atlas);
+    assert_eq!(reaching.direct_actions(), ["area.read"].into());
+    assert_eq!(reaching.delegations_of("area.add"), [newer.id]);
+
+    // An owner's addition is the grant's own, whatever it came through.
+    let owned = c
+        .mira
+        .api
+        .change_clan_grant(c.id, owners.id, &change(&["area.edit"], &[]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(owned.delegations_of("area.edit").is_empty());
+    assert_eq!(owned.direct_actions(), ["area.read", "area.edit"].into());
+
+    // Ending the newer delegation ends only what came through it alone.
+    c.mira.api.delete_clan_grant(c.id, newer.id).await.unwrap();
+    let left = c
+        .server
+        .clan_grant_record(c.id, owners.id)
+        .expect("the grant stays");
+    assert_eq!(left.actions, set(&["area.read", "area.edit"]));
+    assert!(left.delegated.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_or_narrowing_a_delegation_takes_what_came_through_it() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let dv = c.server.create_clan_area(c.id, atlas, "DV");
+    let folder = GrantScope::Atlases {
+        ids: vec![AtlasId(atlas)],
+    };
+    let scouts = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Scouts", None)
+        .await
+        .unwrap();
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    let guests = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Guests", None)
+        .await
+        .unwrap();
     c.mira
         .api
         .add_clan_group_member(c.id, scouts.id, c.nessa.user.id)
@@ -379,99 +871,398 @@ async fn a_delegate_widens_a_grant_they_did_not_issue_only_under_their_delegatio
             c.id,
             group(scouts.id),
             &folder,
-            &GrantBody {
-                actions: vec!["grant.inspect".into(), "grant.manage".into()],
-                may_grant: Some(vec!["area.read".into(), "area.edit".into()]),
+            &delegating(
+                &["grant.inspect", "grant.manage"],
+                &["area.read", "area.edit", "area.add"],
+            ),
+        )
+        .await
+        .unwrap();
+    let owners = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    c.nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.edit", "area.add"]),
+        )
+        .await
+        .unwrap();
+    let issued = c
+        .nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(guests.id),
+            &GrantScope::Areas { ids: vec![dv] },
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    let held = |id: Uuid| c.server.clan_grant_record(c.id, id);
+
+    // A narrower ceiling takes what it leaves out.
+    c.mira
+        .api
+        .change_clan_grant(
+            c.id,
+            delegation.id,
+            &GrantChange {
+                ceiling_remove: set(&["area.add"]),
+                ..GrantChange::default()
             },
         )
         .await
-        .expect("an owner delegates");
-    let owners = c
+        .unwrap();
+    assert_eq!(
+        held(owners.id).unwrap().actions,
+        set(&["area.read", "area.edit"])
+    );
+    assert!(held(issued.id).is_some());
+
+    // Removing grant.manage takes the rest: the owner's own action stays,
+    // and the grant left with nothing goes.
+    c.mira
+        .api
+        .change_clan_grant(
+            c.id,
+            delegation.id,
+            &GrantChange {
+                remove: set(&["grant.manage"]),
+                ceiling_remove: set(&["area.read", "area.edit"]),
+                ..GrantChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    let left = held(owners.id).unwrap();
+    assert_eq!(left.actions, set(&["area.read"]));
+    assert!(left.delegated.is_empty());
+    assert!(held(issued.id).is_none());
+
+    // Deleting the group a delegation was given to takes what came through
+    // it too.
+    c.mira
+        .api
+        .change_clan_grant(
+            c.id,
+            delegation.id,
+            &GrantChange {
+                add: set(&["grant.manage"]),
+                ceiling_add: set(&["area.edit"]),
+                ..GrantChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    c.nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.edit"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        held(owners.id).unwrap().actions,
+        set(&["area.read", "area.edit"])
+    );
+    c.mira.api.delete_clan_group(c.id, scouts.id).await.unwrap();
+    assert_eq!(held(owners.id).unwrap().actions, set(&["area.read"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegate_changes_a_delegating_grant_only_through_delegation() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let folder = GrantScope::Atlases {
+        ids: vec![AtlasId(atlas)],
+    };
+    let scouts = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Scouts", None)
+        .await
+        .unwrap();
+    c.mira
+        .api
+        .add_clan_group_member(c.id, scouts.id, c.nessa.user.id)
+        .await
+        .unwrap();
+    let delegation = c
         .mira
         .api
         .grant_in_clan(
             c.id,
             group(scouts.id),
             &folder,
-            &GrantBody::of(["area.read"]),
+            &delegating(
+                &["grant.inspect", "grant.manage", "area.read"],
+                &["area.read", "area.edit"],
+            ),
         )
         .await
-        .expect("an owner's grant");
-    let grants_to_scouts = |grants: Vec<smudgy_cloud::clans::ClanGrant>| {
-        let mut found: Vec<(Uuid, Vec<String>, Option<Uuid>)> = grants
-            .into_iter()
-            .filter(|grant| grant.recipient == group(scouts.id) && grant.id != delegation.id)
-            .map(|grant| {
-                (
-                    grant.id,
-                    grant.actions.iter().cloned().collect(),
-                    grant.parent_id,
-                )
-            })
-            .collect();
-        found.sort_by_key(|(_, _, parent)| parent.is_some());
-        found
-    };
+        .unwrap();
 
-    // Widening keeps the owner's grant as it was and issues the addition
-    // under Nessa's delegation, so it ends with it.
-    let answered = c
+    // Its own actions, grant.manage and its ceiling are the owners'.
+    for refused in [
+        change(&[], &["area.read"]),
+        change(&[], &["grant.manage"]),
+        GrantChange {
+            ceiling_add: set(&["area.add"]),
+            ..GrantChange::default()
+        },
+    ] {
+        let result = c
+            .nessa
+            .api
+            .change_clan_grant(c.id, delegation.id, &refused)
+            .await;
+        assert!(is_not_found(&result), "{refused:?}: {result:?}");
+    }
+    assert!(is_not_found(
+        &c.nessa.api.delete_clan_grant(c.id, delegation.id).await
+    ));
+    // What comes through a delegation, she adds and removes.
+    let added = c
         .nessa
         .api
-        .change_clan_grant(c.id, owners.id, &GrantBody::of(["area.read", "area.edit"]))
+        .change_clan_grant(c.id, delegation.id, &change(&["area.edit"], &[]))
         .await
-        .expect("widen within the delegation");
-    assert_eq!(answered.id, owners.id, "the grant kept its actions");
-    let all = c
+        .unwrap()
+        .unwrap();
+    assert_eq!(added.delegations_of("area.edit"), [delegation.id]);
+    let removed = c
+        .nessa
+        .api
+        .change_clan_grant(c.id, delegation.id, &change(&[], &["area.edit"]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.actions, delegation.actions);
+
+    // On a grant that does not delegate she removes, and deletes, within her
+    // ceiling, whoever added the actions.
+    let wardens = c
         .mira
         .api
-        .clan_grants(c.id, ClanGrantFilter::default())
+        .create_clan_group(c.id, "Wardens", None)
         .await
         .unwrap();
-    let found = grants_to_scouts(all);
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert_eq!(found[0], (owners.id, vec!["area.read".to_string()], None));
-    let issued = found[1].0;
-    assert_eq!(
-        found[1],
-        (issued, vec!["area.edit".to_string()], Some(delegation.id))
-    );
-
-    // A change that keeps nothing of the owner's grant answers the issued
-    // grant, which the addition joins.
-    let answered = c
+    let owners = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read", "area.edit"]),
+        )
+        .await
+        .unwrap();
+    let narrowed = c
         .nessa
         .api
-        .change_clan_grant(c.id, owners.id, &GrantBody::of(["area.edit"]))
+        .change_clan_grant(c.id, owners.id, &change(&[], &["area.edit"]))
         .await
-        .expect("narrow it away");
-    assert_eq!(answered.id, issued, "the answer names another grant");
-    let found = grants_to_scouts(
-        c.mira
-            .api
-            .clan_grants(c.id, ClanGrantFilter::default())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        found,
-        [(issued, vec!["area.edit".to_string()], Some(delegation.id))]
-    );
-
-    // Ending the delegation ends what it added.
-    c.mira
+        .unwrap()
+        .unwrap();
+    assert_eq!(narrowed.actions, set(&["area.read"]));
+    let emptied = c
+        .nessa
         .api
-        .delete_clan_grant(c.id, delegation.id)
+        .change_clan_grant(c.id, owners.id, &change(&[], &["area.read"]))
         .await
         .unwrap();
-    let found = grants_to_scouts(
-        c.mira
+    assert_eq!(emptied, None, "a grant left with no action goes");
+    let copying = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &folder,
+            &GrantBody::of(["area.read", "area.copy"]),
+        )
+        .await
+        .unwrap();
+    assert!(is_not_found(
+        &c.nessa
             .api
-            .clan_grants(c.id, ClanGrantFilter::default())
+            .change_clan_grant(c.id, copying.id, &change(&[], &["area.copy"]))
             .await
-            .unwrap(),
+    ));
+    assert!(is_not_found(
+        &c.nessa.api.delete_clan_grant(c.id, copying.id).await
+    ));
+    c.mira
+        .api
+        .change_clan_grant(c.id, copying.id, &change(&[], &["area.copy"]))
+        .await
+        .unwrap();
+    c.nessa
+        .api
+        .delete_clan_grant(c.id, copying.id)
+        .await
+        .expect("every action within her ceiling");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_that_shrinks_joins_the_older_grant() {
+    let c = clan().await;
+
+    // Arun's group administration: a grant over one group, and a newer one
+    // over it and another; deleting the other leaves one grant.
+    let first = c
+        .mira
+        .api
+        .create_clan_group(c.id, "First", None)
+        .await
+        .unwrap();
+    let second = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Second", None)
+        .await
+        .unwrap();
+    let arun = GrantRecipient::User {
+        user_id: c.arun.user.id,
+    };
+    let older = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            arun,
+            &GrantScope::Groups {
+                ids: vec![first.id],
+            },
+            &GrantBody::of([action::RENAME_GROUP]),
+        )
+        .await
+        .unwrap();
+    c.mira
+        .api
+        .grant_in_clan(
+            c.id,
+            arun,
+            &GrantScope::Groups {
+                ids: vec![first.id, second.id],
+            },
+            &GrantBody::of([action::ASSIGN_GROUP]),
+        )
+        .await
+        .unwrap();
+    c.mira.api.delete_clan_group(c.id, second.id).await.unwrap();
+    let to_arun = c
+        .mira
+        .api
+        .clan_grants(
+            c.id,
+            ClanGrantFilter {
+                user_id: Some(c.arun.user.id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(to_arun.len(), 1);
+    assert_eq!(to_arun[0].id, older.id);
+    assert_eq!(
+        to_arun[0].actions,
+        set(&[action::RENAME_GROUP, action::ASSIGN_GROUP])
     );
-    assert!(found.is_empty(), "{found:?}");
+
+    // Two delegations to Scouts, over one folder and over it and an empty
+    // one: deleting the empty folder joins the newer into the older, with
+    // its ceiling and what came through it.
+    let protected = c.server.create_clan_atlas(c.id, "Protected");
+    let spare = c.server.create_clan_atlas(c.id, "Spare");
+    let scouts = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Scouts", None)
+        .await
+        .unwrap();
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    c.mira
+        .api
+        .add_clan_group_member(c.id, scouts.id, c.nessa.user.id)
+        .await
+        .unwrap();
+    let narrow = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(scouts.id),
+            &GrantScope::Atlases {
+                ids: vec![AtlasId(protected)],
+            },
+            &delegating(&["grant.manage"], &["area.read"]),
+        )
+        .await
+        .unwrap();
+    let broad = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(scouts.id),
+            &GrantScope::Atlases {
+                ids: vec![AtlasId(protected), AtlasId(spare)],
+            },
+            &delegating(&["grant.manage"], &["area.read", "area.edit"]),
+        )
+        .await
+        .unwrap();
+    let issued = c
+        .nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &GrantScope::Atlases {
+                ids: vec![AtlasId(protected)],
+            },
+            &GrantBody::of(["area.read", "area.edit"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issued.delegations_of("area.read"), [narrow.id]);
+    assert_eq!(issued.delegations_of("area.edit"), [broad.id]);
+    let mira_maps = CloudMapper::new(c.server.base_url.clone(), c.mira.user.api_key.clone());
+    mira_maps
+        .delete_atlas(&AtlasId(spare))
+        .await
+        .expect("an empty folder goes");
+    let kept = c
+        .server
+        .clan_grant_record(c.id, narrow.id)
+        .expect("the older delegation stays");
+    assert_eq!(kept.may_grant, set(&["area.read", "area.edit"]));
+    assert!(c.server.clan_grant_record(c.id, broad.id).is_none());
+    let issued = c.server.clan_grant_record(c.id, issued.id).unwrap();
+    assert_eq!(issued.sources("area.edit"), [narrow.id]);
+    assert_eq!(issued.sources("area.read"), [narrow.id]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1165,7 +1956,7 @@ async fn a_member_takes_map_access_only_on_a_grant_naming_one_map() {
     // Changing it keeps to the same rule.
     c.mira
         .api
-        .change_clan_grant(c.id, grant.id, &GrantBody::of(["area.read", "secret.read"]))
+        .change_clan_grant(c.id, grant.id, &change(&["secret.read"], &[]))
         .await
         .expect("map and Secret actions on the one map");
 }
@@ -1321,4 +2112,83 @@ async fn the_index_lists_a_maps_outside_shares_and_a_packages_grants() {
         .unwrap();
     assert_eq!(seen[0].id, trail);
     assert!(seen[0].grants.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_departing_delegates_additions_go_with_them() {
+    let c = clan().await;
+    let atlas = c.server.create_clan_atlas(c.id, "Protected");
+    let dv = c.server.create_clan_area(c.id, atlas, "DV");
+    let on_dv = GrantScope::Areas { ids: vec![dv] };
+    let wardens = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Wardens", None)
+        .await
+        .unwrap();
+    // Nessa may hand out reading DV, through a grant to her alone.
+    c.mira
+        .api
+        .grant_in_clan(
+            c.id,
+            GrantRecipient::User {
+                user_id: c.nessa.user.id,
+            },
+            &on_dv,
+            &delegating(&["grant.manage"], &["area.read", "area.edit"]),
+        )
+        .await
+        .unwrap();
+    let owners = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &on_dv,
+            &GrantBody::of(["area.edit"]),
+        )
+        .await
+        .unwrap();
+    let joined = c
+        .nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(wardens.id),
+            &on_dv,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(joined.id, owners.id);
+    let readers = c
+        .mira
+        .api
+        .create_clan_group(c.id, "Readers", None)
+        .await
+        .unwrap();
+    let issued = c
+        .nessa
+        .api
+        .grant_in_clan(
+            c.id,
+            group(readers.id),
+            &on_dv,
+            &GrantBody::of(["area.read"]),
+        )
+        .await
+        .unwrap();
+
+    c.nessa
+        .api
+        .remove_clan_member(c.id, c.nessa.user.id)
+        .await
+        .expect("Nessa leaves");
+    let left = c
+        .server
+        .clan_grant_record(c.id, owners.id)
+        .expect("the owner's action stays");
+    assert_eq!(left.actions, set(&["area.edit"]));
+    assert!(c.server.clan_grant_record(c.id, issued.id).is_none());
 }

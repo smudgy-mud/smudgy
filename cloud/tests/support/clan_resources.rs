@@ -4,11 +4,12 @@
 //!
 //! Each kind lists, by name, what the caller holds an action on: never a
 //! row, name or count of anything else. A map, folder or package row carries
-//! `grants`, with the actions each gives there and where it reaches from,
-//! only for a caller who may inspect the grants covering it (a package's:
-//! the whole clan's), and only the grants they may inspect. A Clan-owned
-//! map's row lists its live outside shares to those who read it and hold
-//! `area.share_external` on it, clan owners among them.
+//! `grants`, with the actions each gives there, the delegation each of those
+//! came through, and where it reaches from, only for a caller who may
+//! inspect the grants covering it (a package's: the whole clan's), and only
+//! the grants they may inspect. A Clan-owned map's row lists its live
+//! outside shares to those who read it and hold `area.share_external` on
+//! it, clan owners among them.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -21,7 +22,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::clan_maps::placement;
-use super::clans::{ClanGrantScope, ClanRecipient, ClanRecord, ClanResource, covers, ordered};
+use super::clans::{
+    ClanGrantScope, ClanRecipient, ClanRecord, ClanResource, covers, delegated_view, ordered,
+};
 use super::http::{authenticate, bad_request, email_not_verified, not_found, ok};
 use super::secrets::Shared;
 use super::state::MockState;
@@ -70,6 +73,7 @@ fn grants_on(
             "grant_id": grant.id,
             "recipient": recipient_view(grant.recipient),
             "actions": ordered(&given),
+            "delegated": delegated_view(grant, &given),
         });
         match (&grant.scope, resource) {
             (ClanGrantScope::Clan, _) => row["through"] = json!("clan"),
@@ -163,10 +167,12 @@ fn own_grants(clan: &ClanRecord, area: Uuid, resource: ClanResource) -> Vec<Valu
     grants
         .into_iter()
         .map(|grant| {
+            let given = clan.contribution(grant, resource);
             json!({
                 "grant_id": grant.id,
                 "recipient": recipient_view(grant.recipient),
-                "actions": ordered(&clan.contribution(grant, resource)),
+                "actions": ordered(&given),
+                "delegated": delegated_view(grant, &given),
                 "through": "direct",
             })
         })

@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::clans::{ClanGroup, ClanMember};
-use crate::cloud_api::{Auth, CloudApiClient, SecretSummary};
+use crate::cloud_api::{Auth, CloudApiClient, SecretGrantChange, SecretSummary};
 use crate::{AreaId, AtlasId, CloudError, CloudResult, SourceId};
 
 /// A Secret's `ownership` badge, as the wire names it.
@@ -460,8 +460,9 @@ impl CloudApiClient {
     }
 
     /// `POST /secrets/{s}/grants` on a Clan Secret: shares it with a member
-    /// or a group. `read` is implied. A recipient that already has a grant
-    /// has its actions replaced, under the rules for changing it.
+    /// or a group. `read` is implied. When the recipient already has a
+    /// grant, the actions join it (200) under the rules for changing it,
+    /// instead of making another (201); posting never removes an action.
     ///
     /// # Errors
     /// See the section comment.
@@ -476,20 +477,24 @@ impl CloudApiClient {
             .await
     }
 
-    /// `PATCH /secrets/{s}/grants/{g}` on a Clan Secret: replaces what the
-    /// grant gives.
+    /// `PATCH /secrets/{s}/grants/{g}` on a Clan Secret: applies `change`,
+    /// leaving the actions it does not name as they are.
     ///
     /// # Errors
-    /// See the section comment.
+    /// See the section comment; [`CloudError::InvalidInput`] for a change
+    /// naming nothing, an action both added and removed, or removing
+    /// `read`.
     pub async fn update_clan_secret_grant(
         &self,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
     ) -> CloudResult<ClanSecretGrant> {
-        let body = json!({ "actions": actions });
-        self.patch(&secret_path(secret, &format!("grants/{grant_id}"))?, &body)
-            .await
+        self.patch(
+            &secret_path(secret, &format!("grants/{grant_id}"))?,
+            &change.to_body(),
+        )
+        .await
     }
 
     /// `DELETE /secrets/{s}/grants/{g}` on a Clan Secret: revokes a grant.

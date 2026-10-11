@@ -176,22 +176,61 @@ pub enum GrantScope {
     Packages { ids: Vec<Uuid> },
 }
 
-/// A clan grant (`/clans/{c}/grants`).
+/// Actions a grant holds through one delegation: a delegate added them under
+/// the delegating grant `delegation_id`, and they give something only while
+/// it carries `grant.manage` and its `may_grant` holds them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatedActions {
+    pub delegation_id: Uuid,
+    pub actions: BTreeSet<String>,
+}
+
+/// The actions in `actions` that came through none of `delegated`.
+pub(crate) fn direct<'a>(
+    actions: &'a BTreeSet<String>,
+    delegated: &[DelegatedActions],
+) -> BTreeSet<&'a str> {
+    actions
+        .iter()
+        .map(String::as_str)
+        .filter(|action| {
+            !delegated
+                .iter()
+                .any(|through| through.actions.contains(*action))
+        })
+        .collect()
+}
+
+/// The delegations in `delegated` that `action` came through.
+pub(crate) fn delegations(delegated: &[DelegatedActions], action: &str) -> Vec<Uuid> {
+    delegated
+        .iter()
+        .filter(|through| through.actions.contains(action))
+        .map(|through| through.delegation_id)
+        .collect()
+}
+
+/// A clan grant (`/clans/{c}/grants`). A recipient holds at most one grant
+/// over a scope; writing to them over that scope again changes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClanGrant {
     pub id: Uuid,
     pub clan_id: Uuid,
     pub recipient: GrantRecipient,
-    /// What the grant gives: its own inline actions.
+    /// What the grant gives: its own inline actions and those that came
+    /// through a delegation.
     pub actions: BTreeSet<String>,
     /// On a grant that delegates `grant.manage`: what its holder may hand
     /// out. Only clan owners issue such a grant.
     #[serde(default)]
     pub may_grant: Option<BTreeSet<String>>,
     pub scope: GrantScope,
-    pub issuer_id: Uuid,
+    /// The actions that came through a delegation, by delegation. An action
+    /// of `actions` listed in none of them is the grant's own.
     #[serde(default)]
-    pub parent_id: Option<Uuid>,
+    pub delegated: Vec<DelegatedActions>,
+    /// Whoever created the grant.
+    pub issuer_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -203,6 +242,23 @@ impl ClanGrant {
         self.actions
             .iter()
             .any(|action| action.starts_with("area."))
+    }
+
+    /// The grant's own actions: those that came through no delegation. They
+    /// stay until removed; only a clan owner, or a Member-owned map's owner,
+    /// adds them, and a delegate never removes them from a grant that
+    /// delegates.
+    #[must_use]
+    pub fn direct_actions(&self) -> BTreeSet<&str> {
+        direct(&self.actions, &self.delegated)
+    }
+
+    /// The delegations `action` came through, as the server lists them:
+    /// empty for one of the grant's own actions, or one it does not hold.
+    /// The action goes when the last of them stops delegating it.
+    #[must_use]
+    pub fn delegations_of(&self, action: &str) -> Vec<Uuid> {
+        delegations(&self.delegated, action)
     }
 }
 
@@ -725,47 +781,8 @@ impl CloudApiClient {
             .await
     }
 
-    /// `POST /clans/{c}/grants` with inline actions. Map and folder access
-    /// goes to groups only.
-    ///
-    /// # Errors
-    /// [`CloudError::InvalidInput`](crate::CloudError::InvalidInput) for
-    /// actions that do not apply to the scope, or map access for a member;
-    /// the uniform 404 when the caller may not write it; other failures via
-    /// [`CloudError::from_status`](crate::CloudError::from_status).
-    pub async fn create_clan_grant(
-        &self,
-        clan_id: Uuid,
-        recipient: GrantRecipient,
-        scope: &GrantScope,
-        actions: &[&str],
-    ) -> CloudResult<ClanGrant> {
-        let body = json!({ "recipient": recipient, "scope": scope, "actions": actions });
-        self.post(
-            &format!("/clans/{clan_id}/grants"),
-            Some(&body),
-            Auth::Required,
-        )
-        .await
-    }
-
-    /// `PATCH /clans/{c}/grants/{g}`: replaces what the grant gives with
-    /// inline `actions`. Recipient and scope stay.
-    ///
-    /// # Errors
-    /// As [`Self::create_clan_grant`].
-    pub async fn update_clan_grant(
-        &self,
-        clan_id: Uuid,
-        grant_id: Uuid,
-        actions: &[&str],
-    ) -> CloudResult<ClanGrant> {
-        let body = json!({ "actions": actions });
-        self.patch(&format!("/clans/{clan_id}/grants/{grant_id}"), &body)
-            .await
-    }
-
-    /// `DELETE /clans/{c}/grants/{g}`, with the grants issued under it.
+    /// `DELETE /clans/{c}/grants/{g}`, with every action that came through
+    /// it.
     ///
     /// # Errors
     /// Non-2xx statuses via
@@ -863,8 +880,8 @@ mod tests {
             "recipient": { "group_id": group },
             "actions": ["area.read", "area.add", "area.edit", "area.remove_content"],
             "scope": { "kind": "clan" },
+            "delegated": [],
             "issuer_id": "33333333-3333-4333-8333-333333333333",
-            "parent_id": null,
             "created_at": "2026-10-01T12:00:00.123456Z",
             "updated_at": "2026-10-01T12:00:00.123456Z"
         }))
@@ -873,6 +890,38 @@ mod tests {
         assert_eq!(grant.scope, GrantScope::Clan);
         assert!(grant.actions.contains(action::REMOVE_FROM_AREA));
         assert!(grant.gives_map_access());
+        assert_eq!(grant.direct_actions().len(), 4);
+    }
+
+    #[test]
+    fn delegated_actions_are_told_apart_from_the_grants_own() {
+        let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let grant: ClanGrant = serde_json::from_value(json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "clan_id": "22222222-2222-4222-8222-222222222222",
+            "recipient": { "group_id": "44444444-4444-4444-8444-444444444444" },
+            "actions": ["area.read", "area.add", "area.edit"],
+            "scope": { "kind": "atlases", "ids": ["55555555-5555-4555-8555-555555555555"] },
+            "delegated": [
+                { "delegation_id": first, "actions": ["area.add", "area.edit"] },
+                { "delegation_id": second, "actions": ["area.edit"] }
+            ],
+            "issuer_id": "33333333-3333-4333-8333-333333333333",
+            "created_at": "2026-10-01T12:00:00Z",
+            "updated_at": "2026-10-01T12:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(grant.direct_actions(), [action::READ_AREA].into());
+        assert!(grant.delegations_of(action::READ_AREA).is_empty());
+        assert_eq!(grant.delegations_of(action::ADD_TO_AREA), [first]);
+        assert_eq!(grant.delegations_of(action::EDIT_AREA), [first, second]);
+        assert!(grant.delegations_of(action::DELETE_AREA).is_empty());
+
+        // A grant without the list holds only its own actions.
+        let mut wire = serde_json::to_value(&grant).unwrap();
+        wire.as_object_mut().unwrap().remove("delegated");
+        let bare: ClanGrant = serde_json::from_value(wire).unwrap();
+        assert_eq!(bare.direct_actions().len(), 3);
     }
 
     #[test]

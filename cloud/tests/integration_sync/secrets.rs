@@ -3,7 +3,7 @@
 //! atlas cache shows the result as soon as the call returns.
 
 use super::*;
-use smudgy_cloud::cloud_api::{SecretChange, SecretColorChange};
+use smudgy_cloud::cloud_api::{SecretChange, SecretColorChange, SecretGrantChange};
 use smudgy_cloud::mapper::AreaMutationBatch;
 use smudgy_cloud::mutation::RoomRenumbering;
 use smudgy_cloud::{LabelArgs, LabelId, LabelUpdates, MovedContent, SourceBundle, SourceId};
@@ -305,7 +305,15 @@ async fn a_secret_shared_through_the_mapper_reaches_the_grantee() {
     assert!(!shared.can("manage_access"));
 
     owner_mapper
-        .update_secret_grant(area, &secret, grant.id, &["add"])
+        .update_secret_grant(
+            area,
+            &secret,
+            grant.id,
+            &SecretGrantChange {
+                add: ["add".to_string()].into(),
+                remove: ["edit".to_string(), "remove".to_string()].into(),
+            },
+        )
         .await
         .expect("change the grant");
     tick(&friend_mapper).await;

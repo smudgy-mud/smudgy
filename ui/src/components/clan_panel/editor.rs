@@ -1,16 +1,20 @@
-//! Individual action editors for grants and Secret access. Unknown grant actions are preserved.
+//! Individual action editors for grants and Secret access, each kind's
+//! switches with a preset picker that sets them. Unknown grant actions are
+//! preserved, and a save sends only what the editor changed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, space, text};
 use iced::{Alignment, Length};
-use smudgy_cloud::clan_access::{GrantBody, IndexedResource};
+use smudgy_cloud::clan_access::{GrantBody, GrantChange, IndexedResource};
 use smudgy_cloud::clan_secrets::{ClanSecretGrant, SecretRecipient};
 use smudgy_cloud::clans::{ClanGrant, ClanGroup, ClanMember, GrantRecipient, GrantScope, action};
+use smudgy_cloud::cloud_api::SecretGrantChange;
 use smudgy_cloud::{AreaId, AtlasId, Uuid};
 
-use crate::presets::{self, Kind, ScopeKind};
+use crate::components::preset_picker::Picker;
+use crate::presets::{self, Facet, Kind, PresetPick, ScopeKind};
 use crate::theme::{self, Element as ThemedElement};
 
 /// A group in a picker.
@@ -33,6 +37,18 @@ pub enum EditorMessage {
     TargetToggled(Uuid, bool),
     ActionToggled(&'static str, bool),
     MayGrantToggled(&'static str, bool),
+    /// A preset picked for one kind's actions.
+    Preset(PresetPick),
+    /// A preset picked for what a delegation may hand out.
+    MayGrantPreset(PresetPick),
+}
+
+/// What saving a grant editor sends: a new grant, or the change to the one
+/// edited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantWrite {
+    Create(GrantScope, GrantBody),
+    Change(Uuid, GrantChange),
 }
 
 /// The open grant editor.
@@ -40,6 +56,11 @@ pub enum EditorMessage {
 pub struct GrantEditor {
     /// The grant being changed: its recipient and scope stay.
     pub editing: Option<Uuid>,
+    /// The edited grant's actions and ceiling before the edit, which a save
+    /// compares with; empty for a new grant.
+    before: (BTreeSet<String>, BTreeSet<String>),
+    /// The delegations each of the edited grant's actions came through.
+    delegated: BTreeMap<String, Vec<Uuid>>,
     pub recipient: Option<GrantRecipient>,
     /// The recipient came with the dialog (a group's page, or Edit).
     pub recipient_fixed: bool,
@@ -64,6 +85,8 @@ impl GrantEditor {
     fn blank(scope: ScopeKind) -> Self {
         Self {
             editing: None,
+            before: (BTreeSet::new(), BTreeSet::new()),
+            delegated: BTreeMap::new(),
             recipient: None,
             recipient_fixed: false,
             scope,
@@ -104,6 +127,16 @@ impl GrantEditor {
         let (scope, targets) = scope_parts(&grant.scope);
         let mut editor = Self {
             editing: Some(grant.id),
+            before: (
+                grant.actions.clone(),
+                grant.may_grant.clone().unwrap_or_default(),
+            ),
+            delegated: grant
+                .actions
+                .iter()
+                .map(|action| (action.clone(), grant.delegations_of(action)))
+                .filter(|(_, through)| !through.is_empty())
+                .collect(),
             recipient: Some(grant.recipient),
             recipient_fixed: true,
             scope_fixed: true,
@@ -124,6 +157,40 @@ impl GrantEditor {
             editor.may_grant = may.iter().cloned().collect();
         }
         editor
+    }
+
+    /// Edits `existing`, the grant the chosen recipient already holds over
+    /// the chosen scope, instead of writing a second one (clans.md §5.3);
+    /// with `None`, a new grant again. The recipient and scope choices stay
+    /// as they are.
+    pub fn load(&mut self, existing: Option<&ClanGrant>) {
+        let next = match existing {
+            Some(grant) if self.editing != Some(grant.id) => Self::editing(grant),
+            Some(_) => return,
+            None if self.editing.is_some() => Self::blank(self.scope),
+            None => return,
+        };
+        *self = Self {
+            recipient: self.recipient,
+            recipient_fixed: self.recipient_fixed,
+            scope: self.scope,
+            scope_fixed: self.scope_fixed,
+            targets: std::mem::take(&mut self.targets),
+            member_map: self.member_map,
+            ..next
+        };
+    }
+
+    /// The delegations `action` came through on the edited grant.
+    #[must_use]
+    pub fn delegations_of(&self, action: &str) -> &[Uuid] {
+        self.delegated.get(action).map_or(&[], Vec::as_slice)
+    }
+
+    /// The scope the editor writes over.
+    #[must_use]
+    pub fn scope(&self) -> GrantScope {
+        grant_scope(self.scope, &self.targets)
     }
 
     /// The kinds this editor shows rows for.
@@ -212,22 +279,35 @@ impl GrantEditor {
                     self.may_grant.remove(action);
                 }
             }
+            // A preset is the switches it sets, each as a single toggle.
+            EditorMessage::Preset(pick) => {
+                for (action, on) in pick.changes() {
+                    self.update(EditorMessage::ActionToggled(action, on));
+                }
+            }
+            EditorMessage::MayGrantPreset(pick) => {
+                for (action, on) in pick.changes() {
+                    self.update(EditorMessage::MayGrantToggled(action, on));
+                }
+            }
         }
     }
 
-    /// The single grant this editor writes.
+    /// What saving sends: the new grant, or the change to the edited one,
+    /// naming exactly what the editor changed; `None` when it changed
+    /// nothing. A change removing every action deletes the grant.
     ///
     /// # Errors
     /// The reason to show when the editor is not ready: no recipient, no
-    /// target, or no action.
-    pub fn writes(&self, member_recipient: bool) -> Result<Vec<(GrantScope, GrantBody)>, String> {
+    /// target, or no action for a new grant.
+    pub fn writes(&self, member_recipient: bool) -> Result<Option<GrantWrite>, String> {
         if self.recipient.is_none() {
             return Err(crate::i18n::t!("clans-editor-choose-group"));
         }
         if self.scope != ScopeKind::Clan && self.targets.is_empty() {
             return Err(crate::i18n::t!("clans-editor-choose-target"));
         }
-        let mut chosen: Vec<String> = self
+        let mut chosen: BTreeSet<String> = self
             .actions
             .iter()
             .copied()
@@ -236,22 +316,26 @@ impl GrantEditor {
             .map(ToString::to_string)
             .collect();
         chosen.extend(self.unknown.iter().cloned());
+        let ceiling: BTreeSet<String> = if chosen.contains(action::MANAGE_GRANTS) {
+            self.may_grant.clone()
+        } else {
+            BTreeSet::new()
+        };
+        if let Some(id) = self.editing {
+            let change = GrantChange::between(&self.before.0, &self.before.1, &chosen, &ceiling);
+            return Ok((!change.is_empty()).then_some(GrantWrite::Change(id, change)));
+        }
         if chosen.is_empty() {
             return Err(crate::i18n::t!("clans-editor-choose-action"));
         }
-        let may_grant = |actions: &[String]| {
-            actions
-                .iter()
-                .any(|action| action == action::MANAGE_GRANTS)
-                .then(|| self.may_grant.iter().cloned().collect::<Vec<_>>())
-        };
-        Ok(vec![(
-            grant_scope(self.scope, &self.targets),
+        let delegates = chosen.contains(action::MANAGE_GRANTS);
+        Ok(Some(GrantWrite::Create(
+            self.scope(),
             GrantBody {
-                may_grant: may_grant(&chosen),
-                actions: chosen,
+                actions: chosen.into_iter().collect(),
+                may_grant: delegates.then(|| ceiling.into_iter().collect()),
             },
-        )])
+        )))
     }
 }
 
@@ -301,10 +385,38 @@ pub struct EditorContext<'a> {
     pub folders: &'a [IndexedResource],
     pub maps: &'a [IndexedResource],
     pub packages: &'a [IndexedResource],
+    /// The grants the viewer sees, for naming the delegation an action came
+    /// through.
+    pub grants: &'a [ClanGrant],
     pub owner: bool,
 }
 
 impl EditorContext<'_> {
+    /// The note under an action that came through `delegations`: whose
+    /// access management added it, which it ends with (clans.md §1.2).
+    #[must_use]
+    pub fn delegated_note(&self, delegations: &[Uuid]) -> Option<String> {
+        if delegations.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = delegations
+            .iter()
+            .map(|id| {
+                self.grants
+                    .iter()
+                    .find(|grant| grant.id == *id)
+                    .map_or_else(
+                        || crate::i18n::t!("clans-unknown-group"),
+                        |delegation| self.recipient_name(delegation.recipient),
+                    )
+            })
+            .collect();
+        Some(crate::i18n::t!(
+            "permissions-delegated",
+            "by" => names.join(&crate::i18n::t!("mapper-multi-list-separator"))
+        ))
+    }
+
     /// The name of the group or member a grant goes to.
     #[must_use]
     pub fn recipient_name(&self, recipient: GrantRecipient) -> String {
@@ -512,26 +624,56 @@ pub fn view<'a, Message: Clone + 'a>(
         }
     }
 
-    // Every permission is explicit; sections explain how it combines with others.
+    // The recipient's grant over this scope, opened in place of a second.
+    if editor.editing.is_some() && !editor.recipient_fixed {
+        col = col.push(
+            text(crate::i18n::t!("clans-editor-existing"))
+                .size(12)
+                .style(theme::builtins::text::muted),
+        );
+    }
+
+    // Every permission is explicit, with a preset picker per kind that sets
+    // the switches.
     for kind in editor.kinds() {
-        let actions: Vec<_> = kind
+        let rows: Vec<Switch> = kind
             .actions()
             .filter(|action| {
                 editor.allowed(action) && (context.owner || !action.starts_with("grant."))
             })
-            .collect();
-        if actions.is_empty() {
-            continue;
-        }
-        col = col.push(text(kind.label()).size(16));
-        for action in actions {
-            col = col.push(super::permission_rows::permission(
+            .map(|action| Switch {
                 action,
-                editor.actions.contains(action),
-                (!member_recipient || editor.member_may(action))
+                checked: editor.actions.contains(action),
+                enabled: (!member_recipient || editor.member_may(action))
                     && !(editor.member_map
                         && action == action::READ_AREA
                         && editor.actions.iter().any(|a| *a != action::READ_AREA)),
+            })
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        col = col.push(text(kind.label()).size(16));
+        for picker in pickers(&rows, |preset| {
+            preset.applies_to(editor.scope) && (context.owner || !preset.delegates())
+        }) {
+            let usable = picker.choices.len() > 1;
+            col = col.push(picker.view(
+                crate::i18n::t!("permissions-preset"),
+                usable.then_some(move |pick| map(EditorMessage::Preset(pick))),
+            ));
+        }
+        for row in rows {
+            let action = row.action;
+            col = col.push(super::permission_rows::noted(
+                action,
+                row.checked,
+                row.enabled,
+                editor
+                    .actions
+                    .contains(action)
+                    .then(|| context.delegated_note(editor.delegations_of(action)))
+                    .flatten(),
                 move |on| map(EditorMessage::ActionToggled(action, on)),
             ));
         }
@@ -543,7 +685,7 @@ pub fn view<'a, Message: Clone + 'a>(
                 .size(13)
                 .style(theme::builtins::text::muted),
         );
-        for action in Kind::ALL
+        let rows: Vec<Switch> = Kind::ALL
             .into_iter()
             .filter(|kind| *kind != Kind::Secret)
             .flat_map(Kind::actions)
@@ -553,11 +695,27 @@ pub fn view<'a, Message: Clone + 'a>(
                     && !action.starts_with("clan.")
                     && !action.starts_with("group.")
             })
-        {
+            .map(|action| Switch {
+                action,
+                checked: editor.may_grant.contains(action),
+                enabled: true,
+            })
+            .collect();
+        for picker in pickers(&rows, |preset| {
+            preset.applies_to(editor.scope) && !preset.delegates()
+        }) {
+            let usable = picker.choices.len() > 1;
+            col = col.push(picker.view(
+                picker.facet.kind.label(),
+                usable.then_some(move |pick| map(EditorMessage::MayGrantPreset(pick))),
+            ));
+        }
+        for row in rows {
+            let action = row.action;
             col = col.push(super::permission_rows::permission(
                 action,
-                editor.may_grant.contains(action),
-                true,
+                row.checked,
+                row.enabled,
                 move |on| map(EditorMessage::MayGrantToggled(action, on)),
             ));
         }
@@ -569,6 +727,42 @@ pub fn view<'a, Message: Clone + 'a>(
     col.into()
 }
 
+/// One permission's switch: whether it shows checked, and whether the
+/// viewer may change it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Switch {
+    pub action: &'static str,
+    pub checked: bool,
+    pub enabled: bool,
+}
+
+/// The preset pickers for the facets with actions among `rows`, with the
+/// presets `keep` keeps: each offering the choices whose switches the viewer
+/// may set. An action of the facet not among `rows` is one the viewer may
+/// not give here, so a choice must leave it off.
+pub(super) fn pickers(rows: &[Switch], keep: impl Fn(presets::Preset) -> bool) -> Vec<Picker> {
+    let switch = |action: &str| rows.iter().find(|row| row.action == action).copied();
+    Facet::all()
+        .filter(|facet| facet.actions.iter().any(|action| switch(action).is_some()))
+        .filter_map(|facet| {
+            let presets: Vec<_> = facet
+                .presets()
+                .into_iter()
+                .filter(|preset| keep(*preset))
+                .collect();
+            if presets.is_empty() {
+                return None;
+            }
+            let checked = rows.iter().filter(|row| row.checked).map(|row| row.action);
+            Some(Picker::new(facet, checked, presets, |pick| {
+                pick.changes().all(|(action, on)| {
+                    switch(action).map_or(!on, |row| row.checked == on || row.enabled)
+                })
+            }))
+        })
+        .collect()
+}
+
 // ===========================================================================
 // One Clan Secret's grant
 // ===========================================================================
@@ -577,6 +771,14 @@ pub fn view<'a, Message: Clone + 'a>(
 pub enum SecretEditorMessage {
     RecipientPicked(GroupChoice),
     ActionToggled(&'static str, bool),
+    Preset(PresetPick),
+}
+
+/// What saving a Clan Secret's grant editor sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretWrite {
+    Create(SecretRecipient, Vec<&'static str>),
+    Change(Uuid, SecretGrantChange),
 }
 
 /// The open editor of a grant on one Clan Secret.
@@ -584,6 +786,11 @@ pub enum SecretEditorMessage {
 pub struct SecretGrantEditor {
     pub secret: Uuid,
     pub editing: Option<Uuid>,
+    /// The edited grant's actions before the edit, which a save compares
+    /// with.
+    before: BTreeSet<String>,
+    /// The recipient came with the editor (Edit), rather than picked.
+    recipient_fixed: bool,
     pub recipient: Option<SecretRecipient>,
     pub actions: BTreeSet<&'static str>,
     /// What the grant may give when the viewer manages the Secret's access
@@ -599,16 +806,19 @@ impl SecretGrantEditor {
     /// hold or the grant already has, and never `manage_access`.
     #[must_use]
     pub fn within<'a>(mut self, mine: impl IntoIterator<Item = &'a str>) -> Self {
+        self.bound_by(mine);
+        self
+    }
+
+    /// [`Self::within`], in place: after [`Self::load`] the grant's own
+    /// actions change what it may give.
+    pub fn bound_by<'a>(&mut self, mine: impl IntoIterator<Item = &'a str>) {
         let mine: Vec<&str> = mine.into_iter().collect();
         if mine.contains(&"manage_ownership") {
             self.bound = None;
-            return self;
+            return;
         }
-        let before: Vec<&'static str> = if self.editing.is_some() {
-            self.actions.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
+        let before: Vec<&'static str> = self.before.iter().filter_map(|a| known(a)).collect();
         self.bound = Some(
             mine.into_iter()
                 .filter_map(known)
@@ -617,7 +827,6 @@ impl SecretGrantEditor {
                 .filter(|action| *action != presets::secret_action::MANAGE_ACCESS)
                 .collect(),
         );
-        self
     }
 
     /// Whether the grant may give `action` here.
@@ -634,6 +843,8 @@ impl SecretGrantEditor {
         Self {
             secret,
             editing: None,
+            before: BTreeSet::new(),
+            recipient_fixed: false,
             recipient: None,
             actions: BTreeSet::from([presets::secret_action::READ]),
             bound: None,
@@ -652,6 +863,8 @@ impl SecretGrantEditor {
         Self {
             secret,
             editing: Some(grant.id),
+            before: grant.actions.clone(),
+            recipient_fixed: true,
             recipient: Some(grant.recipient),
             actions,
             bound: None,
@@ -659,11 +872,29 @@ impl SecretGrantEditor {
         }
     }
 
+    /// Edits `existing`, the grant the picked group already holds on the
+    /// Secret, instead of replacing it; with `None`, a new grant again
+    /// (clans.md §8.4).
+    pub fn load(&mut self, existing: Option<&ClanSecretGrant>) {
+        let next = match existing {
+            Some(grant) if self.editing != Some(grant.id) => Self::editing(self.secret, grant),
+            Some(_) => return,
+            None if self.editing.is_some() => Self::new(self.secret),
+            None => return,
+        };
+        *self = Self {
+            recipient: self.recipient,
+            recipient_fixed: self.recipient_fixed,
+            bound: self.bound.take(),
+            ..next
+        };
+    }
+
     pub fn update(&mut self, message: SecretEditorMessage) {
         self.error = None;
         match message {
             SecretEditorMessage::RecipientPicked(group) => {
-                if self.editing.is_none() {
+                if !self.recipient_fixed {
                     self.recipient = Some(SecretRecipient::Group { group_id: group.id });
                 }
             }
@@ -674,7 +905,43 @@ impl SecretGrantEditor {
                     self.actions.remove(action);
                 }
             }
+            SecretEditorMessage::Preset(pick) => {
+                for (action, on) in pick.changes() {
+                    if on || self.allows(action) {
+                        self.update(SecretEditorMessage::ActionToggled(action, on));
+                    }
+                }
+            }
         }
+    }
+
+    /// Whether the editor shows a grant the picked group already held.
+    #[must_use]
+    pub fn loaded(&self) -> bool {
+        self.editing.is_some() && !self.recipient_fixed
+    }
+
+    /// What saving sends: the new grant, or the change to the edited one;
+    /// `None` when nothing changed.
+    ///
+    /// # Errors
+    /// The reason to show when no group is picked.
+    pub fn writes(&self) -> Result<Option<SecretWrite>, String> {
+        let Some(recipient) = self.recipient else {
+            return Err(crate::i18n::t!("clans-editor-choose-group"));
+        };
+        Ok(match self.editing {
+            Some(id) => {
+                let after: BTreeSet<String> =
+                    self.actions.iter().map(ToString::to_string).collect();
+                let change = SecretGrantChange::between(&self.before, &after);
+                (!change.is_empty()).then_some(SecretWrite::Change(id, change))
+            }
+            None => Some(SecretWrite::Create(
+                recipient,
+                self.actions.iter().copied().collect(),
+            )),
+        })
     }
 }
 
@@ -686,8 +953,8 @@ pub fn secret_view<'a, Message: Clone + 'a>(
     map: impl Fn(SecretEditorMessage) -> Message + Copy + 'a,
 ) -> ThemedElement<'a, Message> {
     let label = |key: String| text(key).size(13).style(theme::builtins::text::muted);
-    let recipient: ThemedElement<'a, Message> = match (editor.recipient, editor.editing) {
-        (Some(SecretRecipient::Group { group_id }), Some(_)) => text(
+    let recipient: ThemedElement<'a, Message> = match (editor.recipient, editor.recipient_fixed) {
+        (Some(SecretRecipient::Group { group_id }), true) => text(
             groups
                 .iter()
                 .find(|group| group.id == group_id)
@@ -729,14 +996,35 @@ pub fn secret_view<'a, Message: Clone + 'a>(
     let mut col =
         column![column![label(crate::i18n::t!("clans-editor-group")), recipient].spacing(4)]
             .spacing(10);
-    for action in Kind::Secret
+    if editor.loaded() {
+        col = col.push(
+            text(crate::i18n::t!("clans-editor-existing"))
+                .size(12)
+                .style(theme::builtins::text::muted),
+        );
+    }
+    let rows: Vec<Switch> = Kind::Secret
         .actions()
         .filter(|action| editor.allows(action))
-    {
+        .map(|action| Switch {
+            action,
+            checked: editor.actions.contains(action),
+            enabled: action != presets::secret_action::READ,
+        })
+        .collect();
+    for picker in pickers(&rows, |_| true) {
+        let usable = picker.choices.len() > 1;
+        col = col.push(picker.view(
+            crate::i18n::t!("permissions-preset"),
+            usable.then_some(move |pick| map(SecretEditorMessage::Preset(pick))),
+        ));
+    }
+    for row in rows {
+        let action = row.action;
         col = col.push(super::permission_rows::permission(
             action,
-            editor.actions.contains(action),
-            action != presets::secret_action::READ,
+            row.checked,
+            row.enabled,
             move |on| map(SecretEditorMessage::ActionToggled(action, on)),
         ));
     }
@@ -782,6 +1070,33 @@ mod tests {
         Uuid::from_u128(7)
     }
 
+    /// The grant a new editor writes.
+    fn created(write: Result<Option<GrantWrite>, String>) -> (GrantScope, GrantBody) {
+        match write {
+            Ok(Some(GrantWrite::Create(scope, body))) => (scope, body),
+            other => panic!("expected a new grant, got {other:?}"),
+        }
+    }
+
+    fn folder_grant(actions: &[&str]) -> ClanGrant {
+        serde_json::from_value(serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "clan_id": "22222222-2222-4222-8222-222222222222",
+            "recipient": { "group_id": "33333333-3333-4333-8333-333333333333" },
+            "actions": actions,
+            "scope": { "kind": "atlases", "ids": ["44444444-4444-4444-8444-444444444444"] },
+            "delegated": [],
+            "issuer_id": "55555555-5555-4555-8555-555555555555",
+            "created_at": "2026-10-07T00:00:00Z",
+            "updated_at": "2026-10-07T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn names(actions: &[&str]) -> BTreeSet<String> {
+        actions.iter().map(ToString::to_string).collect()
+    }
+
     #[test]
     fn a_scope_takes_only_its_actions_and_needs_a_target() {
         let mut editor = GrantEditor::for_group(group());
@@ -798,9 +1113,9 @@ mod tests {
             Err(crate::i18n::t!("clans-editor-choose-target"))
         );
         editor.update(EditorMessage::TargetToggled(Uuid::from_u128(3), true));
-        let writes = editor.writes(false).unwrap();
+        let (scope, _) = created(editor.writes(false));
         assert_eq!(
-            writes[0].0,
+            scope,
             GrantScope::Areas {
                 ids: vec![AreaId(Uuid::from_u128(3))]
             }
@@ -809,23 +1124,72 @@ mod tests {
     }
 
     #[test]
-    fn editing_keeps_unknown_actions() {
-        let grant: ClanGrant = serde_json::from_value(serde_json::json!({
-            "id": "11111111-1111-4111-8111-111111111111",
-            "clan_id": "22222222-2222-4222-8222-222222222222",
-            "recipient": { "group_id": "33333333-3333-4333-8333-333333333333" },
-            "actions": ["area.read", "secret.read", "secret.add", "secret.edit", "area.future"],
-            "scope": { "kind": "atlases", "ids": ["44444444-4444-4444-8444-444444444444"] },
-            "issuer_id": "55555555-5555-4555-8555-555555555555",
-            "parent_id": null,
-            "created_at": "2026-10-07T00:00:00Z",
-            "updated_at": "2026-10-07T00:00:00Z"
-        }))
-        .unwrap();
-        let editor = GrantEditor::editing(&grant);
+    fn editing_sends_only_what_changed_and_keeps_unknown_actions() {
+        let grant = folder_grant(&[
+            "area.read",
+            "secret.read",
+            "secret.add",
+            "secret.edit",
+            "area.future",
+        ]);
+        let mut editor = GrantEditor::editing(&grant);
         assert_eq!(editor.scope, ScopeKind::Folders);
-        let writes = editor.writes(false).unwrap();
-        assert!(writes[0].1.actions.contains(&"area.future".to_string()));
+        assert_eq!(editor.writes(false), Ok(None), "nothing changed");
+        editor.update(EditorMessage::ActionToggled(action::ADD_TO_AREA, true));
+        editor.update(EditorMessage::ActionToggled(action::EDIT_SECRETS, false));
+        assert_eq!(
+            editor.writes(false),
+            Ok(Some(GrantWrite::Change(
+                grant.id,
+                GrantChange {
+                    add: names(&["area.add"]),
+                    remove: names(&["secret.edit"]),
+                    ..GrantChange::default()
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn a_preset_sets_its_kinds_switches_and_leaves_the_rest() {
+        let mut editor = GrantEditor::editing(&folder_grant(&["area.read", "area.copy"]));
+        editor.update(EditorMessage::Preset(PresetPick::Preset(
+            presets::Preset::MapEditor,
+        )));
+        for action in [
+            action::READ_AREA,
+            action::ADD_TO_AREA,
+            action::EDIT_AREA,
+            action::REMOVE_FROM_AREA,
+            action::COPY_AREA,
+        ] {
+            assert!(editor.actions.contains(action), "{action}");
+        }
+        editor.update(EditorMessage::Preset(PresetPick::Preset(
+            presets::Preset::MapReader,
+        )));
+        assert_eq!(
+            editor.actions,
+            BTreeSet::from([action::READ_AREA, action::COPY_AREA])
+        );
+    }
+
+    #[test]
+    fn choosing_a_recipient_who_holds_a_grant_here_edits_it() {
+        let grant = folder_grant(&["area.read"]);
+        let mut editor = GrantEditor::for_resource(
+            ScopeKind::Folders,
+            Uuid::from_u128(0x4444_4444_4444_4444_8444_4444_4444_4444),
+        );
+        editor.update(EditorMessage::ActionToggled(action::EDIT_AREA, true));
+        editor.load(Some(&grant));
+        assert_eq!(editor.editing, Some(grant.id));
+        assert_eq!(editor.actions, BTreeSet::from([action::READ_AREA]));
+        assert!(!editor.recipient_fixed, "the recipient may still change");
+        // Another recipient, with no grant here, starts a new one.
+        editor.load(None);
+        assert_eq!(editor.editing, None);
+        assert!(editor.actions.is_empty());
     }
 
     #[test]
@@ -842,9 +1206,9 @@ mod tests {
         ] {
             editor.update(EditorMessage::ActionToggled(action, true));
         }
-        let writes = editor.writes(true).unwrap();
+        let (_, body) = created(editor.writes(true));
         assert_eq!(
-            writes[0].1.actions.len(),
+            body.actions.len(),
             4,
             "the creator's Editor grant keeps its actions"
         );
@@ -866,8 +1230,8 @@ mod tests {
         for action in ["package.read", "package.edit_draft"] {
             editor.update(EditorMessage::ActionToggled(action, true));
         }
-        let writes = editor.writes(true).unwrap();
-        assert_eq!(writes[0].1.actions, ["package.edit_draft", "package.read"]);
+        let (_, body) = created(editor.writes(true));
+        assert_eq!(body.actions, ["package.edit_draft", "package.read"]);
     }
 
     /// A Secret's access manager who does not own it gives only actions

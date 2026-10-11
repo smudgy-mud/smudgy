@@ -1,11 +1,13 @@
-//! A group's permissions, selected by resource rather than by preset.
+//! A group's permissions, selected by resource: each permission a switch,
+//! with a preset picker per group of switches that sets them.
+use super::editor::{Switch, pickers};
 use super::{ClanPage, Message as PanelMessage, editor, permission_rows};
-use crate::presets::{self, Kind, ScopeKind};
+use crate::presets::{self, Kind, PresetPick, ScopeKind};
 use crate::theme::{self, Element as ThemedElement};
 use iced::widget::{button, column, container, row, rule, scrollable, space, text};
 use iced::{Alignment, Length};
 use smudgy_cloud::Uuid;
-use smudgy_cloud::clan_access::GrantBody;
+use smudgy_cloud::clan_access::{GrantBody, GrantChange};
 use smudgy_cloud::clans::{ClanGrant, ClanGroup, GrantRecipient, GrantScope, action};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,27 +44,54 @@ pub enum Message {
     Select(Target),
     Toggle(&'static str, bool),
     Ceiling(&'static str, bool),
+    /// A preset picked for the selected resource's permissions.
+    Preset(PresetPick),
+    /// A preset picked for what the group may hand out there.
+    CeilingPreset(PresetPick),
 }
 
+/// The group's grant over one resource as the editor changes it. A group
+/// holds at most one grant over a scope (clans.md §5.3).
 #[derive(Debug, Clone)]
 struct Draft {
-    original: Vec<ClanGrant>,
+    original: Option<ClanGrant>,
     actions: BTreeSet<String>,
     ceiling: BTreeSet<String>,
 }
 
 impl Draft {
-    fn new(original: Vec<ClanGrant>) -> Self {
+    fn new(original: Option<ClanGrant>) -> Self {
         Self {
             actions: original
-                .iter()
-                .flat_map(|g| g.actions.iter().cloned())
-                .collect(),
+                .as_ref()
+                .map(|grant| grant.actions.clone())
+                .unwrap_or_default(),
             ceiling: original
-                .iter()
-                .flat_map(|g| g.may_grant.iter().flatten().cloned())
-                .collect(),
+                .as_ref()
+                .and_then(|grant| grant.may_grant.clone())
+                .unwrap_or_default(),
             original,
+        }
+    }
+
+    /// The actions and ceiling the grant has before the edit.
+    fn before(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let Some(grant) = &self.original else {
+            return (BTreeSet::new(), BTreeSet::new());
+        };
+        (
+            grant.actions.clone(),
+            grant.may_grant.clone().unwrap_or_default(),
+        )
+    }
+
+    /// The ceiling the edit leaves: none once the grant stops handing out
+    /// access.
+    fn after_ceiling(&self) -> BTreeSet<String> {
+        if self.actions.contains(action::MANAGE_GRANTS) {
+            self.ceiling.clone()
+        } else {
+            BTreeSet::new()
         }
     }
 }
@@ -81,11 +110,12 @@ pub struct Permissions {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// One request a save sends: creating the group's grant over a resource, or
+/// changing the one it holds there.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
     Create(GrantScope, GrantBody),
-    Patch(Uuid, GrantBody),
-    Delete(Uuid),
+    Change(Uuid, GrantChange),
 }
 
 impl Permissions {
@@ -114,12 +144,12 @@ impl Permissions {
         }
     }
 
-    fn direct(&self, target: Target, page: &ClanPage) -> Vec<ClanGrant> {
+    /// The group's grant over exactly `target`, if it holds one.
+    fn direct(&self, target: Target, page: &ClanPage) -> Option<ClanGrant> {
         page.grants_to(self.group)
             .into_iter()
-            .filter(|g| target.exact(g))
+            .find(|g| target.exact(g))
             .cloned()
-            .collect()
     }
 
     /// Inheritance follows the pending folder edits as well as saved grants.
@@ -158,11 +188,7 @@ impl Permissions {
             if *scope == target || !scope_covers(&scope.scope(), target, page) {
                 continue;
             }
-            let before: BTreeSet<_> = draft
-                .original
-                .iter()
-                .flat_map(|g| g.actions.iter().cloned())
-                .collect();
+            let (before, _) = draft.before();
             let added: BTreeSet<_> = draft.actions.difference(&before).cloned().collect();
             if !added.is_empty() {
                 inherited.push((scope.scope(), added, None));
@@ -216,54 +242,74 @@ impl Permissions {
                     _ => self.selected_map = Some(target),
                 }
             }
-            Message::Toggle(action, on) | Message::Ceiling(action, on) => {
-                let ceiling = matches!(message, Message::Ceiling(..));
-                if let Some(target) = self.active() {
-                    if self.implicit(target, page) || !self.allowed(target, action, page) {
-                        return;
-                    }
-                    if !ceiling
-                        && self
-                            .inherited(target, page)
-                            .iter()
-                            .any(|(_, actions, _)| actions.contains(action))
-                    {
-                        return;
-                    }
-                    if ceiling && !page.clan.is_owner {
-                        return;
-                    }
-                    let member_map = target.kind == ScopeKind::Maps
-                        && page
-                            .maps
-                            .iter()
-                            .any(|map| Some(map.id) == target.id && !map.clan_owned());
-                    if let Some(draft) = self.drafts.get_mut(&target) {
-                        if member_map
-                            && !ceiling
-                            && !on
-                            && action == action::READ_AREA
-                            && draft.actions.iter().any(|a| a != action::READ_AREA)
-                        {
-                            return;
-                        }
-                        let set = if ceiling {
-                            &mut draft.ceiling
-                        } else {
-                            &mut draft.actions
-                        };
-                        if on {
-                            set.insert(action.to_string());
-                            if member_map && !ceiling {
-                                set.insert(action::READ_AREA.to_string());
-                            }
-                        } else {
-                            set.remove(action);
-                        }
-                    }
+            Message::Toggle(action, on) => self.toggle(action, on, false, page),
+            Message::Ceiling(action, on) => self.toggle(action, on, true, page),
+            // A preset is the switches it sets, each under the rules of a
+            // single toggle.
+            Message::Preset(pick) => {
+                for (action, on) in pick.changes() {
+                    self.toggle(action, on, false, page);
+                }
+            }
+            Message::CeilingPreset(pick) => {
+                for (action, on) in pick.changes() {
+                    self.toggle(action, on, true, page);
                 }
             }
         }
+    }
+
+    fn toggle(&mut self, action: &'static str, on: bool, ceiling: bool, page: &ClanPage) {
+        let Some(target) = self.active() else {
+            return;
+        };
+        if self.implicit(target, page) || !self.allowed(target, action, page) {
+            return;
+        }
+        if !ceiling
+            && self
+                .inherited(target, page)
+                .iter()
+                .any(|(_, actions, _)| actions.contains(action))
+        {
+            return;
+        }
+        if ceiling && !page.clan.is_owner {
+            return;
+        }
+        let member_map = self.member_map(target, page);
+        if let Some(draft) = self.drafts.get_mut(&target) {
+            if member_map
+                && !ceiling
+                && !on
+                && action == action::READ_AREA
+                && draft.actions.iter().any(|a| a != action::READ_AREA)
+            {
+                return;
+            }
+            let set = if ceiling {
+                &mut draft.ceiling
+            } else {
+                &mut draft.actions
+            };
+            if on {
+                set.insert(action.to_string());
+                if member_map && !ceiling {
+                    set.insert(action::READ_AREA.to_string());
+                }
+            } else {
+                set.remove(action);
+            }
+        }
+    }
+
+    /// Whether `target` is a Member-owned map.
+    fn member_map(&self, target: Target, page: &ClanPage) -> bool {
+        target.kind == ScopeKind::Maps
+            && page
+                .maps
+                .iter()
+                .any(|map| Some(map.id) == target.id && !map.clan_owned())
     }
 
     fn implicit(&self, target: Target, page: &ClanPage) -> bool {
@@ -303,26 +349,25 @@ impl Permissions {
         if !resource.is_some_and(|r| r.can(action::MANAGE_GRANTS)) {
             return false;
         }
-        // The server remains authoritative; show only permissions within
-        // one of this member's covering delegations.
-        self.delegations(target, page).any(|grant| {
+        // The server remains authoritative. A delegate changes the
+        // permissions within one of their covering delegations, whoever
+        // gave them, except the grant's own on a grant that itself hands
+        // out access (clans.md §1.2).
+        let within = self.delegations(target, page).any(|grant| {
             grant
                 .may_grant
                 .as_ref()
                 .is_some_and(|may| may.contains(permission))
-        }) && self.direct(target, page).iter().all(|grant| {
-            // Removing a checked permission changes every exact grant that
-            // gives it. A delegate cannot edit a broader bundle or another
-            // delegation just because one of its actions fits their ceiling.
-            !grant.actions.contains(permission)
-                || (!grant.actions.contains(action::MANAGE_GRANTS)
-                    && grant.may_grant.as_ref().is_none_or(BTreeSet::is_empty)
-                    && self.delegations(target, page).any(|held| {
-                        held.may_grant
-                            .as_ref()
-                            .is_some_and(|may| grant.actions.is_subset(may))
-                    }))
-        })
+        });
+        let protected = self
+            .drafts
+            .get(&target)
+            .and_then(|draft| draft.original.as_ref())
+            .is_some_and(|grant| {
+                grant.actions.contains(action::MANAGE_GRANTS)
+                    && grant.direct_actions().contains(permission)
+            });
+        within && !protected
     }
 
     fn delegations<'a>(
@@ -335,117 +380,39 @@ impl Permissions {
                 GrantRecipient::Group { group_id } => page.clan.group_ids.contains(&group_id),
                 GrantRecipient::User { user_id } => Some(user_id) == self.viewer,
             };
-            held && grant.parent_id.is_none()
-                && grant.actions.contains(action::MANAGE_GRANTS)
+            held && grant.actions.contains(action::MANAGE_GRANTS)
                 && grant.scope != GrantScope::Clan
                 && covers(grant, target, page)
         })
     }
 
-    pub fn writes(&self, page: &ClanPage) -> Vec<Write> {
+    /// What a save sends: for each resource changed, the group's grant
+    /// created, or a change naming exactly the switches changed, so another
+    /// editor's changes meanwhile stay.
+    #[must_use]
+    pub fn writes(&self) -> Vec<Write> {
         let mut writes = Vec::new();
         for (target, draft) in &self.drafts {
-            let previous: BTreeSet<_> = draft
-                .original
-                .iter()
-                .flat_map(|g| g.actions.iter().cloned())
-                .collect();
-            let added: Vec<_> = draft.actions.difference(&previous).cloned().collect();
-            // Additions get their own correctly scoped grant. Existing
-            // grant identities and delegation provenance are preserved.
-            if !added.is_empty() {
-                let may_grant = added
-                    .iter()
-                    .any(|a| a == action::MANAGE_GRANTS)
-                    .then(|| draft.ceiling.iter().cloned().collect());
-                if page.clan.is_owner
-                    || (target.kind == ScopeKind::Maps
-                        && page.maps.iter().any(|map| {
-                            Some(map.id) == target.id && !map.clan_owned() && map.owned_by_me
-                        }))
-                {
-                    writes.push(Write::Create(
-                        target.scope(),
-                        GrantBody {
-                            actions: added,
-                            may_grant,
-                        },
-                    ));
-                } else {
-                    // One server grant must fit one delegation. A member
-                    // may hold different ceilings on the same resource.
-                    let mut bundles: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
-                    for action in added {
-                        if let Some(held) = self.delegations(*target, page).find(|held| {
-                            held.may_grant
-                                .as_ref()
-                                .is_some_and(|may| may.contains(&action))
-                        }) {
-                            bundles.entry(held.id).or_default().push(action);
-                        }
+            let ceiling = draft.after_ceiling();
+            match &draft.original {
+                None if draft.actions.is_empty() => {}
+                None => writes.push(Write::Create(
+                    target.scope(),
+                    GrantBody {
+                        actions: draft.actions.iter().cloned().collect(),
+                        may_grant: draft
+                            .actions
+                            .contains(action::MANAGE_GRANTS)
+                            .then(|| ceiling.into_iter().collect()),
+                    },
+                )),
+                Some(grant) => {
+                    let (actions, before_ceiling) = draft.before();
+                    let change =
+                        GrantChange::between(&actions, &before_ceiling, &draft.actions, &ceiling);
+                    if !change.is_empty() {
+                        writes.push(Write::Change(grant.id, change));
                     }
-                    for actions in bundles.into_values() {
-                        writes.push(Write::Create(
-                            target.scope(),
-                            GrantBody {
-                                actions,
-                                may_grant: None,
-                            },
-                        ));
-                    }
-                }
-            }
-            let previous_ceiling: BTreeSet<_> = draft
-                .original
-                .iter()
-                .flat_map(|g| g.may_grant.iter().flatten().cloned())
-                .collect();
-            let mut ceiling_additions: BTreeSet<_> = draft
-                .ceiling
-                .difference(&previous_ceiling)
-                .cloned()
-                .collect();
-            for grant in &draft.original {
-                let actions: BTreeSet<_> = grant
-                    .actions
-                    .intersection(&draft.actions)
-                    .cloned()
-                    .collect();
-                let may_grant = if !actions.contains(action::MANAGE_GRANTS) {
-                    None
-                } else {
-                    // Preserve each delegation's limits. Applying the union
-                    // to every grant could revive previously capped children.
-                    let mut ceiling: BTreeSet<_> = grant
-                        .may_grant
-                        .iter()
-                        .flatten()
-                        .filter(|a| draft.ceiling.contains(*a))
-                        .cloned()
-                        .collect();
-                    ceiling.append(&mut ceiling_additions);
-                    Some(ceiling.into_iter().collect::<Vec<_>>())
-                };
-                let same_ceiling = grant
-                    .may_grant
-                    .as_ref()
-                    .map(|v| v.iter().cloned().collect::<BTreeSet<_>>())
-                    == may_grant
-                        .as_ref()
-                        .map(|v| v.iter().cloned().collect::<BTreeSet<_>>());
-                if actions == grant.actions && same_ceiling {
-                    continue;
-                }
-                if actions.is_empty() {
-                    writes.push(Write::Delete(grant.id));
-                } else {
-                    writes.push(Write::Patch(
-                        grant.id,
-                        GrantBody {
-                            actions: actions.into_iter().collect(),
-                            may_grant,
-                        },
-                    ));
                 }
             }
         }
@@ -626,7 +593,7 @@ pub fn view<'a>(editor: &'a Permissions, page: &'a ClanPage) -> ThemedElement<'a
         crate::i18n::t!("action-save")
     }))
     .style(theme::builtins::button::primary);
-    if !editor.saving && !editor.writes(page).is_empty() {
+    if !editor.saving && !editor.writes().is_empty() {
         save = save.on_press(PanelMessage::SaveGroupPermissions);
     }
     footer = footer.push(save);
@@ -666,6 +633,7 @@ fn detail<'a>(
         folders: &page.folders,
         maps: &page.maps,
         packages: &page.packages,
+        grants: &page.grants,
         owner: page.clan.is_owner,
     };
     let mut col = column![text(context.scope_label(&target.scope())).size(17)].spacing(10);
@@ -721,7 +689,7 @@ fn detail<'a>(
         );
         if let Some(grant) = origin.and_then(|id| page.grants.iter().find(|grant| grant.id == id))
             && page.can_change(grant)
-            && editor.writes(page).is_empty()
+            && editor.writes().is_empty()
         {
             col = col.push(
                 button(text(crate::i18n::t!("permissions-edit-origin")).size(12))
@@ -749,33 +717,49 @@ fn detail<'a>(
         if actions.is_empty() {
             continue;
         }
-        col = col.push(text(heading).size(16));
-        for permission in actions {
-            let inherited_here = inherited
-                .iter()
-                .any(|(_, actions, _)| actions.contains(permission));
-            let implied = (permission == action::READ_AREA
-                && target.kind == ScopeKind::Maps
-                && page
-                    .maps
+        let rows: Vec<Switch> = actions
+            .into_iter()
+            .map(|permission| {
+                let inherited_here = inherited
                     .iter()
-                    .any(|map| Some(map.id) == target.id && !map.clan_owned())
-                && draft.actions.iter().any(|a| a != action::READ_AREA))
-                || permission == action::INSPECT_GRANTS
-                    && (draft.actions.contains(action::MANAGE_GRANTS)
-                        || inherited
-                            .iter()
-                            .any(|(_, actions, _)| actions.contains(action::MANAGE_GRANTS)));
-            let checked =
-                implicit || inherited_here || implied || draft.actions.contains(permission);
-            col = col.push(permission_rows::permission(
+                    .any(|(_, actions, _)| actions.contains(permission));
+                let implied = (permission == action::READ_AREA
+                    && editor.member_map(target, page)
+                    && draft.actions.iter().any(|a| a != action::READ_AREA))
+                    || permission == action::INSPECT_GRANTS
+                        && (draft.actions.contains(action::MANAGE_GRANTS)
+                            || inherited
+                                .iter()
+                                .any(|(_, actions, _)| actions.contains(action::MANAGE_GRANTS)));
+                Switch {
+                    action: permission,
+                    checked: implicit
+                        || inherited_here
+                        || implied
+                        || draft.actions.contains(permission),
+                    enabled: !implicit
+                        && !inherited_here
+                        && !implied
+                        && !editor.saving
+                        && editor.allowed(target, permission, page),
+                }
+            })
+            .collect();
+        col = col.push(text(heading).size(16));
+        for picker in pickers(&rows, |preset| preset.applies_to(target.kind)) {
+            let usable = picker.choices.len() > 1;
+            col = col.push(picker.view(
+                crate::i18n::t!("permissions-preset"),
+                usable.then_some(|pick| send(Message::Preset(pick))),
+            ));
+        }
+        for switch in rows {
+            let permission = switch.action;
+            col = col.push(permission_rows::noted(
                 permission,
-                checked,
-                !implicit
-                    && !inherited_here
-                    && !implied
-                    && !editor.saving
-                    && editor.allowed(target, permission, page),
+                switch.checked,
+                switch.enabled,
+                delegated_note(draft, permission, &context),
                 move |on| send(Message::Toggle(permission, on)),
             ));
         }
@@ -787,7 +771,7 @@ fn detail<'a>(
                 .size(13)
                 .style(permission_rows::description),
         );
-        for permission in Kind::ALL
+        let rows: Vec<Switch> = Kind::ALL
             .into_iter()
             .filter(|k| *k != Kind::Secret)
             .flat_map(Kind::actions)
@@ -797,16 +781,46 @@ fn detail<'a>(
                     && !a.starts_with("clan.")
                     && !a.starts_with("group.")
             })
-        {
+            .map(|permission| Switch {
+                action: permission,
+                checked: draft.ceiling.contains(permission),
+                enabled: page.clan.is_owner && !editor.saving,
+            })
+            .collect();
+        for picker in pickers(&rows, |preset| {
+            preset.applies_to(target.kind) && !preset.delegates()
+        }) {
+            let usable = picker.choices.len() > 1;
+            col = col.push(picker.view(
+                picker.facet.kind.label(),
+                usable.then_some(|pick| send(Message::CeilingPreset(pick))),
+            ));
+        }
+        for switch in rows {
+            let permission = switch.action;
             col = col.push(permission_rows::permission(
                 permission,
-                draft.ceiling.contains(permission),
-                page.clan.is_owner && !editor.saving,
+                switch.checked,
+                switch.enabled,
                 move |on| send(Message::Ceiling(permission, on)),
             ));
         }
     }
     col.into()
+}
+
+/// Whose access management added `action` to the group's grant, when it
+/// came through a delegation: it ends with that delegation (clans.md §1.2).
+fn delegated_note(
+    draft: &Draft,
+    action: &str,
+    context: &super::editor::EditorContext<'_>,
+) -> Option<String> {
+    let grant = draft.original.as_ref()?;
+    if !draft.actions.contains(action) {
+        return None;
+    }
+    context.delegated_note(&grant.delegations_of(action))
 }
 
 fn sections(scope: ScopeKind) -> Vec<(String, Vec<&'static str>)> {
@@ -842,6 +856,8 @@ fn sections(scope: ScopeKind) -> Vec<(String, Vec<&'static str>)> {
                 action::ACCEPT_TRANSFER,
                 action::CREATE_AREA,
                 action::CREATE_MEMBER_OWNED_AREA,
+                action::RENAME_AREA,
+                action::REFILE_AREA,
                 action::DELETE_ATLAS,
             ],
         ),
@@ -852,8 +868,6 @@ fn sections(scope: ScopeKind) -> Vec<(String, Vec<&'static str>)> {
                 action::ADD_TO_AREA,
                 action::EDIT_AREA,
                 action::REMOVE_FROM_AREA,
-                action::RENAME_AREA,
-                action::REFILE_AREA,
                 action::COPY_AREA,
                 action::SHARE_AREA_EXTERNALLY,
                 action::DELETE_AREA,

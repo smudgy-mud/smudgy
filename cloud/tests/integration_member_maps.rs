@@ -7,6 +7,7 @@
 
 mod support;
 
+use smudgy_cloud::clan_access::{GrantBody, GrantChange};
 use smudgy_cloud::clan_maps::MapOwnership;
 use smudgy_cloud::clans::{ClanGrantFilter, GrantRecipient, GrantScope, action};
 use smudgy_cloud::{
@@ -35,6 +36,15 @@ fn member(server: &MockHandle, nickname: &str) -> Member {
 
 fn is_not_found<T: std::fmt::Debug>(result: &Result<T, CloudError>) -> bool {
     matches!(result, Err(CloudError::NotFoundOrNoAccess))
+}
+
+/// A grant change adding `add` and removing `remove`.
+fn change(add: &[&str], remove: &[&str]) -> GrantChange {
+    GrantChange {
+        add: add.iter().map(ToString::to_string).collect(),
+        remove: remove.iter().map(ToString::to_string).collect(),
+        ..GrantChange::default()
+    }
 }
 
 async fn row(member: &Member, area: AreaId) -> Option<Area> {
@@ -134,13 +144,13 @@ async fn a_member_owned_map_reaches_only_its_owners_and_its_own_grants() {
     // only its owner and the grantee see the grant.
     let grant = nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: arun.user.id,
             },
             &GrantScope::Areas { ids: vec![map] },
-            &[action::EDIT_AREA],
+            &GrantBody::of([action::EDIT_AREA]),
         )
         .await
         .expect("an owner grants one member");
@@ -169,13 +179,13 @@ async fn a_member_owned_map_reaches_only_its_owners_and_its_own_grants() {
     assert!(is_not_found(
         &c.mira
             .api
-            .create_clan_grant(
+            .grant_in_clan(
                 c.id,
                 GrantRecipient::Group {
                     group_id: c.everyone
                 },
                 &GrantScope::Areas { ids: vec![map] },
-                &[action::READ_AREA],
+                &GrantBody::of([action::READ_AREA]),
             )
             .await
     ));
@@ -189,7 +199,7 @@ async fn a_member_owned_map_reaches_only_its_owners_and_its_own_grants() {
     assert!(matches!(
         nessa
             .api
-            .create_clan_grant(
+            .grant_in_clan(
                 c.id,
                 GrantRecipient::Group {
                     group_id: c.everyone
@@ -197,7 +207,7 @@ async fn a_member_owned_map_reaches_only_its_owners_and_its_own_grants() {
                 &GrantScope::Areas {
                     ids: vec![map, other]
                 },
-                &[action::READ_AREA],
+                &GrantBody::of([action::READ_AREA]),
             )
             .await,
         Err(CloudError::InvalidInput(_))
@@ -206,7 +216,7 @@ async fn a_member_owned_map_reaches_only_its_owners_and_its_own_grants() {
     assert!(matches!(
         nessa
             .api
-            .update_clan_grant(c.id, grant.id, &["area.share_external"])
+            .change_clan_grant(c.id, grant.id, &change(&["area.share_external"], &[]))
             .await,
         Err(CloudError::InvalidInput(_))
     ));
@@ -237,13 +247,13 @@ async fn joint_ownership_offers_apply_on_the_last_acceptance() {
     for reader in [arun, bo] {
         nessa
             .api
-            .create_clan_grant(
+            .grant_in_clan(
                 c.id,
                 GrantRecipient::User {
                     user_id: reader.user.id,
                 },
                 &GrantScope::Areas { ids: vec![map] },
-                &[action::READ_AREA],
+                &GrantBody::of([action::READ_AREA]),
             )
             .await
             .unwrap();
@@ -335,13 +345,13 @@ async fn declining_a_map_offer_needs_the_read_its_listing_needs() {
         .create_member_owned_area(c.id, c.roads.0, "Grove", &[nessa.user.id]);
     let reading = nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: arun.user.id,
             },
             &GrantScope::Areas { ids: vec![map] },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -366,8 +376,6 @@ async fn declining_a_map_offer_needs_the_read_its_listing_needs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ownership_offer_lapses_when_a_grant_naming_its_map_changes() {
-    use smudgy_cloud::clan_access::GrantBody;
-
     let (c, people) = clan(&["nessa", "arun", "bo"]).await;
     let (nessa, arun, bo) = (&people[0], &people[1], &people[2]);
     let map = c
@@ -378,13 +386,13 @@ async fn an_ownership_offer_lapses_when_a_grant_naming_its_map_changes() {
         grants.push(
             nessa
                 .api
-                .create_clan_grant(
+                .grant_in_clan(
                     c.id,
                     GrantRecipient::User {
                         user_id: reader.user.id,
                     },
                     &GrantScope::Areas { ids: vec![map] },
-                    &[action::READ_AREA],
+                    &GrantBody::of([action::READ_AREA]),
                 )
                 .await
                 .unwrap(),
@@ -399,11 +407,7 @@ async fn an_ownership_offer_lapses_when_a_grant_naming_its_map_changes() {
         .unwrap();
     nessa
         .api
-        .change_clan_grant(
-            c.id,
-            grants[1].id,
-            &GrantBody::of(["area.read", "area.edit"]),
-        )
+        .change_clan_grant(c.id, grants[1].id, &change(&["area.edit"], &[]))
         .await
         .unwrap();
     assert!(is_not_found(
@@ -419,13 +423,13 @@ async fn an_ownership_offer_lapses_when_a_grant_naming_its_map_changes() {
         .unwrap();
     nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: c.mira.user.id,
             },
             &GrantScope::Areas { ids: vec![map] },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -458,13 +462,13 @@ async fn a_member_owned_map_becomes_clan_owned_and_back() {
         .create_member_owned_area(c.id, c.roads.0, "Grove", &[nessa.user.id]);
     nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: arun.user.id,
             },
             &GrantScope::Areas { ids: vec![map] },
-            &[action::EDIT_AREA],
+            &GrantBody::of([action::EDIT_AREA]),
         )
         .await
         .unwrap();
@@ -545,13 +549,13 @@ async fn deleting_a_folder_unfiles_the_maps_its_deleter_cannot_see() {
         .create_member_owned_area(c.id, towns.0, "Square", &[nessa.user.id]);
     nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: c.mira.user.id,
             },
             &GrantScope::Areas { ids: vec![shared] },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -911,8 +915,6 @@ async fn outside_shares_read_a_clan_owned_map_only() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_outside_share_ends_for_good_when_its_sharer_loses_share_external() {
-    use smudgy_cloud::clan_access::GrantBody;
-
     let (c, people) = clan(&["nessa"]).await;
     let nessa = &people[0];
     let friend = member(&c.server, "friend");
@@ -979,12 +981,20 @@ async fn an_outside_share_ends_for_good_when_its_sharer_loses_share_external() {
         .expect("shared again");
     c.mira
         .api
-        .change_clan_grant(c.id, grant.id, &GrantBody::of(["atlas.read"]))
+        .change_clan_grant(
+            c.id,
+            grant.id,
+            &change(&["atlas.read"], &["area.share_external"]),
+        )
         .await
         .unwrap();
     c.mira
         .api
-        .change_clan_grant(c.id, grant.id, &GrantBody::of(["area.share_external"]))
+        .change_clan_grant(
+            c.id,
+            grant.id,
+            &change(&["area.share_external"], &["atlas.read"]),
+        )
         .await
         .unwrap();
     assert!(row(&friend, roads).await.is_none());
@@ -1034,13 +1044,13 @@ async fn a_map_whose_last_owner_is_deleted_freezes() {
         .create_member_owned_area(c.id, c.roads.0, "Grove", &[nessa.user.id]);
     nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: arun.user.id,
             },
             &GrantScope::Areas { ids: vec![map] },
-            &[action::EDIT_AREA],
+            &GrantBody::of([action::EDIT_AREA]),
         )
         .await
         .unwrap();
@@ -1071,7 +1081,7 @@ async fn a_map_whose_last_owner_is_deleted_freezes() {
     assert!(is_not_found(
         &arun
             .api
-            .update_clan_grant(c.id, grants[0].id, &[action::READ_AREA])
+            .change_clan_grant(c.id, grants[0].id, &change(&[action::ADD_TO_AREA], &[]))
             .await
     ));
 }
@@ -1128,13 +1138,13 @@ async fn a_dissolving_clans_owners_and_member_owned_maps_change_no_more() {
         .to_string();
     nessa
         .api
-        .create_clan_grant(
+        .grant_in_clan(
             c.id,
             GrantRecipient::User {
                 user_id: arun.user.id,
             },
             &GrantScope::Areas { ids: vec![grove] },
-            &[action::READ_AREA],
+            &GrantBody::of([action::READ_AREA]),
         )
         .await
         .unwrap();
@@ -1365,4 +1375,158 @@ async fn a_write_refused_by_a_dissolving_clan_parks_with_its_refusal() {
         Some(CloudError::ClanDissolving)
     ));
     assert!(mapper.is_operation_pending(grove, operation), "kept parked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_owned_maps_grant_always_gives_read() {
+    let (c, people) = clan(&["nessa", "arun"]).await;
+    let (nessa, arun) = (&people[0], &people[1]);
+    let map = c
+        .server
+        .create_member_owned_area(c.id, c.roads.0, "Grove", &[nessa.user.id]);
+    let to_arun = GrantRecipient::User {
+        user_id: arun.user.id,
+    };
+    let alone = GrantScope::Areas { ids: vec![map] };
+    let grant = nessa
+        .api
+        .grant_in_clan(c.id, to_arun, &alone, &GrantBody::of([action::EDIT_AREA]))
+        .await
+        .unwrap();
+    assert!(grant.actions.contains(action::READ_AREA));
+
+    // Removing area.read is refused: deleting the grant revokes it.
+    let refused = nessa
+        .api
+        .change_clan_grant(c.id, grant.id, &change(&[], &[action::READ_AREA]))
+        .await;
+    assert!(
+        matches!(refused, Err(CloudError::InvalidInput(_))),
+        "{refused:?}"
+    );
+    let narrowed = nessa
+        .api
+        .change_clan_grant(c.id, grant.id, &change(&[], &[action::EDIT_AREA]))
+        .await
+        .unwrap()
+        .expect("area.read stays");
+    assert_eq!(narrowed.actions, [action::READ_AREA.to_string()].into());
+
+    // Granting again adds to the one grant, as the owner's own actions.
+    let again = nessa
+        .api
+        .grant_in_clan(c.id, to_arun, &alone, &GrantBody::of([action::ADD_TO_AREA]))
+        .await
+        .unwrap();
+    assert_eq!(again.id, grant.id);
+    assert_eq!(
+        again.direct_actions(),
+        [action::READ_AREA, action::ADD_TO_AREA].into()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grants_left_naming_one_map_join_when_a_map_goes_to_members() {
+    let (c, people) = clan(&["nessa"]).await;
+    let nessa = &people[0];
+    let grove = c
+        .mira
+        .api
+        .create_clan_area(c.id, c.roads, "Grove", MapOwnership::Clan)
+        .await
+        .unwrap()
+        .id;
+    let roads = c
+        .mira
+        .api
+        .create_clan_area(c.id, c.roads, "Roads", MapOwnership::Clan)
+        .await
+        .unwrap()
+        .id;
+    let scouts = GrantRecipient::Group {
+        group_id: c
+            .mira
+            .api
+            .create_clan_group(c.id, "Scouts", None)
+            .await
+            .unwrap()
+            .id,
+    };
+    let older = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            scouts,
+            &GrantScope::Areas { ids: vec![roads] },
+            &GrantBody::of([action::READ_AREA]),
+        )
+        .await
+        .unwrap();
+    let both = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            scouts,
+            &GrantScope::Areas {
+                ids: vec![grove, roads],
+            },
+            &GrantBody::of([action::READ_AREA, action::EDIT_AREA]),
+        )
+        .await
+        .unwrap();
+    let alone = c
+        .mira
+        .api
+        .grant_in_clan(
+            c.id,
+            scouts,
+            &GrantScope::Areas { ids: vec![grove] },
+            &GrantBody::of([
+                action::READ_AREA,
+                action::RENAME_AREA,
+                action::SHARE_AREA_EXTERNALLY,
+            ]),
+        )
+        .await
+        .unwrap();
+
+    let offer = c
+        .mira
+        .api
+        .offer_area_ownership(grove, &[nessa.user.id], MapOwnership::Members, false)
+        .await
+        .unwrap();
+    nessa
+        .api
+        .accept_area_offer(grove, offer.id, None)
+        .await
+        .unwrap();
+
+    // The grant naming Grove beside Roads lost it and joined the older
+    // grant naming Roads alone.
+    assert!(c.server.clan_grant_record(c.id, both.id).is_none());
+    let joined = c
+        .server
+        .clan_grant_record(c.id, older.id)
+        .expect("the older grant keeps its ID");
+    assert_eq!(joined.scope, ClanGrantScope::Areas([roads.0].into()));
+    assert_eq!(
+        joined.actions,
+        [action::READ_AREA, action::EDIT_AREA]
+            .map(ToString::to_string)
+            .into()
+    );
+    // The grant naming Grove alone keeps what a Member-owned map allows.
+    let kept = c
+        .server
+        .clan_grant_record(c.id, alone.id)
+        .expect("it gives area.read of its own");
+    assert_eq!(
+        kept.actions,
+        [action::READ_AREA, action::RENAME_AREA]
+            .map(ToString::to_string)
+            .into()
+    );
 }

@@ -872,6 +872,19 @@ async fn a_requests_shape_is_judged_before_its_subject() {
     let url = format!("{}/secrets/{}/grants", server.base_url, Uuid::new_v4());
     let (status, _) = call(reqwest::Method::POST, &url, &ann.api_key, Some(json!({}))).await;
     assert_eq!(status, 400);
+    let url = format!(
+        "{}/secrets/{}/grants/{}",
+        server.base_url,
+        Uuid::new_v4(),
+        Uuid::new_v4()
+    );
+    for body in [
+        json!({ "remove": ["read"] }),
+        json!({ "actions": ["edit"] }),
+    ] {
+        let (status, _) = call(reqwest::Method::PATCH, &url, &ann.api_key, Some(body)).await;
+        assert_eq!(status, 400);
+    }
     let url = format!("{}/areas/{hidden}?expected_rev=3", server.base_url);
     let (status, _) = call(reqwest::Method::DELETE, &url, &ann.api_key, None).await;
     assert_eq!(status, 404, "a well-formed query on a hidden map");
@@ -1034,6 +1047,17 @@ async fn preconditions_and_clan_bodies_are_judged_before_their_subject() {
             reqwest::Method::POST,
             format!("/clans/{clan}/groups"),
             json!({}),
+        ),
+        // A grant change is a change set: the replacing shape is refused.
+        (
+            reqwest::Method::PATCH,
+            format!("/clans/{clan}/grants/{}", Uuid::new_v4()),
+            json!({ "actions": ["area.read"] }),
+        ),
+        (
+            reqwest::Method::PATCH,
+            format!("/clans/{clan}/grants/{}", Uuid::new_v4()),
+            json!({ "actions": { "add": ["area.read"], "remove": ["area.read"] } }),
         ),
     ];
     for (method, path, body) in clan_routes {

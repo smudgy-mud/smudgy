@@ -354,10 +354,146 @@ impl Kind {
     /// The parts of the kind's core that presets match one at a time: one
     /// for most kinds; membership, groups and handing out access for clan
     /// administration, whose presets each cover one of those.
-    fn facets(self) -> Vec<&'static [&'static str]> {
-        match self {
+    #[must_use]
+    pub fn facets(self) -> Vec<Facet> {
+        let parts: Vec<&'static [&'static str]> = match self {
             Self::ClanAdministration => vec![MEMBERSHIP_FACET, GROUP_LEAD, FOLDER_MANAGER],
             _ => vec![self.core()],
+        };
+        parts
+            .into_iter()
+            .map(|actions| Facet {
+                kind: self,
+                actions,
+            })
+            .collect()
+    }
+}
+
+/// A part of a kind's core that one preset picker sets: the whole core for
+/// most kinds, and membership, group leads and handing out access for clan
+/// administration ([`Kind::facets`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facet {
+    pub kind: Kind,
+    pub actions: &'static [&'static str],
+}
+
+/// What a facet's checked actions read as in its picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacetState {
+    /// None of its actions.
+    Empty,
+    /// Exactly a preset's actions.
+    Preset(Preset),
+    /// Some other set of them: Custom.
+    Custom,
+}
+
+impl Facet {
+    /// The facet a preset sets.
+    #[must_use]
+    pub fn of(preset: Preset) -> Self {
+        preset
+            .kind()
+            .facets()
+            .into_iter()
+            .find(|facet| facet.holds(preset))
+            .unwrap_or(Self {
+                kind: preset.kind(),
+                actions: preset.kind().core(),
+            })
+    }
+
+    /// The facets of every kind, in picker order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Kind::ALL.into_iter().flat_map(Kind::facets)
+    }
+
+    fn holds(self, preset: Preset) -> bool {
+        preset.kind() == self.kind
+            && preset
+                .actions()
+                .iter()
+                .all(|action| self.actions.contains(action))
+    }
+
+    /// The facet's presets, smallest first.
+    #[must_use]
+    pub fn presets(self) -> Vec<Preset> {
+        self.kind
+            .presets()
+            .iter()
+            .copied()
+            .filter(|preset| self.holds(*preset))
+            .collect()
+    }
+
+    /// What the facet's part of `checked` reads as.
+    #[must_use]
+    pub fn state<'a, I>(self, checked: I) -> FacetState
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let part: BTreeSet<&str> = checked
+            .into_iter()
+            .filter(|action| self.actions.contains(action))
+            .collect();
+        if part.is_empty() {
+            return FacetState::Empty;
+        }
+        self.presets()
+            .into_iter()
+            .find(|preset| {
+                preset.actions().len() == part.len()
+                    && preset.actions().iter().all(|action| part.contains(action))
+            })
+            .map_or(FacetState::Custom, FacetState::Preset)
+    }
+
+    /// Whether picking `pick` leaves `action`, one of the facet's, checked.
+    #[must_use]
+    pub fn picks(self, pick: PresetPick, action: &str) -> bool {
+        match pick {
+            PresetPick::None(_) => false,
+            PresetPick::Preset(preset) => preset.actions().contains(&action),
+        }
+    }
+}
+
+/// A choice in a facet's picker: a preset, or none of the facet's actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetPick {
+    None(Facet),
+    Preset(Preset),
+}
+
+impl PresetPick {
+    /// The facet the choice sets.
+    #[must_use]
+    pub fn facet(self) -> Facet {
+        match self {
+            Self::None(facet) => facet,
+            Self::Preset(preset) => Facet::of(preset),
+        }
+    }
+
+    /// The facet's actions turned on or off to make the choice: each with
+    /// whether it ends up checked.
+    pub fn changes(self) -> impl Iterator<Item = (&'static str, bool)> {
+        let facet = self.facet();
+        facet
+            .actions
+            .iter()
+            .map(move |action| (*action, facet.picks(self, action)))
+    }
+}
+
+impl std::fmt::Display for PresetPick {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None(_) => formatter.write_str(&crate::i18n::t!("presets-none")),
+            Self::Preset(preset) => formatter.write_str(&preset.label()),
         }
     }
 }
@@ -666,30 +802,15 @@ where
     let mut chips = Vec::new();
     for kind in Kind::ALL {
         for facet in kind.facets() {
-            let part: BTreeSet<&str> = facet
-                .iter()
-                .copied()
-                .filter(|action| actions.contains(action))
-                .collect();
-            if part.is_empty() {
-                continue;
-            }
-            let preset = kind
-                .presets()
-                .iter()
-                .copied()
-                .filter(|preset| preset.actions().iter().all(|action| facet.contains(action)))
-                .find(|preset| {
-                    preset.actions().len() == part.len()
-                        && preset.actions().iter().all(|action| part.contains(action))
-                });
-            match preset {
-                Some(preset) => chips.push(Chip::Preset(preset)),
-                None => chips.extend(
+            match facet.state(actions.iter().copied()) {
+                FacetState::Empty => {}
+                FacetState::Preset(preset) => chips.push(Chip::Preset(preset)),
+                FacetState::Custom => chips.extend(
                     facet
+                        .actions
                         .iter()
                         .copied()
-                        .filter(|action| part.contains(action))
+                        .filter(|action| actions.contains(action))
                         .map(Chip::Action),
                 ),
             }

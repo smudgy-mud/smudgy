@@ -11,7 +11,7 @@ use smudgy_cloud::clan_secrets::{
     NewSecret, NewSecretOwner, OfferRequest, SecretRecipient, secret_preset,
 };
 use smudgy_cloud::clans::action;
-use smudgy_cloud::cloud_api::{CopyAreaRequest, secret_action};
+use smudgy_cloud::cloud_api::{CopyAreaRequest, SecretGrantChange, secret_action};
 use smudgy_cloud::{
     AreaId, CloudApiClient, CloudError, CloudMapper, Credential, CredentialSource, MapperBackend,
     SourceId,
@@ -43,6 +43,14 @@ fn is_not_found<T: std::fmt::Debug>(result: &Result<T, CloudError>) -> bool {
 fn to(user: &Member) -> SecretRecipient {
     SecretRecipient::User {
         user_id: user.user.id,
+    }
+}
+
+/// A Secret grant change adding `add` and removing `remove`.
+fn change(add: &[&str], remove: &[&str]) -> SecretGrantChange {
+    SecretGrantChange {
+        add: add.iter().map(ToString::to_string).collect(),
+        remove: remove.iter().map(ToString::to_string).collect(),
     }
 }
 
@@ -165,12 +173,12 @@ async fn owners_share_with_members_and_groups() {
         .expect("an owner shares with a group");
     assert_eq!(held(&c.mira, c.area, c.secret).await, ["read"]);
 
-    // One grant per recipient: a second one replaces its actions and keeps
+    // One grant per recipient: a second one adds to its actions and keeps
     // its ID.
     let again = c
         .ann
         .api
-        .grant_clan_secret(&c.secret, to(&c.bo), &secret_preset::EDITOR[1..])
+        .grant_clan_secret(&c.secret, to(&c.bo), &["remove"])
         .await
         .unwrap();
     assert_eq!(again.id, grant.id);
@@ -196,7 +204,7 @@ async fn owners_share_with_members_and_groups() {
     let changed = c
         .ann
         .api
-        .update_clan_secret_grant(&c.secret, to_group.id, &["add"])
+        .update_clan_secret_grant(&c.secret, to_group.id, &change(&["add"], &[]))
         .await
         .unwrap();
     assert!(changed.can("add") && changed.can("read"));
@@ -245,23 +253,23 @@ async fn a_manager_shares_within_their_own_actions() {
     // it, but not add it back.
     c.ann
         .api
-        .update_clan_secret_grant(&c.secret, cy.id, &["add", "remove"])
+        .update_clan_secret_grant(&c.secret, cy.id, &change(&["remove"], &[]))
         .await
         .unwrap();
     c.bo.api
-        .update_clan_secret_grant(&c.secret, cy.id, &["remove"])
+        .update_clan_secret_grant(&c.secret, cy.id, &change(&[], &["add"]))
         .await
         .expect("keeps remove, drops add");
     let cleared =
         c.bo.api
-            .update_clan_secret_grant(&c.secret, cy.id, &[])
+            .update_clan_secret_grant(&c.secret, cy.id, &change(&[], &["remove"]))
             .await
             .unwrap();
     assert!(!cleared.can("remove"));
     assert!(is_not_found(
         &c.bo
             .api
-            .update_clan_secret_grant(&c.secret, cy.id, &["remove"])
+            .update_clan_secret_grant(&c.secret, cy.id, &change(&["remove"], &[]))
             .await
     ));
 
@@ -270,7 +278,7 @@ async fn a_manager_shares_within_their_own_actions() {
     assert!(is_not_found(
         &c.bo
             .api
-            .update_clan_secret_grant(&c.secret, manager.id, &["add"])
+            .update_clan_secret_grant(&c.secret, manager.id, &change(&[], &["add"]))
             .await
     ));
     assert!(is_not_found(
@@ -440,9 +448,32 @@ async fn malformed_bodies_are_refused_and_grant_writes_end_offers() {
     let both = c
         .ann
         .api
-        .update_clan_secret_grant(&c.secret, Uuid::new_v4(), &["fly"])
+        .update_clan_secret_grant(&c.secret, Uuid::new_v4(), &change(&["fly"], &[]))
         .await;
     assert!(matches!(both, Err(CloudError::InvalidInput(_))), "{both:?}");
+
+    // `read` stays, and an action both added and removed is refused.
+    let grant = c
+        .ann
+        .api
+        .grant_clan_secret(&c.secret, to(&c.bo), &["add"])
+        .await
+        .unwrap();
+    for refused in [
+        change(&[], &["read"]),
+        change(&["edit"], &["edit"]),
+        change(&[], &[]),
+    ] {
+        let result = c
+            .ann
+            .api
+            .update_clan_secret_grant(&c.secret, grant.id, &refused)
+            .await;
+        assert!(
+            matches!(result, Err(CloudError::InvalidInput(_))),
+            "{refused:?}: {result:?}"
+        );
+    }
 
     // A pending ownership offer stands only while access stays as it was.
     c.ann
@@ -547,11 +578,7 @@ async fn copy_comes_only_from_a_grant_that_names_it() {
     // Named, it is held, given on, and taken along.
     c.ann
         .api
-        .update_clan_secret_grant(
-            &c.secret,
-            bo.id,
-            &["add", "edit", "remove", "manage_access", "copy"],
-        )
+        .update_clan_secret_grant(&c.secret, bo.id, &change(&["copy"], &[]))
         .await
         .unwrap();
     let cy =

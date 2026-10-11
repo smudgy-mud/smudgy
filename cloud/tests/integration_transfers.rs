@@ -8,10 +8,12 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use smudgy_cloud::clan_maps::MapOwnership;
 use smudgy_cloud::clans::action;
 use smudgy_cloud::cloud_api::{
-    CopyAreaRequest, TransferDirection, TransferRecipient, TransferView,
+    CopyAreaRequest, SecretGrantChange, TransferDirection, TransferRecipient, TransferView,
 };
 use smudgy_cloud::{
     Area, AreaId, AtlasId, CloudApiClient, CloudError, CloudMapper, Credential, CredentialSource,
@@ -1040,7 +1042,14 @@ async fn a_clan_map_is_copied_out_by_a_member_holding_area_copy() {
         .expect("Kai's grant came along into the clan");
     tomas
         .api
-        .update_clan_secret_grant(&cache, grant.id, &["copy"])
+        .update_clan_secret_grant(
+            &cache,
+            grant.id,
+            &SecretGrantChange {
+                add: ["copy".to_string()].into(),
+                remove: BTreeSet::new(),
+            },
+        )
         .await
         .unwrap();
     let copy = kai

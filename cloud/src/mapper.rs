@@ -30,7 +30,7 @@ use crate::backends::{
     AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, RoomRemap, area_edits,
     source_document::{EditContext, SourceDocument, exits},
 };
-use crate::cloud_api::{SecretGrant, SecretSummary};
+use crate::cloud_api::{SecretGrant, SecretGrantChange, SecretSummary};
 use crate::error::CloudResult;
 use crate::mapper::area_cache::AreaCache;
 use crate::mapper::exit_cache::ExitCache;
@@ -2774,8 +2774,9 @@ impl Mapper {
 
     /// Shares one of a cloud map's Secrets with a friend: `read` and
     /// `actions` (see [`secret_action`](crate::cloud_api::secret_action)).
-    /// A second grant from the caller to the same friend replaces the first.
-    /// The grant confers nothing while the friend cannot read the map.
+    /// When the caller already has a grant to that friend, the actions join
+    /// it; sharing never removes an action. The grant confers nothing while
+    /// the friend cannot read the map.
     ///
     /// # Errors
     /// See the section comment. Every refusal past the request's shape,
@@ -2793,19 +2794,21 @@ impl Mapper {
             .await
     }
 
-    /// Replaces the actions of a grant on one of a cloud map's Secrets.
+    /// Applies `change` to a grant on one of a cloud map's Secrets, leaving
+    /// the actions it does not name as they are.
     ///
     /// # Errors
-    /// As [`Self::grant_secret`].
+    /// As [`Self::grant_secret`]; [`CloudError::InvalidInput`] for a change
+    /// naming nothing, an action both added and removed, or removing `read`.
     pub async fn update_secret_grant(
         &self,
         area_id: AreaId,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
     ) -> CloudResult<SecretGrant> {
         self.inner
-            .update_secret_grant(area_id, secret, grant_id, actions)
+            .update_secret_grant(area_id, secret, grant_id, change)
             .await
     }
 

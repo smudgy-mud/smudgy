@@ -262,7 +262,7 @@ fn clan_map(
         for action in &contribution {
             give(&mut actions, &who, &[action]);
         }
-        if contribution.contains("grant.manage") && grant.parent_id.is_none() {
+        if contribution.contains("grant.manage") {
             for (action, right) in MAP.into_iter().filter(|(a, _)| SHARED.contains(a)) {
                 if grant.may_grant.contains(right) {
                     give(&mut content, &who, &[&format!("share_{action}")]);
@@ -473,10 +473,10 @@ pub fn may_disclose(
                 };
                 SHARED.contains(right)
                     && clan
-                        .delegation_for(
+                        .delegation_through(
                             user,
                             &ClanGrantScope::Areas(BTreeSet::from([area.id])),
-                            &BTreeSet::from([(*action).to_owned()]),
+                            action,
                             &|id| super::clan_maps::placement(st, clan.id, id).and_then(|p| p.0),
                         )
                         .is_some()
