@@ -1266,6 +1266,10 @@ fn write_embedded_dir(target: &Path, dir: &Dir<'_>) -> Result<()> {
 #[cfg(test)]
 mod inline_widget_tests;
 #[cfg(test)]
+#[path = "../../../tests/text-effects/typings.rs"]
+mod text_effects_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
