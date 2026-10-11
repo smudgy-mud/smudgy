@@ -6,14 +6,15 @@
 //! A grant names a recipient, an active member or one of the clan's groups
 //! (built-ins included), and gives `read` plus any of `add`, `edit`,
 //! `remove`, `manage_access` and `copy` (which no preset holds, so a grant
-//! carries it only when it names it); there is one grant per recipient, and a
-//! second POST for the same recipient replaces its actions under the rules
-//! for changing it (keeping its grantor). Ownership authority writes any
-//! grant; a holder of `manage_access` grants only actions it holds, never
-//! `manage_access`, and changes or revokes only grants that do not carry
-//! it. Holders of `manage_access` list every grant; another reader lists
-//! the grants to them and to their groups. Every refusal is the uniform
-//! 404, and every write moves the Secret's access revision, which ends
+//! carries it only when it names it); there is one grant per recipient, a
+//! second POST for the same recipient adds its actions under the rules for
+//! changing it (keeping its grantor), and a PATCH adds and removes exactly
+//! what it names. Ownership authority writes any grant; a holder of
+//! `manage_access` grants only actions it holds, never `manage_access`, and
+//! changes or revokes only grants that do not carry it. Holders of
+//! `manage_access` list every grant; another reader lists the grants to them
+//! and to their groups. Every refusal is the uniform 404, and every write
+//! that changes a grant moves the Secret's access revision, which ends
 //! pending ownership offers.
 
 use std::collections::BTreeSet;
@@ -26,6 +27,7 @@ use uuid::Uuid;
 use super::clan_secrets::{ClanSecretGrantRecord, ClanSecretRecord, actions};
 use super::clans::ClanRecipient;
 use super::http::{bad_request, created, not_found, ok};
+use super::secret_grants::GrantChange;
 use super::state::MockState;
 
 const MANAGE_ACCESS: &str = "manage_access";
@@ -184,8 +186,8 @@ pub fn list(st: &MockState, viewer: Uuid, at: (Uuid, usize)) -> Response {
     ok(json!(rows))
 }
 
-/// `POST /secrets/{s}/grants` on a Clan Secret. 201 with the grant, a
-/// replaced one included.
+/// `POST /secrets/{s}/grants` on a Clan Secret: 201 with a new grant, or 200
+/// with the recipient's grant the actions joined.
 pub fn create(
     st: &mut MockState,
     viewer: Uuid,
@@ -203,6 +205,7 @@ pub fn create(
         .iter()
         .position(|grant| grant.recipient == recipient);
     let before = existing.map_or_else(BTreeSet::new, |index| record.grants[index].actions.clone());
+    let actions: BTreeSet<&'static str> = before.union(&actions).copied().collect();
     if !may_change(&mine, &before, &actions) {
         return not_found();
     }
@@ -210,8 +213,11 @@ pub fn create(
     let record = record_mut(st, at);
     let index = if let Some(index) = existing {
         let grant = &mut record.grants[index];
-        grant.actions = actions;
-        grant.updated_at = now;
+        if grant.actions != actions {
+            grant.actions = actions;
+            grant.updated_at = now;
+            record.access_rev += 1;
+        }
         index
     } else {
         record.grants.push(ClanSecretGrantRecord {
@@ -222,35 +228,43 @@ pub fn create(
             created_at: now,
             updated_at: now,
         });
+        record.access_rev += 1;
         record.grants.len() - 1
     };
-    record.access_rev += 1;
-    let grant = record.grants[index].clone();
-    created(view(st, at, &grant))
+    let grant = view(st, at, &record_at(st, at).grants[index].clone());
+    if existing.is_some() {
+        ok(grant)
+    } else {
+        created(grant)
+    }
 }
 
-/// `PATCH /secrets/{s}/grants/{g}` on a Clan Secret.
+/// `PATCH /secrets/{s}/grants/{g}` on a Clan Secret: a change set.
 pub fn update(
     st: &mut MockState,
     viewer: Uuid,
     at: (Uuid, usize),
     grant_id: Uuid,
-    actions: BTreeSet<&'static str>,
+    change: &GrantChange,
 ) -> Response {
     let mine = mine(st, viewer, at);
     let record = record_at(st, at);
     let Some(index) = record.grants.iter().position(|grant| grant.id == grant_id) else {
         return not_found();
     };
-    if !may_change(&mine, &record.grants[index].actions, &actions) {
+    let before = &record.grants[index].actions;
+    let actions = change.apply(before);
+    if !may_change(&mine, before, &actions) {
         return not_found();
     }
     let record = record_mut(st, at);
     let grant = &mut record.grants[index];
-    grant.actions = actions;
-    grant.updated_at = Utc::now();
-    let grant = grant.clone();
-    record.access_rev += 1;
+    if grant.actions != actions {
+        grant.actions = actions;
+        grant.updated_at = Utc::now();
+        record.access_rev += 1;
+    }
+    let grant = record.grants[index].clone();
     ok(view(st, at, &grant))
 }
 

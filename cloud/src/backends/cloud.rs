@@ -11,7 +11,7 @@ use super::MapperBackend;
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
-    cloud_api::{SecretChange, SecretGrant, SecretSummary, secret_grants_path},
+    cloud_api::{SecretChange, SecretGrant, SecretGrantChange, SecretSummary, secret_grants_path},
     format3::AreaProjection,
     mutation::{MoveRequest, MoveResult, MutationResult, parse_move_result},
 };
@@ -814,12 +814,12 @@ impl MapperBackend for CloudMapper {
         _area_id: &AreaId,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
         auth_generation: u64,
     ) -> CloudResult<SecretGrant> {
         let path = format!("{}/{grant_id}", secret_grants_path(secret)?);
         let credential = self.credentials.credential_at_generation(auth_generation)?;
-        self.patch_with_credential(&path, &json!({ "actions": actions }), &credential)
+        self.patch_with_credential(&path, &change.to_body(), &credential)
             .await
     }
 

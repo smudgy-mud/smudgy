@@ -17,7 +17,7 @@ use crate::{
     SourceId,
     access_review::ReviewedMove,
     clan_secrets::NewSecret,
-    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    cloud_api::{SecretChange, SecretGrant, SecretGrantChange, SecretSummary},
     mutation::{MoveRequest, MoveResult, MovedRoom, Precondition, ResourceKind},
 };
 
@@ -234,11 +234,11 @@ impl Inner {
         area_id: AreaId,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
     ) -> CloudResult<SecretGrant> {
         let generation = self.source_write_generation(area_id)?;
         self.backend
-            .update_secret_grant(&area_id, secret, grant_id, actions, generation)
+            .update_secret_grant(&area_id, secret, grant_id, change, generation)
             .await
     }
 

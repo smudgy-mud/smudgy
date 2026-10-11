@@ -594,6 +594,7 @@ impl ClanPanel {
             folders: &page.folders,
             maps: &page.maps,
             packages: &page.packages,
+            grants: &page.grants,
             owner: page.clan.is_owner,
         }
     }
@@ -1791,7 +1792,7 @@ fn grant_notes(grant: &ClanGrant) -> Vec<String> {
             .join(", ");
         notes.push(crate::i18n::t!("clans-note-may-grant", "preset" => label));
     }
-    if grant.parent_id.is_some() {
+    if !grant.delegated.is_empty() {
         notes.push(crate::i18n::t!("clans-note-delegated"));
     }
     notes

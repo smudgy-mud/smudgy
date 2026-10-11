@@ -15,7 +15,7 @@ use super::{AreaMergeCommit, AreaMergePlan, MapperBackend, cloud::CloudMapper};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
-    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    cloud_api::{SecretChange, SecretGrant, SecretGrantChange, SecretSummary},
     mutation::{MoveRequest, MoveResult, MutationEnvelope, MutationResult},
 };
 
@@ -923,11 +923,11 @@ where
         area_id: &AreaId,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
         auth_generation: u64,
     ) -> CloudResult<SecretGrant> {
         self.inner
-            .update_secret_grant(area_id, secret, grant_id, actions, auth_generation)
+            .update_secret_grant(area_id, secret, grant_id, change, auth_generation)
             .await
     }
 

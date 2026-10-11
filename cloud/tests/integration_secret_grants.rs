@@ -8,7 +8,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use smudgy_cloud::cloud_api::{
-    CopyAreaRequest, CreateShareRequest, SecretGrant, ShareScope, secret_action,
+    CopyAreaRequest, CreateShareRequest, SecretGrant, SecretGrantChange, ShareScope, secret_action,
 };
 use smudgy_cloud::{
     AreaId, CloudApiClient, CloudError, CloudMapper, Credential, CredentialSource, MapperBackend,
@@ -34,6 +34,14 @@ fn actions(grant: &SecretGrant) -> Vec<&str> {
 
 fn set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(ToString::to_string).collect()
+}
+
+/// A Secret grant change adding `add` and removing `remove`.
+fn change(add: &[&str], remove: &[&str]) -> SecretGrantChange {
+    SecretGrantChange {
+        add: set(add),
+        remove: set(remove),
+    }
 }
 
 /// The Secret's bundle in `user`'s projection of the map, if they read it.
@@ -131,7 +139,11 @@ async fn a_grant_round_trips() {
     assert_eq!(own.iter().map(|g| g.id).collect::<Vec<_>>(), [grant.id]);
 
     let changed = owner_client
-        .update_secret_grant(&secret, grant.id, &[secret_action::ADD])
+        .update_secret_grant(
+            &secret,
+            grant.id,
+            &change(&[secret_action::ADD], &[secret_action::EDIT]),
+        )
         .await
         .expect("the owner changes the grant");
     assert_eq!(changed.id, grant.id);
@@ -235,7 +247,7 @@ async fn the_projection_shows_the_secret_with_the_granted_actions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeat_grant_replaces_the_first() {
+async fn a_repeat_grant_adds_to_the_first() {
     let Shared {
         server,
         owner,
@@ -252,9 +264,92 @@ async fn a_repeat_grant_replaces_the_first() {
         .grant_secret(&secret, friend.id, &[secret_action::REMOVE])
         .await
         .expect("second grant");
-    assert_eq!(second.id, first.id, "the same grant, replaced");
-    assert_eq!(actions(&second), ["read", "remove"]);
+    assert_eq!(second.id, first.id, "the same grant, added to");
+    assert_eq!(actions(&second), ["add", "read", "remove"]);
     assert_eq!(client.secret_grants(&secret).await.expect("list").len(), 1);
+
+    // A new grant is a 201; adding to one is a 200, and never removes.
+    let url = format!("{}/secrets/{}/grants", server.base_url, secret);
+    let post = |grantee: Uuid, actions: serde_json::Value| {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&owner.api_key)
+            .json(&serde_json::json!({ "grantee_id": grantee, "actions": actions }))
+            .send()
+    };
+    let again = post(friend.id, serde_json::json!(["edit"])).await.unwrap();
+    assert_eq!(again.status(), 200);
+    let listed = client.secret_grants(&secret).await.expect("list");
+    assert_eq!(listed[0].actions, set(&["read", "add", "edit", "remove"]));
+    let other = server.create_user("other@example.com", "other", true);
+    server.befriend(&owner, &other);
+    let fresh = post(other.id, serde_json::json!([])).await.unwrap();
+    assert_eq!(fresh.status(), 201);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_change_names_what_it_adds_and_removes() {
+    let Shared {
+        server,
+        owner,
+        friend,
+        secret,
+        ..
+    } = shared_map().await;
+    let client = api_client(&server, &owner);
+    let grant = client
+        .grant_secret(&secret, friend.id, &[secret_action::ADD])
+        .await
+        .expect("grant");
+
+    // Two managers' changes to different actions both land.
+    let before = grant.actions.clone();
+    let mut theirs = before.clone();
+    theirs.insert(secret_action::EDIT.to_string());
+    let mut mine = before.clone();
+    mine.insert(secret_action::COPY.to_string());
+    client
+        .update_secret_grant(
+            &secret,
+            grant.id,
+            &SecretGrantChange::between(&before, &theirs),
+        )
+        .await
+        .expect("one change");
+    let both = client
+        .update_secret_grant(
+            &secret,
+            grant.id,
+            &SecretGrantChange::between(&before, &mine),
+        )
+        .await
+        .expect("the other change");
+    assert_eq!(actions(&both), ["add", "copy", "edit", "read"]);
+
+    // `read` stays, an action named both ways is a 400, and so is a change
+    // naming nothing or of the old replacing shape.
+    let url = format!("{}/secrets/{}/grants/{}", server.base_url, secret, grant.id);
+    for body in [
+        serde_json::json!({ "remove": ["read"] }),
+        serde_json::json!({ "add": ["edit"], "remove": ["edit"] }),
+        serde_json::json!({ "add": [], "remove": [] }),
+        serde_json::json!({ "actions": ["edit"] }),
+        serde_json::json!({ "add": ["fly"] }),
+    ] {
+        let response = reqwest::Client::new()
+            .patch(&url)
+            .bearer_auth(&owner.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{body}");
+    }
+    let listed = client.secret_grants(&secret).await.expect("list");
+    assert_eq!(
+        listed[0].actions, both.actions,
+        "the refusals changed nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -375,7 +470,11 @@ async fn a_manager_grants_within_their_actions_and_never_manage_access() {
     // The grant carrying manage_access is the owner's to change or revoke.
     assert!(matches!(
         manager_client
-            .update_secret_grant(&secret, manager_grant.id, &[secret_action::EDIT])
+            .update_secret_grant(
+                &secret,
+                manager_grant.id,
+                &change(&[], &[secret_action::ADD]),
+            )
             .await,
         Err(CloudError::NotFoundOrNoAccess)
     ));
@@ -389,16 +488,16 @@ async fn a_manager_grants_within_their_actions_and_never_manage_access() {
     // Raising past their own actions is refused; lowering is fine.
     assert!(matches!(
         manager_client
-            .update_secret_grant(
-                &secret,
-                issued.id,
-                &[secret_action::EDIT, secret_action::REMOVE]
-            )
+            .update_secret_grant(&secret, issued.id, &change(&[secret_action::REMOVE], &[]))
             .await,
         Err(CloudError::NotFoundOrNoAccess)
     ));
     let lowered = manager_client
-        .update_secret_grant(&secret, issued.id, &[secret_action::ADD])
+        .update_secret_grant(
+            &secret,
+            issued.id,
+            &change(&[secret_action::ADD], &[secret_action::EDIT]),
+        )
         .await
         .expect("the manager lowers their grant");
     assert_eq!(actions(&lowered), ["add", "read"]);
@@ -409,17 +508,13 @@ async fn a_manager_grants_within_their_actions_and_never_manage_access() {
             .update_secret_grant(
                 &secret,
                 issued.id,
-                &[secret_action::ADD, secret_action::MANAGE_ACCESS]
+                &change(&[secret_action::MANAGE_ACCESS], &[]),
             )
             .await,
         Err(CloudError::NotFoundOrNoAccess)
     ));
     owner_client
-        .update_secret_grant(
-            &secret,
-            issued.id,
-            &[secret_action::ADD, secret_action::REMOVE],
-        )
+        .update_secret_grant(&secret, issued.id, &change(&[secret_action::REMOVE], &[]))
         .await
         .expect("the owner changes the manager's grant within the rules");
 
@@ -646,7 +741,13 @@ async fn grants_go_through_the_cloud_backend_too() {
         .expect("list through the backend");
     assert_eq!(listed.len(), 1);
     let changed = backend
-        .update_secret_grant(&area, &secret, grant.id, &[secret_action::EDIT], generation)
+        .update_secret_grant(
+            &area,
+            &secret,
+            grant.id,
+            &change(&[secret_action::EDIT], &[secret_action::ADD]),
+            generation,
+        )
         .await
         .expect("change through the backend");
     assert_eq!(actions(&changed), ["edit", "read"]);
@@ -734,10 +835,12 @@ async fn copy_comes_only_from_a_grant_that_names_it() {
     );
 
     // Named, it is held, given on, and taken along.
-    let mut with_copy = everything_but_copy.to_vec();
-    with_copy.push(secret_action::COPY);
     owner_client
-        .update_secret_grant(&secret, manager_grant.id, &with_copy)
+        .update_secret_grant(
+            &secret,
+            manager_grant.id,
+            &change(&[secret_action::COPY], &[]),
+        )
         .await
         .expect("the owner gives copy");
     let bundle = bundle_for(&server, &manager, area, &secret)

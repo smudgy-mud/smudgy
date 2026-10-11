@@ -15,8 +15,8 @@ use iced::widget::{
 };
 use iced::{Length, Padding, Task};
 use smudgy_cloud::cloud_api::{
-    CreateShareRequest, FriendView, GrantTreeNode, SecretGrant, ShareDirection, ShareGrant,
-    ShareGrantRow, SharePatch, ShareScope, TransferRecipient, secret_action,
+    CreateShareRequest, FriendView, GrantTreeNode, SecretGrant, SecretGrantChange, ShareDirection,
+    ShareGrant, ShareGrantRow, SharePatch, ShareScope, TransferRecipient, secret_action,
 };
 use smudgy_cloud::mapper::area_cache::AreaCache;
 use smudgy_cloud::{
@@ -26,6 +26,8 @@ use smudgy_cloud::{
 use smudgy_map_widget::sources;
 
 use crate::components::cloud_errors::display_error;
+use crate::components::preset_picker::Picker;
+use crate::presets::{Facet, Preset, PresetPick};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
@@ -292,117 +294,92 @@ pub struct GrantEdit {
     pub error: Option<String>,
 }
 
-/// One box of a Secret share: what a friend may do beyond seeing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretFlag {
-    /// `add`.
-    Add,
-    /// `edit` and `remove`.
-    Edit,
-    /// `manage_access`. Only the map's owner gives it.
-    Share,
-    /// `copy`: the Secret comes along when they copy the map. It is in no
-    /// preset, and only someone who holds it gives it.
-    Copy,
-}
+/// One box of a Secret share: an action a friend or member gets beyond
+/// seeing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SecretFlag(pub &'static str);
 
 impl SecretFlag {
-    const ALL: [Self; 4] = [Self::Add, Self::Edit, Self::Share, Self::Copy];
-
-    /// The wire actions the box stands for.
-    fn actions(self) -> &'static [&'static str] {
-        match self {
-            Self::Add => &[secret_action::ADD],
-            Self::Edit => &[secret_action::EDIT, secret_action::REMOVE],
-            Self::Share => &[secret_action::MANAGE_ACCESS],
-            Self::Copy => &[secret_action::COPY],
-        }
-    }
+    /// Every box, in the order the dialog shows them. Copy is in no preset,
+    /// and Share (`manage_access`) is the owner's to give.
+    const ALL: [Self; 5] = [
+        Self(secret_action::ADD),
+        Self(secret_action::EDIT),
+        Self(secret_action::REMOVE),
+        Self(secret_action::MANAGE_ACCESS),
+        Self(secret_action::COPY),
+    ];
 }
 
-/// The Secret boxes of a new share, or of a grant being edited. None
-/// checked is view only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // one per box the dialog shows
-pub struct SecretFlags {
-    pub add: bool,
-    pub edit: bool,
-    pub share: bool,
-    pub copy: bool,
-}
+/// The boxes of a new Secret share, or of a grant being edited: the actions
+/// it gives beside `read`. None checked is view only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretFlags(BTreeSet<&'static str>);
 
 impl SecretFlags {
-    fn get(self, flag: SecretFlag) -> bool {
-        match flag {
-            SecretFlag::Add => self.add,
-            SecretFlag::Edit => self.edit,
-            SecretFlag::Share => self.share,
-            SecretFlag::Copy => self.copy,
-        }
+    fn get(&self, flag: SecretFlag) -> bool {
+        self.0.contains(flag.0)
     }
 
     fn set(&mut self, flag: SecretFlag, value: bool) {
-        match flag {
-            SecretFlag::Add => self.add = value,
-            SecretFlag::Edit => self.edit = value,
-            SecretFlag::Share => self.share = value,
-            SecretFlag::Copy => self.copy = value,
+        if value {
+            self.0.insert(flag.0);
+        } else {
+            self.0.remove(flag.0);
         }
     }
 
-    /// The boxes a grant's actions check. Can edit stands for either of
-    /// `edit` and `remove`.
+    /// The boxes a grant's actions check.
     fn of(actions: &BTreeSet<String>) -> Self {
-        let mut flags = Self::default();
-        for flag in SecretFlag::ALL {
-            flags.set(
-                flag,
-                flag.actions()
-                    .iter()
-                    .any(|action| actions.contains(*action)),
-            );
-        }
-        flags
+        Self(
+            SecretFlag::ALL
+                .into_iter()
+                .filter(|flag| actions.contains(flag.0))
+                .map(|flag| flag.0)
+                .collect(),
+        )
     }
 
-    /// The actions a new grant with these boxes carries.
-    fn actions(self) -> Vec<&'static str> {
-        SecretFlag::ALL
-            .into_iter()
-            .filter(|flag| self.get(*flag))
-            .flat_map(|flag| flag.actions().iter().copied())
+    /// The actions a grant with these boxes carries beside `read`.
+    fn actions(&self) -> Vec<&'static str> {
+        self.0.iter().copied().collect()
+    }
+
+    /// Every action the boxes give, `read` among them, as a grant lists
+    /// them.
+    fn with_read(&self) -> BTreeSet<String> {
+        std::iter::once(secret_action::READ)
+            .chain(self.0.iter().copied())
+            .map(ToString::to_string)
             .collect()
-    }
-
-    /// The actions an edited grant carries: a box left as it was keeps
-    /// exactly what the grant had, so saving never widens a box it did not
-    /// touch.
-    fn edited_actions(self, original: &BTreeSet<String>) -> Vec<&'static str> {
-        let before = Self::of(original);
-        let mut actions = Vec::new();
-        for flag in SecretFlag::ALL {
-            if self.get(flag) == before.get(flag) {
-                actions.extend(
-                    flag.actions()
-                        .iter()
-                        .filter(|action| original.contains(**action)),
-                );
-            } else if self.get(flag) {
-                actions.extend(flag.actions());
-            }
-        }
-        actions
     }
 
     /// These boxes with every one the sharer may not give turned off.
     fn clamped(mut self, sharer: &SecretSharer) -> Self {
-        for flag in SecretFlag::ALL {
-            if !sharer.may_give(flag) {
-                self.set(flag, false);
-            }
-        }
+        self.0.retain(|action| sharer.may_give(SecretFlag(action)));
         self
     }
+}
+
+/// The Secret preset picker over `flags`, offering the choices whose boxes
+/// `toggles` lets change. `read` stays checked.
+fn secret_picker(flags: &SecretFlags, toggles: impl Fn(SecretFlag) -> bool) -> Picker {
+    let facet = Facet::of(Preset::SecretReader);
+    let checked = flags.with_read();
+    Picker::new(
+        facet,
+        checked.iter().map(String::as_str),
+        facet.presets(),
+        |pick| {
+            pick.changes().all(|(action, on)| {
+                if action == secret_action::READ {
+                    on
+                } else {
+                    flags.get(SecretFlag(action)) == on || toggles(SecretFlag(action))
+                }
+            })
+        },
+    )
 }
 
 /// The viewer as a sharer of one Secret. The map's owner holds every
@@ -417,15 +394,10 @@ struct SecretSharer<'a> {
 impl SecretSharer<'_> {
     /// Whether the viewer may check `flag` for a friend.
     fn may_give(&self, flag: SecretFlag) -> bool {
-        match flag {
-            SecretFlag::Share => self.is_owner,
-            _ => {
-                self.is_owner
-                    || flag
-                        .actions()
-                        .iter()
-                        .all(|action| self.held.contains(*action))
-            }
+        if flag.0 == secret_action::MANAGE_ACCESS {
+            self.is_owner
+        } else {
+            self.is_owner || self.held.contains(flag.0)
         }
     }
 
@@ -442,11 +414,10 @@ impl SecretSharer<'_> {
     /// boxes already on, which they may only clear. Can share is the owner's,
     /// on grants the owner issued.
     fn may_toggle(&self, edit: &SecretGrantEdit, flag: SecretFlag) -> bool {
-        match flag {
-            SecretFlag::Share => {
-                self.is_owner && edit.original.grantor_id == edit.original.owner_id
-            }
-            _ => self.may_give(flag) || SecretFlags::of(&edit.original.actions).get(flag),
+        if flag.0 == secret_action::MANAGE_ACCESS {
+            self.is_owner && edit.original.grantor_id == edit.original.owner_id
+        } else {
+            self.may_give(flag) || edit.original.actions.contains(flag.0)
         }
     }
 }
@@ -565,6 +536,8 @@ pub enum ShareMessage {
     RecipientToggled(Uuid, bool),
     FlagToggled(GrantFlag, bool),
     SecretFlagToggled(SecretFlag, bool),
+    /// A Secret preset picked for a new share's boxes.
+    SecretPreset(PresetPick),
     /// Check/uncheck one disclosed host (§4.2 grantor consent).
     HostHintToggled(String, bool),
     Submit,
@@ -575,6 +548,8 @@ pub enum ShareMessage {
     EditGrant(Uuid),
     EditFlagToggled(GrantFlag, bool),
     EditSecretFlagToggled(SecretFlag, bool),
+    /// A Secret preset picked for an edited grant's boxes.
+    EditSecretPreset(PresetPick),
     EditCancelled,
     EditSaved,
     EditResult {
@@ -1731,7 +1706,7 @@ impl ShareDialog {
         self.manage_error = None;
         self.results.clear();
         if let Some(sharer) = self.sharer() {
-            self.secret_flags = self.secret_flags.clamped(&sharer);
+            self.secret_flags = self.secret_flags.clone().clamped(&sharer);
         }
     }
 
@@ -1965,6 +1940,20 @@ pub(super) fn update_share(
             }
             Update::none()
         }
+        // A preset is the boxes it sets, each as a single toggle; `read`
+        // stays.
+        ShareMessage::SecretPreset(pick) => {
+            for (action, on) in pick.changes() {
+                if action != secret_action::READ
+                    && dialog
+                        .sharer()
+                        .is_some_and(|sharer| sharer.may_give(SecretFlag(action)))
+                {
+                    dialog.secret_flags.set(SecretFlag(action), on);
+                }
+            }
+            Update::none()
+        }
         ShareMessage::HostHintToggled(host, value) => {
             if let Some((_, checked)) = dialog.host_hints.iter_mut().find(|(h, _)| *h == host) {
                 *checked = value;
@@ -1979,7 +1968,7 @@ pub(super) fn update_share(
                 let recipients = dialog.clan_recipients();
                 let Some(actions) = dialog
                     .sharer()
-                    .map(|sharer| dialog.secret_flags.clamped(&sharer).actions())
+                    .map(|sharer| dialog.secret_flags.clone().clamped(&sharer).actions())
                 else {
                     return Update::none();
                 };
@@ -2022,7 +2011,7 @@ pub(super) fn update_share(
             dialog.results.clear();
             let mut tasks = Vec::new();
             let task = if let Some(sharer) = dialog.sharer() {
-                let actions = dialog.secret_flags.clamped(&sharer).actions();
+                let actions = dialog.secret_flags.clone().clamped(&sharer).actions();
                 // A Secret shows only to people who see its map: when the
                 // viewer may share the map, a friend who can't see it gets
                 // map view too. Unknown while the tree is loading.
@@ -2188,6 +2177,22 @@ pub(super) fn update_share(
             }
             Update::none()
         }
+        ShareMessage::EditSecretPreset(pick) => {
+            for (action, on) in pick.changes() {
+                if action == secret_action::READ {
+                    continue;
+                }
+                let flag = SecretFlag(action);
+                let allowed = dialog
+                    .sharer()
+                    .zip(dialog.secret_editing.as_ref())
+                    .is_some_and(|(sharer, edit)| sharer.may_toggle(edit, flag));
+                if allowed && let Some(edit) = &mut dialog.secret_editing {
+                    edit.flags.set(flag, on);
+                }
+            }
+            Update::none()
+        }
         ShareMessage::EditCancelled => {
             dialog.editing = None;
             dialog.secret_editing = None;
@@ -2202,11 +2207,14 @@ pub(super) fn update_share(
                 if edit.saving {
                     return Update::none();
                 }
-                if edit.flags == SecretFlags::of(&edit.original.actions) {
+                // Exactly the boxes changed, so another manager's changes
+                // meanwhile stay (format-3.md §5.1).
+                let change =
+                    SecretGrantChange::between(&edit.original.actions, &edit.flags.with_read());
+                if change.is_empty() {
                     dialog.secret_editing = None;
                     return Update::none();
                 }
-                let actions = edit.flags.edited_actions(&edit.original.actions);
                 edit.saving = true;
                 edit.error = None;
                 let id = edit.original.id;
@@ -2217,7 +2225,7 @@ pub(super) fn update_share(
                     return Update::with_task(Task::perform(
                         async move {
                             client
-                                .update_clan_secret_grant(&secret, id, &actions)
+                                .update_clan_secret_grant(&secret, id, &change)
                                 .await
                                 .map(|grant| SecretGrant {
                                     actions: grant.actions,
@@ -2233,7 +2241,7 @@ pub(super) fn update_share(
                 return Update::with_task(Task::perform(
                     async move {
                         mapper
-                            .update_secret_grant(area_id, &secret, id, &actions)
+                            .update_secret_grant(area_id, &secret, id, &change)
                             .await
                     },
                     move |result| share(ShareMessage::SecretEditResult { id, result }),
@@ -3580,11 +3588,12 @@ fn map_flags_section(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
 
 /// The labels of the Secret boxes, in order.
 fn secret_flag_label(flag: SecretFlag) -> String {
-    match flag {
-        SecretFlag::Add => crate::i18n::t!("mapper-secret-can-add"),
-        SecretFlag::Edit => crate::i18n::t!("mapper-secret-can-edit"),
-        SecretFlag::Share => crate::i18n::t!("mapper-secret-can-share"),
-        SecretFlag::Copy => crate::i18n::t!("mapper-secret-can-copy"),
+    match flag.0 {
+        secret_action::ADD => crate::i18n::t!("mapper-secret-can-add"),
+        secret_action::EDIT => crate::i18n::t!("mapper-secret-can-edit"),
+        secret_action::REMOVE => crate::i18n::t!("mapper-secret-can-remove"),
+        secret_action::MANAGE_ACCESS => crate::i18n::t!("mapper-secret-can-share"),
+        _ => crate::i18n::t!("mapper-secret-can-copy"),
     }
 }
 
@@ -3592,21 +3601,28 @@ fn secret_flag_label(flag: SecretFlag) -> String {
 /// whoever may give it. The others show to every sharer, off and locked
 /// when they may not give them.
 fn shows_secret_flag(flag: SecretFlag, may_change: bool, sharer: &SecretSharer) -> bool {
-    match flag {
-        SecretFlag::Share => sharer.is_owner && may_change,
-        SecretFlag::Copy => may_change,
-        SecretFlag::Add | SecretFlag::Edit => true,
+    match flag.0 {
+        secret_action::MANAGE_ACCESS => sharer.is_owner && may_change,
+        secret_action::COPY => may_change,
+        _ => true,
     }
 }
 
-/// What sharing a Secret gives. None checked is view only. Can share is
-/// the owner's to give, and Can copy is offered only to a sharer who holds
-/// it; a manager's other boxes they don't hold stay off.
+/// What sharing a Secret gives: a preset picker and a box per action. None
+/// checked is view only. Can share is the owner's to give, and Can copy is
+/// offered only to a sharer who holds it; a manager's other boxes they
+/// don't hold stay off.
 fn secret_flags_section(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
     let mut caps = column![section_label(crate::i18n::t!("mapper-they-can"))].spacing(6);
     let Some(sharer) = dialog.sharer() else {
         return caps.into();
     };
+    let picker = secret_picker(&dialog.secret_flags, |flag| sharer.may_give(flag));
+    let usable = picker.choices.len() > 1;
+    caps = caps.push(picker.view(
+        crate::i18n::t!("permissions-preset"),
+        usable.then_some(|pick| share(ShareMessage::SecretPreset(pick))),
+    ));
     for flag in SecretFlag::ALL {
         if !shows_secret_flag(flag, sharer.may_give(flag), &sharer) {
             continue;
@@ -3672,19 +3688,17 @@ fn results_section(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
 /// The badges of a Secret grant: "add · edit · copy", or "view".
 fn secret_badges(actions: &BTreeSet<String>) -> String {
     let flags = SecretFlags::of(actions);
-    let mut badges = Vec::new();
-    if flags.add {
-        badges.push(crate::i18n::t!("mapper-badge-add"));
-    }
-    if flags.edit {
-        badges.push(crate::i18n::t!("mapper-badge-edit"));
-    }
-    if flags.share {
-        badges.push(crate::i18n::t!("mapper-badge-share"));
-    }
-    if flags.copy {
-        badges.push(crate::i18n::t!("mapper-badge-copy"));
-    }
+    let badges: Vec<String> = SecretFlag::ALL
+        .into_iter()
+        .filter(|flag| flags.get(*flag))
+        .map(|flag| match flag.0 {
+            secret_action::ADD => crate::i18n::t!("mapper-badge-add"),
+            secret_action::EDIT => crate::i18n::t!("mapper-badge-edit"),
+            secret_action::REMOVE => crate::i18n::t!("mapper-badge-remove"),
+            secret_action::MANAGE_ACCESS => crate::i18n::t!("mapper-badge-share"),
+            _ => crate::i18n::t!("mapper-badge-copy"),
+        })
+        .collect();
     if badges.is_empty() {
         crate::i18n::t!("mapper-badge-view")
     } else {
@@ -3787,7 +3801,14 @@ fn secret_grant_edit_row<'a>(
     let mut flags = iced::widget::Row::new()
         .spacing(8)
         .align_y(Vertical::Center);
+    let mut preset = None;
     if let Some(sharer) = dialog.sharer() {
+        let picker = secret_picker(&edit.flags, |flag| sharer.may_toggle(edit, flag));
+        let usable = picker.choices.len() > 1;
+        preset = Some(picker.view(
+            crate::i18n::t!("permissions-preset"),
+            usable.then_some(|pick| share(ShareMessage::EditSecretPreset(pick))),
+        ));
         for flag in SecretFlag::ALL {
             let may_toggle = sharer.may_toggle(edit, flag);
             if !shows_secret_flag(flag, may_toggle, &sharer) {
@@ -3805,7 +3826,11 @@ fn secret_grant_edit_row<'a>(
             flags = flags.push(item);
         }
     }
-    let mut block = column![flags].spacing(6).padding([4, 0]);
+    let mut block = column![].spacing(6).padding([4, 0]);
+    if let Some(preset) = preset {
+        block = block.push(preset);
+    }
+    block = block.push(flags);
     if let Some(error) = &edit.error {
         block = block.push(text(error.clone()).size(11).style(builtins::text::danger));
     }
@@ -5049,69 +5074,82 @@ mod tests {
         assert_eq!(opening_place(&[], SourceId::Map), None);
     }
 
+    /// The boxes checked for `actions`.
+    fn flags(actions: &[&str]) -> SecretFlags {
+        let mut flags = SecretFlags::default();
+        for action in actions {
+            let flag = SecretFlag::ALL
+                .into_iter()
+                .find(|flag| flag.0 == *action)
+                .unwrap();
+            flags.set(flag, true);
+        }
+        flags
+    }
+
     #[test]
     fn secret_boxes_clamp_to_what_the_sharer_may_give() {
-        let everything = SecretFlags {
-            add: true,
-            edit: true,
-            share: true,
-            copy: true,
-        };
+        let everything = flags(&["add", "edit", "remove", "manage_access", "copy"]);
         let all = actions(ALL);
         let owner = SecretSharer {
             is_owner: true,
             held: &all,
         };
-        assert_eq!(everything.clamped(&owner), everything);
+        assert_eq!(everything.clone().clamped(&owner), everything);
 
-        // A manager without `remove` can't give Can edit (edit and remove),
-        // nor Can copy without `copy`, and never Can share.
+        // A manager gives the actions they hold, never Can share: here Can
+        // add and Can edit, not Can remove nor Can copy.
         let held = actions(&["read", "add", "edit", "manage_access"]);
         let manager = SecretSharer {
             is_owner: false,
             held: &held,
         };
         assert_eq!(
-            everything.clamped(&manager),
-            SecretFlags {
-                add: true,
-                ..SecretFlags::default()
-            }
+            everything.clone().clamped(&manager),
+            flags(&["add", "edit"])
         );
         let held = actions(&["read", "add", "manage_access", "copy"]);
         let copier = SecretSharer {
             is_owner: false,
             held: &held,
         };
+        assert_eq!(everything.clamped(&copier), flags(&["add", "copy"]));
+        assert_eq!(flags(&["add", "edit"]).actions(), ["add", "edit"]);
         assert_eq!(
-            everything.clamped(&copier),
-            SecretFlags {
-                add: true,
-                copy: true,
-                ..SecretFlags::default()
-            }
-        );
-        assert_eq!(
-            SecretFlags {
-                add: true,
-                edit: true,
-                share: false,
-                copy: false,
-            }
-            .actions(),
-            ["add", "edit", "remove"]
-        );
-        assert_eq!(
-            SecretFlags {
-                add: true,
-                copy: true,
-                ..SecretFlags::default()
-            }
-            .actions(),
+            flags(&["copy", "add"]).actions(),
             ["add", "copy"],
             "Can copy is its own box, in the wire's order"
         );
         assert!(SecretFlags::default().actions().is_empty(), "view only");
+    }
+
+    /// The Secret preset picker reads the boxes with `read`, and offers only
+    /// the presets whose boxes the sharer may set.
+    #[test]
+    fn the_secret_picker_offers_what_the_sharer_may_give() {
+        let held = actions(&["read", "add", "edit", "manage_access"]);
+        let manager = SecretSharer {
+            is_owner: false,
+            held: &held,
+        };
+        let picker = secret_picker(&flags(&["add", "edit"]), |flag| manager.may_give(flag));
+        assert_eq!(
+            picker.state,
+            crate::presets::FacetState::Preset(Preset::SecretContributor)
+        );
+        assert_eq!(
+            picker.choices,
+            [
+                PresetPick::Preset(Preset::SecretReader),
+                PresetPick::Preset(Preset::SecretContributor)
+            ],
+            "no Editor without remove, no Access manager, and read stays"
+        );
+        assert_eq!(
+            secret_picker(&flags(&["add", "edit", "copy"]), |_| true).state,
+            crate::presets::FacetState::Preset(Preset::SecretContributor),
+            "Copy is in no preset"
+        );
     }
 
     /// The copy dialog says how many of the Secrets the viewer reads come
@@ -5165,13 +5203,21 @@ mod tests {
             held: &copying,
         };
         let shows = |sharer: &SecretSharer| {
-            shows_secret_flag(SecretFlag::Copy, sharer.may_give(SecretFlag::Copy), sharer)
+            shows_secret_flag(
+                SecretFlag(secret_action::COPY),
+                sharer.may_give(SecretFlag(secret_action::COPY)),
+                sharer,
+            )
         };
         assert!(shows(&owner));
         assert!(!shows(&manager));
         assert!(shows(&copier));
         // Add and Edit show to every sharer, locked when out of reach.
-        assert!(shows_secret_flag(SecretFlag::Add, false, &manager));
+        assert!(shows_secret_flag(
+            SecretFlag(secret_action::ADD),
+            false,
+            &manager
+        ));
 
         let edit = |grant: SecretGrant| SecretGrantEdit {
             flags: SecretFlags::of(&grant.actions),
@@ -5181,14 +5227,17 @@ mod tests {
         };
         let plain = edit(secret_grant(20, secret(10), OWNER, TOMAS, &["read", "add"]));
         let copies = edit(secret_grant(21, secret(10), OWNER, MIRA, &["read", "copy"]));
-        assert!(!manager.may_toggle(&plain, SecretFlag::Copy));
+        assert!(!manager.may_toggle(&plain, SecretFlag(secret_action::COPY)));
         assert!(
-            manager.may_toggle(&copies, SecretFlag::Copy),
+            manager.may_toggle(&copies, SecretFlag(secret_action::COPY)),
             "a manager may clear copy, though they lack it"
         );
-        assert!(copier.may_toggle(&plain, SecretFlag::Copy));
-        assert!(owner.may_toggle(&plain, SecretFlag::Copy));
-        assert!(copies.flags.copy && !copies.flags.add);
+        assert!(copier.may_toggle(&plain, SecretFlag(secret_action::COPY)));
+        assert!(owner.may_toggle(&plain, SecretFlag(secret_action::COPY)));
+        assert!(
+            copies.flags.get(SecretFlag(secret_action::COPY))
+                && !copies.flags.get(SecretFlag(secret_action::ADD))
+        );
     }
 
     #[test]
@@ -5252,12 +5301,7 @@ mod tests {
         assert_eq!(dialog.target, secret(10));
         dialog.pick(secret(11));
         dialog.selected.extend([id(TOMAS), id(MIRA)]);
-        dialog.secret_flags = SecretFlags {
-            add: true,
-            edit: true,
-            share: false,
-            copy: false,
-        };
+        dialog.secret_flags = flags(&["add", "edit"]);
         dialog
             .results
             .push(("tomas".to_string(), ShareOutcome::Shared));
@@ -5267,10 +5311,7 @@ mod tests {
         assert_eq!(dialog.selected, HashSet::from([id(TOMAS), id(MIRA)]));
         assert_eq!(
             dialog.secret_flags,
-            SecretFlags {
-                add: true,
-                ..SecretFlags::default()
-            },
+            flags(&["add"]),
             "Can edit is beyond what the manager holds on Bookcase"
         );
         assert!(dialog.results.is_empty());
@@ -5294,7 +5335,7 @@ mod tests {
             error: None,
         };
 
-        // Can edit is already on: the manager may clear it, though they
+        // Can remove is already on: the manager may clear it, though they
         // lack `remove`. Off, it stays off.
         let editor = edit(secret_grant(
             20,
@@ -5304,11 +5345,13 @@ mod tests {
             &["read", "edit", "remove"],
         ));
         assert!(manager.manages(&editor.original));
-        assert!(manager.may_toggle(&editor, SecretFlag::Edit));
-        assert!(manager.may_toggle(&editor, SecretFlag::Add));
-        assert!(!manager.may_toggle(&editor, SecretFlag::Share));
+        assert!(manager.may_toggle(&editor, SecretFlag(secret_action::REMOVE)));
+        assert!(manager.may_toggle(&editor, SecretFlag(secret_action::EDIT)));
+        assert!(manager.may_toggle(&editor, SecretFlag(secret_action::ADD)));
+        assert!(!manager.may_toggle(&editor, SecretFlag(secret_action::MANAGE_ACCESS)));
         let viewer = edit(secret_grant(21, secret(10), OWNER, MIRA, &["read"]));
-        assert!(!manager.may_toggle(&viewer, SecretFlag::Edit));
+        assert!(!manager.may_toggle(&viewer, SecretFlag(secret_action::REMOVE)));
+        assert!(manager.may_toggle(&viewer, SecretFlag(secret_action::EDIT)));
 
         // A grant carrying manage_access is the owner's.
         let co_manager = secret_grant(22, secret(10), OWNER, MIRA, &["read", "manage_access"]);
@@ -5321,9 +5364,9 @@ mod tests {
             held: &all,
         };
         assert!(owner.manages(&co_manager));
-        assert!(owner.may_toggle(&viewer, SecretFlag::Share));
+        assert!(owner.may_toggle(&viewer, SecretFlag(secret_action::MANAGE_ACCESS)));
         let from_manager = edit(secret_grant(23, secret(10), VIEWER, TOMAS, &["read"]));
-        assert!(!owner.may_toggle(&from_manager, SecretFlag::Share));
+        assert!(!owner.may_toggle(&from_manager, SecretFlag(secret_action::MANAGE_ACCESS)));
     }
 
     #[test]
@@ -5372,33 +5415,26 @@ mod tests {
     }
 
     #[test]
-    fn saving_keeps_untouched_boxes_exactly() {
-        // A grant with `edit` but not `remove` keeps just `edit` when only
-        // Can add changes.
-        let original = actions(&["read", "edit"]);
-        let mut flags = SecretFlags::of(&original);
-        assert!(flags.edit);
-        flags.add = true;
-        assert_eq!(flags.edited_actions(&original), ["add", "edit"]);
-        // Turning a box on gives its whole set; off takes it all away.
-        flags.edit = false;
-        flags.share = true;
-        assert_eq!(flags.edited_actions(&original), ["add", "manage_access"]);
-        let none = SecretFlags::default();
-        assert!(none.edited_actions(&original).is_empty());
-
-        // Can copy is its own box: untouched, it keeps the grant's `copy`
-        // exactly; checked, it adds just `copy`.
+    fn saving_names_only_the_boxes_changed() {
         let original = actions(&["read", "edit", "copy"]);
         let mut flags = SecretFlags::of(&original);
-        assert!(flags.copy && flags.edit && !flags.add);
-        flags.add = true;
-        assert_eq!(flags.edited_actions(&original), ["add", "edit", "copy"]);
-        flags.copy = false;
-        assert_eq!(flags.edited_actions(&original), ["add", "edit"]);
-        let original = actions(&["read", "add"]);
-        let mut flags = SecretFlags::of(&original);
-        flags.copy = true;
-        assert_eq!(flags.edited_actions(&original), ["add", "copy"]);
+        assert!(
+            flags.get(SecretFlag(secret_action::EDIT))
+                && flags.get(SecretFlag(secret_action::COPY))
+                && !flags.get(SecretFlag(secret_action::ADD))
+        );
+        assert!(
+            SecretGrantChange::between(&original, &flags.with_read()).is_empty(),
+            "nothing changed, so nothing to send"
+        );
+        flags.set(SecretFlag(secret_action::ADD), true);
+        flags.set(SecretFlag(secret_action::COPY), false);
+        assert_eq!(
+            SecretGrantChange::between(&original, &flags.with_read()),
+            SecretGrantChange {
+                add: actions(&["add"]),
+                remove: actions(&["copy"]),
+            }
+        );
     }
 }

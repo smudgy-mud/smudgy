@@ -69,7 +69,7 @@ fn grant(recipient: GrantRecipient, scope: GrantScope, actions: &[&str]) -> Clan
         "actions": actions,
         "scope": scope,
         "issuer_id": id(2),
-        "parent_id": null,
+        "delegated": [],
         "created_at": "2026-10-07T00:00:00Z",
         "updated_at": "2026-10-07T00:00:00Z"
     }))
@@ -640,7 +640,7 @@ fn opening_group_permissions_without_changes_does_not_write() {
     let Some(Modal::GroupPermissions(editor)) = &panel.open.as_ref().unwrap().modal else {
         panic!("Manage permissions opens the three-tab editor");
     };
-    assert!(editor.writes(panel.open.as_ref().unwrap()).is_empty());
+    assert!(editor.writes().is_empty());
     assert!(!editor.saving);
 }
 
@@ -776,6 +776,7 @@ fn a_member_owned_maps_grants_are_its_owners_to_change() {
         folders: &page.folders,
         maps: &page.maps,
         packages: &page.packages,
+        grants: &page.grants,
         owner: true,
     };
     assert_eq!(context.scope_label(&on(60).scope), "Nessa's DV");
@@ -813,6 +814,7 @@ fn a_scope_counts_the_resources_out_of_sight_after_its_names() {
         folders: &page.folders,
         maps: &page.maps,
         packages: &page.packages,
+        grants: &page.grants,
         owner: true,
     };
     let scope = |maps: &[u128]| GrantScope::Areas {

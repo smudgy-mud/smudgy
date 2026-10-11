@@ -1,7 +1,7 @@
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
-    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    cloud_api::{SecretChange, SecretGrant, SecretGrantChange, SecretSummary},
     mutation::{MoveRequest, MoveResult, MutationEnvelope, MutationResult},
 };
 use async_trait::async_trait;
@@ -478,7 +478,7 @@ pub trait MapperBackend: Send + Sync {
         Err(secrets_unsupported())
     }
 
-    /// `POST /secrets/{id}/grants`: shares a Secret with a friend, replacing
+    /// `POST /secrets/{id}/grants`: shares a Secret with a friend, adding to
     /// the caller's earlier grant to them.
     async fn grant_secret(
         &self,
@@ -492,16 +492,17 @@ pub trait MapperBackend: Send + Sync {
         Err(secrets_unsupported())
     }
 
-    /// `PATCH /secrets/{id}/grants/{grant}`: replaces a grant's actions.
+    /// `PATCH /secrets/{id}/grants/{grant}`: adds and removes a grant's
+    /// actions.
     async fn update_secret_grant(
         &self,
         area_id: &AreaId,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
         auth_generation: u64,
     ) -> CloudResult<SecretGrant> {
-        let _ = (area_id, secret, grant_id, actions, auth_generation);
+        let _ = (area_id, secret, grant_id, change, auth_generation);
         Err(secrets_unsupported())
     }
 

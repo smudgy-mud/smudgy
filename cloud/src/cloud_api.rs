@@ -502,6 +502,46 @@ impl SecretGrant {
     }
 }
 
+/// A change to a Secret grant (`PATCH /secrets/{s}/grants/{g}`), owner
+/// Secrets and Clan Secrets alike: actions to add and remove. The actions it
+/// does not name stay as they are, so changes two managers make to
+/// different actions both land. [`READ`](secret_action::READ) is always
+/// present; revoking the grant is a delete.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecretGrantChange {
+    pub add: BTreeSet<String>,
+    pub remove: BTreeSet<String>,
+}
+
+impl SecretGrantChange {
+    /// The change taking a grant from `before` to `after`: what an editor
+    /// sends for the switches it changed. It never names `read`.
+    #[must_use]
+    pub fn between(before: &BTreeSet<String>, after: &BTreeSet<String>) -> Self {
+        let named = |from: &BTreeSet<String>, to: &BTreeSet<String>| {
+            from.difference(to)
+                .filter(|action| *action != secret_action::READ)
+                .cloned()
+                .collect()
+        };
+        Self {
+            add: named(after, before),
+            remove: named(before, after),
+        }
+    }
+
+    /// Whether it names nothing. The server refuses such a change, so an
+    /// editor with nothing changed sends none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+
+    pub(crate) fn to_body(&self) -> Value {
+        json!({ "add": self.add, "remove": self.remove })
+    }
+}
+
 /// The path of a Secret's grants. Only Secrets have grants; the map and
 /// Private are refused before anything is sent.
 pub(crate) fn secret_grants_path(secret: &SourceId) -> CloudResult<String> {
@@ -1404,8 +1444,9 @@ impl CloudApiClient {
     }
 
     /// `POST /secrets/{id}/grants` — shares the Secret with a friend. `read`
-    /// is implied. A second grant from the caller to the same grantee
-    /// replaces the first one's actions.
+    /// is implied. When the caller already has a grant to that friend, the
+    /// actions join it (200) instead of making another (201); posting never
+    /// removes an action.
     ///
     /// # Errors
     /// See the section comment.
@@ -1420,20 +1461,22 @@ impl CloudApiClient {
             .await
     }
 
-    /// `PATCH /secrets/{id}/grants/{grant}` — replaces a grant's actions.
+    /// `PATCH /secrets/{id}/grants/{grant}` — applies `change`, leaving the
+    /// actions it does not name as they are.
     ///
     /// # Errors
-    /// See the section comment.
+    /// See the section comment; [`CloudError::InvalidInput`] for a change
+    /// naming nothing, an action both added and removed, or removing
+    /// `read`.
     pub async fn update_secret_grant(
         &self,
         secret: &SourceId,
         grant_id: Uuid,
-        actions: &[&str],
+        change: &SecretGrantChange,
     ) -> CloudResult<SecretGrant> {
-        let body = json!({ "actions": actions });
         self.patch(
             &format!("{}/{grant_id}", secret_grants_path(secret)?),
-            &body,
+            &change.to_body(),
         )
         .await
     }
@@ -1990,6 +2033,24 @@ mod tests {
         assert!(created.grantee_nickname.is_none());
         assert_eq!(created.grantor_nickname.as_deref(), Some("mira"));
         assert_eq!(created.actions.len(), 1);
+    }
+
+    #[test]
+    fn secret_grant_changes_never_name_read() {
+        let set = |actions: &[&str]| -> BTreeSet<String> {
+            actions.iter().map(ToString::to_string).collect()
+        };
+        let change = SecretGrantChange::between(
+            &set(&[secret_action::READ, secret_action::ADD]),
+            &set(&[secret_action::EDIT]),
+        );
+        assert_eq!(change.add, set(&[secret_action::EDIT]));
+        assert_eq!(change.remove, set(&[secret_action::ADD]));
+        assert_eq!(
+            change.to_body(),
+            json!({ "add": ["edit"], "remove": ["add"] })
+        );
+        assert!(SecretGrantChange::between(&set(&[secret_action::READ]), &set(&[])).is_empty());
     }
 
     #[test]

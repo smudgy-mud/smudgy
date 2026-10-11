@@ -22,7 +22,7 @@
 #![allow(clippy::too_many_lines)]
 
 use smudgy_cloud::clan_maps::MapOwnership;
-use smudgy_cloud::cloud_api::secret_action;
+use smudgy_cloud::cloud_api::{SecretGrantChange, secret_action};
 use smudgy_cloud::mapper::AreaMutationBatch;
 use smudgy_cloud::mutation::{
     AreaMutation, MoveRequest, MovedRoom, MutationEnvelope, OpResult, Precondition,
@@ -1020,15 +1020,20 @@ async fn grants_round_trip(
         .grant_secret(&secret, friend, &[secret_action::ADD])
         .await
         .map_err(|e| format!("grant again: {e}"))?;
-    if again.id != grant.id || again.can(secret_action::EDIT) {
-        return Err(format!("a repeat grant did not replace: {again:?}"));
+    if again.id != grant.id || !again.can(secret_action::EDIT) || !again.can(secret_action::ADD) {
+        return Err(format!(
+            "a repeat grant did not add to the first: {again:?}"
+        ));
     }
     let changed = mapper
         .update_secret_grant(
             &area,
             &secret,
             grant.id,
-            &[secret_action::ADD, secret_action::REMOVE],
+            &SecretGrantChange {
+                add: [secret_action::REMOVE.to_string()].into(),
+                remove: [secret_action::EDIT.to_string()].into(),
+            },
             generation,
         )
         .await

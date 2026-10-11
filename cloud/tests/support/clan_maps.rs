@@ -23,9 +23,7 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::clans::{
-    ClanGrantRecord, ClanGrantScope, ClanRecipient, ClanRecord, ClanResource, ordered,
-};
+use super::clans::{ClanGrantScope, ClanRecipient, ClanRecord, ClanResource, ordered, own};
 use super::http::{
     Handled, authenticate, bad_request, conflict, created, gate_verified, not_found, ok,
 };
@@ -292,6 +290,31 @@ pub fn member_grant_actions(
     let mut stored = actions.clone();
     stored.insert("area.read".to_string());
     Ok(stored)
+}
+
+/// Checks a change set an active owner makes to a Member-owned map's grant
+/// (docs/clans.md §7.4): only the map's own actions, no ceiling, and
+/// `area.read` stays; deleting the grant revokes it.
+pub fn member_grant_change(
+    add: &BTreeSet<String>,
+    remove: &BTreeSet<String>,
+    ceiling: bool,
+) -> Result<(), Response> {
+    if ceiling
+        || add
+            .iter()
+            .any(|action| !MEMBER_OWNED_ACTIONS.contains(&action.as_str()))
+    {
+        return Err(bad_request(
+            "That action does not apply to a Member-owned map",
+        ));
+    }
+    if remove.contains("area.read") {
+        return Err(bad_request(
+            "A Member-owned map's grant always gives area.read; delete it to revoke",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -750,20 +773,15 @@ pub fn create_clan_area(
     // naming that map alone (docs/clans.md §6).
     if !member_owned {
         let seq = st.next_seq();
-        let now = Utc::now();
         if let Some(clan) = st.clans.clans.get_mut(&clan_id) {
-            clan.grants.push(ClanGrantRecord {
-                id: Uuid::new_v4(),
-                recipient: ClanRecipient::User(viewer),
-                scope: ClanGrantScope::Areas(BTreeSet::from([id])),
-                actions: CREATOR_ACTIONS.iter().map(ToString::to_string).collect(),
-                may_grant: BTreeSet::new(),
-                issuer_id: viewer,
-                parent_id: None,
-                created_at: now,
-                updated_at: now,
+            clan.upsert(
+                ClanRecipient::User(viewer),
+                ClanGrantScope::Areas(BTreeSet::from([id])),
+                &own(CREATOR_ACTIONS),
+                &BTreeSet::new(),
+                viewer,
                 seq,
-            });
+            );
         }
     }
     Ok(id)

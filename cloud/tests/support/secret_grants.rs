@@ -11,10 +11,11 @@
 //! holds, never `manage_access`; only the owner grants that, on grants the
 //! owner issued, and only the owner changes or revokes a grant carrying
 //! it. Grants are keyed by (Secret, grantor, grantee); a grantee's actions
-//! are the union of theirs. A grant confers nothing while its grantee
-//! cannot read the map, and stays in place until then. Unfriending and
-//! blocking delete grants as they delete map shares; deleting a Secret, or
-//! its map, deletes its grants.
+//! are the union of theirs. Posting again adds to the grant, and a `PATCH`
+//! adds and removes exactly what it names. A grant confers nothing while
+//! its grantee cannot read the map, and stays in place until then.
+//! Unfriending and blocking delete grants as they delete map shares;
+//! deleting a Secret, or its map, deletes its grants.
 //!
 //! Every route needs a verified email (403). A body of the wrong shape or
 //! an unknown action is a 400; every other refusal is the uniform 404.
@@ -347,6 +348,71 @@ fn read_actions(body: &Value) -> Result<BTreeSet<&'static str>, Response> {
     Ok(actions)
 }
 
+/// A `PATCH` body: `{"add": [...], "remove": [...]}`, each optional, naming
+/// at least one action and none both added and removed. `read` is always
+/// present: adding it changes nothing, and removing it is a 400.
+#[derive(Debug, Default)]
+pub struct GrantChange {
+    pub add: BTreeSet<&'static str>,
+    pub remove: BTreeSet<&'static str>,
+}
+
+impl GrantChange {
+    fn of(body: &Value) -> Result<Self, Response> {
+        let names = |key: &str| -> Result<Vec<&str>, Response> {
+            match body.get(key) {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .ok_or_else(|| bad_request(&format!("`{key}` must list strings")))
+                    })
+                    .collect(),
+                Some(_) => Err(bad_request(&format!("`{key}` must list strings"))),
+            }
+        };
+        let (add, remove) = (names("add")?, names("remove")?);
+        if add.is_empty() && remove.is_empty() {
+            return Err(bad_request("a change names at least one action"));
+        }
+        if remove.contains(&READ) {
+            return Err(bad_request(
+                "`read` is always present; revoking the grant removes it",
+            ));
+        }
+        let known = |names: Vec<&str>| -> Result<BTreeSet<&'static str>, Response> {
+            let mut actions = BTreeSet::new();
+            for name in names.into_iter().filter(|name| *name != READ) {
+                let Some(action) = GRANTABLE.into_iter().find(|known| *known == name) else {
+                    return Err(bad_request(&format!("unknown action `{name}`")));
+                };
+                actions.insert(action);
+            }
+            Ok(actions)
+        };
+        let change = Self {
+            add: known(add)?,
+            remove: known(remove)?,
+        };
+        if let Some(action) = change.add.intersection(&change.remove).next() {
+            return Err(bad_request(&format!(
+                "`{action}` is both added and removed"
+            )));
+        }
+        Ok(change)
+    }
+
+    /// `before` with the change applied.
+    pub fn apply(&self, before: &BTreeSet<&'static str>) -> BTreeSet<&'static str> {
+        before
+            .union(&self.add)
+            .copied()
+            .filter(|action| !self.remove.contains(action))
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /secrets/{id}/grants
 // ---------------------------------------------------------------------------
@@ -399,8 +465,10 @@ pub async fn list_grants(
 // POST /secrets/{id}/grants
 // ---------------------------------------------------------------------------
 
-/// Shares the Secret with a friend. A second grant from the same grantor to
-/// the same grantee replaces the first one's actions and keeps its id.
+/// Shares the Secret with a friend: 201 with a new grant. A second grant from
+/// the same grantor to the same grantee adds its actions to the first, under
+/// the rules for changing it, and answers 200 with it; posting never removes
+/// an action.
 pub async fn create_grant(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -463,6 +531,7 @@ pub async fn create_grant(
         .iter()
         .position(|grant| grant.grantor_id == viewer && grant.grantee_id == grantee);
     let before = existing.map_or_else(BTreeSet::new, |at| secret.grants[at].actions.clone());
+    let actions: BTreeSet<&'static str> = before.union(&actions).copied().collect();
     if grantee == owner
         || grantee == viewer
         || !may_change(&mine, viewer == owner, &before, &actions, viewer, owner)
@@ -476,8 +545,10 @@ pub async fn create_grant(
     let secret = &mut area.secrets[index];
     let at = if let Some(at) = existing {
         let grant = &mut secret.grants[at];
-        grant.actions = actions;
-        grant.updated_at = now;
+        if grant.actions != actions {
+            grant.actions = actions;
+            grant.updated_at = now;
+        }
         at
     } else {
         secret.grants.push(SecretGrantRecord {
@@ -492,15 +563,21 @@ pub async fn create_grant(
     };
     let area = &st.areas[&area_id];
     let secret = &area.secrets[index];
-    created(view(area, secret, &secret.grants[at]))
+    let grant = view(area, secret, &secret.grants[at]);
+    if existing.is_some() {
+        ok(grant)
+    } else {
+        created(grant)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // PATCH /secrets/{id}/grants/{grant}
 // ---------------------------------------------------------------------------
 
-/// Replaces a grant's actions. Adding one re-checks the grantor's and
-/// grantee's friendship and blocks.
+/// Applies a change set to a grant's actions, leaving those it does not
+/// name. Adding one re-checks the grantor's and grantee's friendship and
+/// blocks.
 pub async fn update_grant(
     State(state): State<Shared>,
     Path((raw_secret, raw_grant)): Path<(String, String)>,
@@ -520,8 +597,8 @@ pub async fn update_grant(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let actions = match parse_body::<Value>(&body).and_then(|body| read_actions(&body)) {
-        Ok(actions) => actions,
+    let change = match parse_body::<Value>(&body).and_then(|body| GrantChange::of(&body)) {
+        Ok(change) => change,
         Err(e) => return e,
     };
     let Some((area_id, index)) = find_secret(&st, secret_id) else {
@@ -533,7 +610,7 @@ pub async fn update_grant(
             viewer,
             (area_id, index),
             grant_id,
-            actions,
+            &change,
         );
     }
 
@@ -544,6 +621,7 @@ pub async fn update_grant(
         return not_found();
     };
     let current = &secret.grants[at];
+    let actions = change.apply(&current.actions);
     let mine = st.secret_actions(viewer, area, secret);
     if !may_change(
         &mine,
@@ -564,8 +642,10 @@ pub async fn update_grant(
 
     let area = st.areas.get_mut(&area_id).expect("found above");
     let grant = &mut area.secrets[index].grants[at];
-    grant.actions = actions;
-    grant.updated_at = Utc::now();
+    if grant.actions != actions {
+        grant.actions = actions;
+        grant.updated_at = Utc::now();
+    }
     let area = &st.areas[&area_id];
     let secret = &area.secrets[index];
     ok(view(area, secret, &secret.grants[at]))

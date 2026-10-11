@@ -46,7 +46,9 @@ use crate::components::clan_map_offers;
 use crate::components::cloud_errors::display_error;
 use crate::presets::ScopeKind;
 
-pub use editor::{EditorMessage, GrantEditor, SecretEditorMessage, SecretGrantEditor};
+pub use editor::{
+    EditorMessage, GrantEditor, GrantWrite, SecretEditorMessage, SecretGrantEditor, SecretWrite,
+};
 
 /// Members shown per page of the directory.
 pub const MEMBERS_PER_PAGE: usize = 20;
@@ -1248,7 +1250,7 @@ impl ClanPanel {
                 if editor.saving {
                     return Task::none();
                 }
-                let writes = editor.writes(page);
+                let writes = editor.writes();
                 if writes.is_empty() {
                     return Task::none();
                 }
@@ -1271,11 +1273,8 @@ impl ClanPanel {
                                     )
                                     .await?;
                             }
-                            permissions::Write::Patch(id, body) => {
-                                client.change_clan_grant(clan_id, id, &body).await?;
-                            }
-                            permissions::Write::Delete(id) => {
-                                client.delete_clan_grant(clan_id, id).await?;
+                            permissions::Write::Change(id, change) => {
+                                client.change_clan_grant(clan_id, id, &change).await?;
                             }
                         }
                     }
@@ -1317,8 +1316,27 @@ impl ClanPanel {
                 Task::none()
             }
             Message::Editor(message) => {
-                if let Some(Modal::Grant(editor)) = self.modal_mut() {
+                let chooses = matches!(
+                    message,
+                    EditorMessage::RecipientPicked(_)
+                        | EditorMessage::ScopePicked(_)
+                        | EditorMessage::TargetToggled(..)
+                );
+                if let Some(page) = self.open.as_mut()
+                    && let Some(Modal::Grant(editor)) = &mut page.modal
+                {
                     editor.update(message);
+                    // A recipient holds one grant over a scope: choosing
+                    // one they hold opens it (clans.md §5.3).
+                    if chooses && !(editor.recipient_fixed && editor.scope_fixed) {
+                        let scope = editor.scope();
+                        let existing = editor.recipient.and_then(|recipient| {
+                            page.grants
+                                .iter()
+                                .find(|grant| grant.recipient == recipient && grant.scope == scope)
+                        });
+                        editor.load(existing);
+                    }
                 }
                 Task::none()
             }
@@ -1398,8 +1416,33 @@ impl ClanPanel {
                 self.load_secret_grants(secret)
             }
             Message::SecretEditor(message) => {
-                if let Some(Modal::SecretGrant(editor)) = self.modal_mut() {
-                    editor.update(message);
+                let picked = matches!(message, SecretEditorMessage::RecipientPicked(_));
+                if let Some(page) = self.open.as_mut() {
+                    let mine: Vec<String> = match &page.modal {
+                        Some(Modal::SecretGrant(editor)) => page
+                            .secret_actions(editor.secret)
+                            .into_iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if let Some(Modal::SecretGrant(editor)) = &mut page.modal {
+                        editor.update(message);
+                        // One grant per recipient on a Secret: picking a
+                        // group that holds one opens it (clans.md §8.4).
+                        if picked {
+                            let existing = match (&page.secret_grants, editor.recipient) {
+                                (Some((secret, Ok(grants))), Some(recipient))
+                                    if *secret == editor.secret =>
+                                {
+                                    grants.iter().find(|grant| grant.recipient == recipient)
+                                }
+                                _ => None,
+                            };
+                            editor.load(existing);
+                            editor.bound_by(mine.iter().map(String::as_str));
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -1768,31 +1811,33 @@ impl ClanPanel {
             return Task::none();
         };
         let member = matches!(editor.recipient, Some(GrantRecipient::User { .. }));
-        let writes = match editor.writes(member) {
-            Ok(writes) => writes,
+        let write = match editor.writes(member) {
+            Ok(Some(write)) => write,
+            Ok(None) => {
+                page.modal = None;
+                return Task::none();
+            }
             Err(reason) => {
                 editor.error = Some(reason);
                 return Task::none();
             }
         };
-        let (Some(recipient), editing) = (editor.recipient, editor.editing) else {
+        let Some(recipient) = editor.recipient else {
             return Task::none();
         };
         let client = self.cloud.client.clone();
-        // A delegate's change can answer another grant than the one edited,
-        // or leave it deleted (clans.md §1.2): the page reloads its grants
-        // after a save instead of keeping the edited ID.
+        // A change can leave the grant deleted, and joins move grants
+        // between IDs (clans.md §5.3): the page reloads its grants after a
+        // save instead of keeping the edited one.
         self.save_dialog(async move {
-            for (scope, body) in writes {
-                match editing {
-                    Some(grant) => {
-                        client.change_clan_grant(clan_id, grant, &body).await?;
-                    }
-                    None => {
-                        client
-                            .grant_in_clan(clan_id, recipient, &scope, &body)
-                            .await?;
-                    }
+            match write {
+                GrantWrite::Create(scope, body) => {
+                    client
+                        .grant_in_clan(clan_id, recipient, &scope, &body)
+                        .await?;
+                }
+                GrantWrite::Change(id, change) => {
+                    client.change_clan_grant(clan_id, id, &change).await?;
                 }
             }
             Ok(())
@@ -1803,23 +1848,30 @@ impl ClanPanel {
         let Some(Modal::SecretGrant(editor)) = self.modal_mut() else {
             return Task::none();
         };
-        let Some(recipient) = editor.recipient else {
-            editor.error = Some(crate::i18n::t!("clans-editor-choose-group"));
-            return Task::none();
-        };
         let secret = editor.secret;
-        let editing = editor.editing;
-        let actions: Vec<&'static str> = editor.actions.iter().copied().collect();
+        let write = match editor.writes() {
+            Ok(Some(write)) => write,
+            Ok(None) => {
+                if let Some(page) = self.open.as_mut() {
+                    page.modal = None;
+                }
+                return Task::none();
+            }
+            Err(reason) => {
+                editor.error = Some(reason);
+                return Task::none();
+            }
+        };
         let client = self.cloud.client.clone();
         Task::perform(
             async move {
                 let source = SourceId::Secret(secret);
-                match editing {
-                    Some(grant) => client
-                        .update_clan_secret_grant(&source, grant, &actions)
+                match write {
+                    SecretWrite::Change(grant, change) => client
+                        .update_clan_secret_grant(&source, grant, &change)
                         .await
                         .map(|_| ()),
-                    None => client
+                    SecretWrite::Create(recipient, actions) => client
                         .grant_clan_secret(&source, recipient, &actions)
                         .await
                         .map(|_| ()),

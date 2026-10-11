@@ -5,8 +5,11 @@
 //! group's creator governs it while a member; anyone else holds what the
 //! grants reaching them give. Grants carry inline actions only (no roles), and
 //! a delegation never hands out clan administration, group membership or
-//! further delegation. A new clan starts with its founding grants: All clan
-//! members read the member directory. Resource permissions are scoped.
+//! further delegation. A recipient holds one grant per scope: writes add to it
+//! and change sets edit it, and each action a delegate adds records the
+//! delegation it came through, going when that delegation stops handing it
+//! out. A new clan starts with its founding grants: All clan members read the
+//! member directory. Resource permissions are scoped.
 //!
 //! Every route needs a verified email. Every refusal that could reveal
 //! something is the uniform 404; the rest are the clan 409s.
@@ -344,21 +347,141 @@ pub enum ClanResource {
     Package(Uuid),
 }
 
+/// A recipient's one grant over one scope (docs/clans.md §5.3).
 #[derive(Debug, Clone)]
 pub struct ClanGrantRecord {
     pub id: Uuid,
     pub recipient: ClanRecipient,
     pub scope: ClanGrantScope,
+    /// Every action it holds: its own, and those that came through a
+    /// delegation.
     pub actions: BTreeSet<String>,
+    /// For each delegation actions came through, those actions. An action of
+    /// `actions` none of them lists is the grant's own.
+    pub delegated: BTreeMap<Uuid, BTreeSet<String>>,
     /// What a grant carrying `grant.manage` may hand out.
     pub may_grant: BTreeSet<String>,
     pub issuer_id: Uuid,
-    /// The delegation it was issued under.
-    pub parent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Creation order; ties on `created_at` never reorder the list.
+    /// Creation order; ties on `created_at` never reorder the list, and it
+    /// stands in for the server's ID tie-break among grants of one instant.
     pub seq: u64,
+}
+
+/// Where an action a write adds comes from: the grant's own (an owner of the
+/// clan or of a Member-owned map added it), or through a delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Own,
+    Through(Uuid),
+}
+
+/// `actions` as an owner adds them: each the grant's own.
+pub fn own<I, S>(actions: I) -> Vec<(String, Source)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    actions
+        .into_iter()
+        .map(|action| (action.as_ref().to_string(), Source::Own))
+        .collect()
+}
+
+impl ClanGrantRecord {
+    /// Whether it delegates: it carries `grant.manage`, which only owners
+    /// add, so it is always the grant's own.
+    pub fn delegates(&self) -> bool {
+        self.actions.contains("grant.manage")
+    }
+
+    /// Whether `action` is the grant's own: held, through no delegation.
+    pub fn owns(&self, action: &str) -> bool {
+        self.actions.contains(action)
+            && !self
+                .delegated
+                .values()
+                .any(|through| through.contains(action))
+    }
+
+    /// The delegations `action` came through.
+    pub fn sources(&self, action: &str) -> Vec<Uuid> {
+        self.delegated
+            .iter()
+            .filter(|(_, through)| through.contains(action))
+            .map(|(delegation, _)| *delegation)
+            .collect()
+    }
+
+    /// Adds `action` from `source`. An owner's addition is the grant's own,
+    /// ending any delegation it came through; a delegate's leaves one of
+    /// the grant's own as it is, and otherwise records the delegation beside
+    /// any other it came through.
+    fn add(&mut self, action: &str, source: Source) {
+        match source {
+            Source::Own => {
+                self.actions.insert(action.to_string());
+                for through in self.delegated.values_mut() {
+                    through.remove(action);
+                }
+                self.delegated.retain(|_, through| !through.is_empty());
+            }
+            Source::Through(delegation) => {
+                if self.owns(action) {
+                    return;
+                }
+                self.actions.insert(action.to_string());
+                self.delegated
+                    .entry(delegation)
+                    .or_default()
+                    .insert(action.to_string());
+            }
+        }
+    }
+
+    /// Removes `action`, whoever added it.
+    fn remove(&mut self, action: &str) {
+        self.actions.remove(action);
+        for through in self.delegated.values_mut() {
+            through.remove(action);
+        }
+        self.delegated.retain(|_, through| !through.is_empty());
+    }
+
+    /// Drops what came through `delegation` that `keep` leaves out: an action
+    /// that came through nothing else goes.
+    fn retire(&mut self, delegation: Uuid, keep: &BTreeSet<String>) {
+        let Some(through) = self.delegated.get_mut(&delegation) else {
+            return;
+        };
+        let dropped: Vec<String> = through.difference(keep).cloned().collect();
+        if dropped.is_empty() {
+            return;
+        }
+        through.retain(|action| keep.contains(action));
+        if through.is_empty() {
+            self.delegated.remove(&delegation);
+        }
+        self.updated_at = Utc::now();
+        for action in dropped {
+            if !self
+                .delegated
+                .values()
+                .any(|through| through.contains(&action))
+            {
+                self.actions.remove(&action);
+            }
+        }
+    }
+
+    /// Whether it holds what `other` holds: the same actions, from the same
+    /// sources, and the same ceiling.
+    fn holds_as(&self, other: &Self) -> bool {
+        self.actions == other.actions
+            && self.delegated == other.delegated
+            && self.may_grant == other.may_grant
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -706,9 +829,11 @@ impl ClanRecord {
         members.into_iter().map(|(_, _, user)| user).collect()
     }
 
-    /// What one grant gives on a resource: its actions that apply there,
-    /// within its delegation's ceiling and coverage. Map, folder and Secret
-    /// actions reach only group recipients.
+    /// What one grant gives on a resource: its actions that apply there. An
+    /// action that came through a delegation gives something only while one
+    /// of its delegations still hands it out there, and never clan, group or
+    /// grant administration. Map, folder and Secret actions reach only group
+    /// recipients.
     pub fn contribution(
         &self,
         grant: &ClanGrantRecord,
@@ -718,43 +843,51 @@ impl ClanRecord {
         if !covers(&grant.scope, resource) {
             return given;
         }
-        let ceiling = match grant.parent_id {
-            None => None,
-            Some(parent) => {
-                let Some(parent) = self.grants.iter().find(|other| other.id == parent) else {
-                    return given;
-                };
-                if !parent.actions.contains("grant.manage")
-                    || !takes_inline(parent.scope.kind(), "grant.manage")
-                    || !covers(&parent.scope, resource)
-                {
-                    return given;
-                }
-                Some(&parent.may_grant)
-            }
-        };
         for action in &grant.actions {
             if !takes_inline(grant.scope.kind(), action)
                 || !applies(action, resource)
-                || ceiling
-                    .is_some_and(|ceiling| !ceiling.contains(action) || administration(action))
                 || (matches!(grant.recipient, ClanRecipient::User(_))
                     && grants_map_access(action)
                     && !names_one_map(&grant.scope))
             {
                 continue;
             }
-            given.insert(action.clone());
+            let live = grant.owns(action)
+                || (!administration(action)
+                    && grant
+                        .sources(action)
+                        .into_iter()
+                        .any(|delegation| self.hands_out(delegation, action, resource)));
+            if live {
+                given.insert(action.clone());
+            }
         }
         given
     }
 
+    /// Whether `delegation` hands out `action` on `resource`: it carries
+    /// `grant.manage`, its ceiling holds the action, and it covers the
+    /// resource.
+    fn hands_out(&self, delegation: Uuid, action: &str, resource: ClanResource) -> bool {
+        self.grants
+            .iter()
+            .find(|grant| grant.id == delegation)
+            .is_some_and(|grant| {
+                grant.delegates()
+                    && takes_inline(grant.scope.kind(), "grant.manage")
+                    && grant.may_grant.contains(action)
+                    && covers(&grant.scope, resource)
+            })
+    }
+
     /// Narrows the grants of a map made Member-owned (docs/clans.md §7.3):
-    /// grants naming it beside other maps lose it; grants naming it alone
-    /// keep the actions in `allowed`, those issued under a delegation go, and
-    /// a grant left with nothing goes.
+    /// grants naming it beside other maps lose it, and join a grant their
+    /// scope then matches; grants naming it alone keep their own actions in
+    /// `allowed` when `area.read` is among them, and go otherwise; every
+    /// action that came through a delegation goes.
     pub fn narrow_to_member_owned(&mut self, area: Uuid, allowed: &[&str]) {
         let mut doomed = Vec::new();
+        let mut undelegated = Vec::new();
         for grant in &mut self.grants {
             let ClanGrantScope::Areas(ids) = &mut grant.scope else {
                 continue;
@@ -766,15 +899,28 @@ impl ClanRecord {
                 ids.remove(&area);
                 continue;
             }
-            grant
+            if grant.delegates() {
+                undelegated.push(grant.id);
+            }
+            let own: BTreeSet<String> = grant
                 .actions
-                .retain(|action| allowed.contains(&action.as_str()));
+                .iter()
+                .filter(|action| grant.owns(action) && allowed.contains(&action.as_str()))
+                .cloned()
+                .collect();
+            grant.actions = own;
+            grant.delegated.clear();
             grant.may_grant.clear();
-            if grant.parent_id.is_some() || !grant.actions.contains("area.read") {
+            if !grant.actions.contains("area.read") {
                 doomed.push(grant.id);
             }
         }
-        self.remove_grants(&doomed);
+        for delegation in undelegated {
+            self.retire_through(delegation, &BTreeSet::new());
+        }
+        self.delete(&doomed);
+        self.join();
+        self.check();
     }
 
     /// `user`'s actions on a resource. Owners hold every action that applies,
@@ -851,9 +997,9 @@ impl ClanRecord {
 
     /// Whether `user` may see `grant`: owners every grant, members their own
     /// and their groups', and holders of `grant.inspect` or `grant.manage`
-    /// those within it. Grant actions are never delegated, so only a root
-    /// grant inspects. A Member-owned map's grants are its owners' to see,
-    /// which callers decide before asking.
+    /// those within it. Grant actions never come through a delegation. A
+    /// Member-owned map's grants are its owners' to see, which callers decide
+    /// before asking.
     pub fn may_inspect(
         &self,
         user: Uuid,
@@ -873,58 +1019,234 @@ impl ClanRecord {
         };
         reaches
             || self.held(user).into_iter().any(|held| {
-                held.parent_id.is_none()
-                    && takes_inline(held.scope.kind(), "grant.inspect")
-                    && (held.actions.contains("grant.inspect")
-                        || held.actions.contains("grant.manage"))
+                takes_inline(held.scope.kind(), "grant.inspect")
+                    && (held.actions.contains("grant.inspect") || held.delegates())
                     && Self::within(&grant.scope, &held.scope, placement)
             })
     }
 
-    /// The delegation under which `user` may write a grant of `actions` over
-    /// `scope`: a root grant they hold carrying `grant.manage`, covering the
-    /// scope, whose ceiling holds the actions.
-    pub(super) fn delegation_for(
+    /// The delegation an action `user` adds over `scope` comes through: the
+    /// oldest delegation reaching them whose scope `scope` lies within and
+    /// whose ceiling holds `action` (docs/clans.md §1.2). `None` when no
+    /// delegation of theirs lets them add or remove it there.
+    pub(super) fn delegation_through(
         &self,
         user: Uuid,
         scope: &ClanGrantScope,
-        actions: &BTreeSet<String>,
+        action: &str,
         placement: Placement<'_>,
     ) -> Option<Uuid> {
         self.held(user)
             .into_iter()
-            .find(|held| {
-                held.parent_id.is_none()
+            .filter(|held| {
+                held.delegates()
                     && takes_inline(held.scope.kind(), "grant.manage")
-                    && held.actions.contains("grant.manage")
+                    && held.may_grant.contains(action)
                     && Self::within(scope, &held.scope, placement)
-                    && actions.is_subset(&held.may_grant)
             })
+            .min_by_key(|held| (held.created_at, held.seq))
             .map(|held| held.id)
     }
 
-    /// Deletes grants with every grant issued under them.
+    /// Grant `id`.
+    pub fn grant(&self, id: Uuid) -> Option<&ClanGrantRecord> {
+        self.grants.iter().find(|grant| grant.id == id)
+    }
+
+    /// The grant `recipient` holds over exactly `scope`.
+    pub fn grant_over(
+        &self,
+        recipient: ClanRecipient,
+        scope: &ClanGrantScope,
+    ) -> Option<&ClanGrantRecord> {
+        self.grants
+            .iter()
+            .find(|grant| grant.recipient == recipient && grant.scope == *scope)
+    }
+
+    /// Adds `added` and `ceiling` to `recipient`'s grant over `scope`,
+    /// creating it, issued by `issuer`, when they hold none. Returns its ID
+    /// and whether it is new.
+    pub fn upsert(
+        &mut self,
+        recipient: ClanRecipient,
+        scope: ClanGrantScope,
+        added: &[(String, Source)],
+        ceiling: &BTreeSet<String>,
+        issuer: Uuid,
+        seq: u64,
+    ) -> (Uuid, bool) {
+        let now = Utc::now();
+        let existing = self
+            .grants
+            .iter()
+            .position(|grant| grant.recipient == recipient && grant.scope == scope);
+        let created = existing.is_none();
+        let at = existing.unwrap_or_else(|| {
+            self.grants.push(ClanGrantRecord {
+                id: Uuid::new_v4(),
+                recipient,
+                scope,
+                actions: BTreeSet::new(),
+                delegated: BTreeMap::new(),
+                may_grant: BTreeSet::new(),
+                issuer_id: issuer,
+                created_at: now,
+                updated_at: now,
+                seq,
+            });
+            self.grants.len() - 1
+        });
+        let grant = &mut self.grants[at];
+        let before = grant.clone();
+        for (action, source) in added {
+            grant.add(action, *source);
+        }
+        grant.may_grant.extend(ceiling.iter().cloned());
+        if !created && !grant.holds_as(&before) {
+            grant.updated_at = now;
+        }
+        let id = grant.id;
+        self.check();
+        (id, created)
+    }
+
+    /// Deletes grants, with every action that came through them; a grant
+    /// left with no action goes too.
     pub fn remove_grants(&mut self, ids: &[Uuid]) {
+        self.delete(ids);
+        self.check();
+    }
+
+    fn delete(&mut self, ids: &[Uuid]) {
         let mut doomed: BTreeSet<Uuid> = ids.iter().copied().collect();
-        loop {
-            let before = doomed.len();
-            for grant in &self.grants {
-                if grant
-                    .parent_id
-                    .is_some_and(|parent| doomed.contains(&parent))
-                {
-                    doomed.insert(grant.id);
+        while !doomed.is_empty() {
+            self.grants.retain(|grant| !doomed.contains(&grant.id));
+            for grant in &mut self.grants {
+                for delegation in &doomed {
+                    grant.retire(*delegation, &BTreeSet::new());
                 }
             }
-            if doomed.len() == before {
-                break;
+            doomed = self
+                .grants
+                .iter()
+                .filter(|grant| grant.actions.is_empty())
+                .map(|grant| grant.id)
+                .collect();
+        }
+    }
+
+    /// Drops every action that came through `delegation` that `keep` leaves
+    /// out, as removing `grant.manage` (keeping nothing) or narrowing its
+    /// ceiling does; a grant left with no action goes.
+    fn retire_through(&mut self, delegation: Uuid, keep: &BTreeSet<String>) {
+        for grant in &mut self.grants {
+            grant.retire(delegation, keep);
+        }
+        let emptied: Vec<Uuid> = self
+            .grants
+            .iter()
+            .filter(|grant| grant.actions.is_empty())
+            .map(|grant| grant.id)
+            .collect();
+        self.delete(&emptied);
+    }
+
+    /// Joins each grant whose scope became another's, for the same
+    /// recipient, into the older one (docs/clans.md §5.3): it keeps its ID
+    /// and gains the other's actions with where each came from (one either
+    /// held as its own stays its own), its ceiling, and the actions that
+    /// came through it.
+    fn join(&mut self) {
+        loop {
+            let pair = self.grants.iter().find_map(|grant| {
+                self.grants
+                    .iter()
+                    .find(|other| {
+                        other.recipient == grant.recipient
+                            && other.scope == grant.scope
+                            && (other.created_at, other.seq) > (grant.created_at, grant.seq)
+                    })
+                    .map(|newer| (grant.id, newer.id))
+            });
+            let Some((kept, gone)) = pair else {
+                return;
+            };
+            let at = self
+                .grants
+                .iter()
+                .position(|grant| grant.id == gone)
+                .expect("found above");
+            let gone = self.grants.remove(at);
+            let record = self
+                .grants
+                .iter_mut()
+                .find(|grant| grant.id == kept)
+                .expect("found above");
+            for action in &gone.actions {
+                if gone.owns(action) {
+                    record.add(action, Source::Own);
+                }
+                for delegation in gone.sources(action) {
+                    record.add(action, Source::Through(delegation));
+                }
+            }
+            record.may_grant.extend(gone.may_grant.iter().cloned());
+            record.updated_at = Utc::now();
+            // What came through the joined grant came through the kept one.
+            for grant in &mut self.grants {
+                if let Some(through) = grant.delegated.remove(&gone.id) {
+                    grant.delegated.entry(kept).or_default().extend(through);
+                    grant.updated_at = Utc::now();
+                }
             }
         }
-        self.grants.retain(|grant| !doomed.contains(&grant.id));
+    }
+
+    /// The grant invariants the service's schema keeps: one grant per
+    /// recipient and scope, none without an action, a ceiling exactly on a
+    /// grant carrying `grant.manage`, and every delegated action within a
+    /// live delegation's ceiling. Grant writes check them, so a write the
+    /// mock lets through wrongly surfaces in the tests.
+    pub fn check(&self) {
+        for grant in &self.grants {
+            assert!(
+                !grant.actions.is_empty(),
+                "a grant with no action: {grant:?}"
+            );
+            assert_eq!(
+                self.grants
+                    .iter()
+                    .filter(|other| other.recipient == grant.recipient && other.scope == grant.scope)
+                    .count(),
+                1,
+                "two grants to one recipient over one scope: {grant:?}"
+            );
+            assert_eq!(
+                grant.delegates(),
+                !grant.may_grant.is_empty(),
+                "a ceiling goes with grant.manage, and only with it: {grant:?}"
+            );
+            for (delegation, through) in &grant.delegated {
+                assert!(!through.is_empty() && through.is_subset(&grant.actions));
+                let delegation = self
+                    .grants
+                    .iter()
+                    .find(|other| other.id == *delegation)
+                    .unwrap_or_else(|| {
+                        panic!("a delegated action outlived its delegation: {grant:?}")
+                    });
+                assert!(
+                    delegation.owns("grant.manage") && through.is_subset(&delegation.may_grant),
+                    "a delegated action beyond its delegation: {grant:?}"
+                );
+            }
+        }
     }
 
     /// Takes a deleted group, folder or map out of every grant scope; a grant
-    /// left with no IDs goes, with the grants issued under it.
+    /// left with no IDs goes, with every action that came through it, and
+    /// one left naming what another grant to its recipient names joins it.
     pub fn drop_target(&mut self, target: Uuid) {
         let mut emptied = Vec::new();
         for grant in &mut self.grants {
@@ -935,7 +1257,9 @@ impl ClanRecord {
                 emptied.push(grant.id);
             }
         }
-        self.remove_grants(&emptied);
+        self.delete(&emptied);
+        self.join();
+        self.check();
     }
 
     fn grant_view(&self, grant: &ClanGrantRecord) -> Value {
@@ -949,16 +1273,32 @@ impl ClanRecord {
             "recipient": recipient,
             "actions": ordered(&grant.actions),
             "scope": grant.scope.view(),
+            "delegated": delegated_view(grant, &grant.actions),
             "issuer_id": grant.issuer_id,
-            "parent_id": grant.parent_id,
             "created_at": grant.created_at,
             "updated_at": grant.updated_at,
         });
-        if grant.actions.contains("grant.manage") {
+        if grant.delegates() {
             view["may_grant"] = json!(ordered(&grant.may_grant));
         }
         view
     }
+}
+
+/// A grant's `delegated` list, limited to `given`: each delegation with the
+/// actions of `given` that came through it.
+pub fn delegated_view(grant: &ClanGrantRecord, given: &BTreeSet<String>) -> Value {
+    json!(
+        grant
+            .delegated
+            .iter()
+            .filter_map(|(delegation, through)| {
+                let shown: BTreeSet<String> = through.intersection(given).cloned().collect();
+                (!shown.is_empty())
+                    .then(|| json!({ "delegation_id": delegation, "actions": ordered(&shown) }))
+            })
+            .collect::<Vec<_>>()
+    )
 }
 
 fn group_sort_key(group: &ClanGroupRecord) -> (u8, String, Uuid) {
@@ -1234,21 +1574,8 @@ pub async fn create_clan(
             },
         );
         let everyone = Uuid::new_v4();
-        let founding = |action: &str, seq: u64| ClanGrantRecord {
-            id: Uuid::new_v4(),
-            recipient: ClanRecipient::Group(everyone),
-            scope: ClanGrantScope::Clan,
-            actions: BTreeSet::from([action.to_string()]),
-            may_grant: BTreeSet::new(),
-            issuer_id: caller,
-            parent_id: None,
-            created_at: now,
-            updated_at: now,
-            seq,
-        };
-        let grants = vec![founding("clan.read_members", seq)];
-        st.next_seq();
-        let clan = ClanRecord {
+        let founding_seq = st.next_seq();
+        let mut clan = ClanRecord {
             id,
             name,
             description: about,
@@ -1275,11 +1602,20 @@ pub async fn create_clan(
                 },
             ],
             group_members: Vec::new(),
-            grants,
+            grants: Vec::new(),
             invitations: Vec::new(),
             owned_maps: 0,
             packages: Vec::new(),
         };
+        // Its founding grant: All clan members read the member directory.
+        clan.upsert(
+            ClanRecipient::Group(everyone),
+            ClanGrantScope::Clan,
+            &own(["clan.read_members"]),
+            &BTreeSet::new(),
+            caller,
+            founding_seq,
+        );
         let summary = clan.summary(caller);
         st.clans.clans.insert(id, clan);
         Ok(created(summary))
@@ -2110,16 +2446,31 @@ fn scope_of(fields: &Map<String, Value>) -> Result<ClanGrantScope, Response> {
     }
 }
 
-/// `actions` (inline, never a role here) and `may_grant`, which goes with
-/// `grant.manage` and only with it.
-fn bundle_of(
-    fields: &Map<String, Value>,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), Response> {
+fn no_roles(fields: &Map<String, Value>) -> Result<(), Response> {
     if fields.contains_key("role_id") {
         return Err(bad_request(
             "grants carry their own actions; there are no roles",
         ));
     }
+    Ok(())
+}
+
+/// A ceiling holds map, folder, Secret and package actions only.
+fn ceiling_refusal<'a>(named: impl IntoIterator<Item = &'a String>) -> Result<(), Response> {
+    match named.into_iter().find(|action| administration(action)) {
+        Some(action) => Err(bad_request(&format!(
+            "`may_grant` holds map, folder, Secret and package actions only, not `{action}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A `POST` body's `actions` (inline, never a role here) and `may_grant`,
+/// which goes with `grant.manage` and only with it.
+fn bundle_of(
+    fields: &Map<String, Value>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), Response> {
+    no_roles(fields)?;
     let actions =
         action_set(fields, "actions")?.ok_or_else(|| bad_request("missing field `actions`"))?;
     if actions.is_empty() {
@@ -2132,12 +2483,67 @@ fn bundle_of(
         ));
     }
     let may_grant = may_grant.unwrap_or_default();
-    if let Some(action) = may_grant.iter().find(|action| administration(action)) {
-        return Err(bad_request(&format!(
-            "`may_grant` holds map, folder, Secret and package actions only, not `{action}`"
-        )));
-    }
+    ceiling_refusal(&may_grant)?;
     Ok((actions, may_grant))
+}
+
+/// A `PATCH` body: `{"actions": {"add", "remove"}, "may_grant": {"add",
+/// "remove"}}`, every part optional, naming at least one action, none both
+/// added and removed in one part.
+#[derive(Debug, Default)]
+struct Change {
+    add: BTreeSet<String>,
+    remove: BTreeSet<String>,
+    ceiling_add: BTreeSet<String>,
+    ceiling_remove: BTreeSet<String>,
+}
+
+impl Change {
+    fn of(fields: &Map<String, Value>) -> Result<Self, Response> {
+        no_roles(fields)?;
+        let part = |name: &str| -> Result<(BTreeSet<String>, BTreeSet<String>), Response> {
+            match fields.get(name) {
+                None | Some(Value::Null) => Ok(Default::default()),
+                Some(Value::Object(part)) => {
+                    let add = action_set(part, "add")?.unwrap_or_default();
+                    let remove = action_set(part, "remove")?.unwrap_or_default();
+                    if let Some(action) = add.intersection(&remove).next() {
+                        return Err(bad_request(&format!(
+                            "`{action}` is both added and removed"
+                        )));
+                    }
+                    Ok((add, remove))
+                }
+                Some(_) => Err(bad_request(&format!(
+                    "expected `{{\"add\", \"remove\"}}` for `{name}`"
+                ))),
+            }
+        };
+        let (add, remove) = part("actions")?;
+        let (ceiling_add, ceiling_remove) = part("may_grant")?;
+        let change = Self {
+            add,
+            remove,
+            ceiling_add,
+            ceiling_remove,
+        };
+        if change.names_nothing() {
+            return Err(bad_request("a change names at least one action"));
+        }
+        ceiling_refusal(change.ceiling_add.iter().chain(&change.ceiling_remove))?;
+        Ok(change)
+    }
+
+    fn names_nothing(&self) -> bool {
+        self.add.is_empty()
+            && self.remove.is_empty()
+            && self.ceiling_add.is_empty()
+            && self.ceiling_remove.is_empty()
+    }
+
+    fn touches_ceiling(&self) -> bool {
+        !self.ceiling_add.is_empty() || !self.ceiling_remove.is_empty()
+    }
 }
 
 /// Inline actions and their ceiling must apply to the scope's kind.
@@ -2287,16 +2693,22 @@ pub async fn create_grant(
             )?,
             None => actions,
         };
-        let delegates = actions.contains("grant.manage");
-        let parent = if clan.is_owner(caller) || member_owned.is_some() {
-            None
-        } else if delegates {
+        // Where each action comes from: an owner's, of the clan or of the
+        // Member-owned map, are the grant's own; anyone else's each come
+        // through the oldest of their delegations that hands it out there.
+        let added: Vec<(String, Source)> = if clan.is_owner(caller) || member_owned.is_some() {
+            own(&actions)
+        } else if actions.contains("grant.manage") {
             return Err(not_found());
         } else {
-            Some(
-                clan.delegation_for(caller, &scope, &actions, &placed)
-                    .ok_or_else(not_found)?,
-            )
+            actions
+                .iter()
+                .map(|action| {
+                    clan.delegation_through(caller, &scope, action, &placed)
+                        .map(|delegation| (action.clone(), Source::Through(delegation)))
+                        .ok_or_else(not_found)
+                })
+                .collect::<Result<_, _>>()?
         };
         let recipient_exists = match recipient {
             ClanRecipient::User(user) => clan.is_member(user),
@@ -2318,65 +2730,65 @@ pub async fn create_grant(
         if !recipient_exists || !targets_exist {
             return Err(not_found());
         }
+        // The recipient's grant over the scope, if any, takes the addition;
+        // a grant carrying `grant.manage` keeps a ceiling.
+        let held = clan.grant_over(recipient, &scope);
+        if (actions.contains("grant.manage") || held.is_some_and(ClanGrantRecord::delegates))
+            && may_grant.is_empty()
+            && held.is_none_or(|grant| grant.may_grant.is_empty())
+        {
+            return Err(bad_request(
+                "a grant carrying `grant.manage` hands out something",
+            ));
+        }
         let seq = st.next_seq();
-        let now = Utc::now();
         let clan = active_clan_mut(&mut st, clan_id)?;
-        let grant = ClanGrantRecord {
-            id: Uuid::new_v4(),
-            recipient,
-            scope,
-            actions,
-            may_grant,
-            issuer_id: caller,
-            parent_id: parent,
-            created_at: now,
-            updated_at: now,
-            seq,
-        };
-        let view = clan.grant_view(&grant);
-        clan.grants.push(grant);
+        let (id, fresh) = clan.upsert(recipient, scope, &added, &may_grant, caller, seq);
+        let view = clan.grant_view(clan.grant(id).expect("just written"));
         super::shares::sweep_outside_shares(&mut st);
-        Ok(created(view))
+        Ok(if fresh { created(view) } else { ok(view) })
     })())
 }
 
-/// A grant the caller may see and change: an owner any grant; a delegation
-/// a grant that does not delegate, within its scope and ceiling.
+/// How the caller writes a grant (docs/clans.md §1.2, §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writer {
+    /// A clan owner: any grant but a Member-owned map's, every action the
+    /// grant's own.
+    Owner,
+    /// An active owner of the Member-owned map a grant names alone.
+    MapOwner,
+    /// Anyone else, action by action within their delegations.
+    Delegate,
+}
+
+/// A grant the caller may see, and how they may write it. Whether a delegate
+/// may write what they ask is judged action by action.
 fn managed(
     st: &MockState,
     clan: &ClanRecord,
     caller: Uuid,
     grant_id: Uuid,
-) -> Result<(ClanGrantRecord, bool), Response> {
+) -> Result<(ClanGrantRecord, Writer), Response> {
     let placed = |area: Uuid| super::clan_maps::placement(st, clan.id, area).and_then(|p| p.0);
-    let grant = clan
-        .grants
-        .iter()
-        .find(|grant| grant.id == grant_id)
-        .ok_or_else(not_found)?;
+    let grant = clan.grant(grant_id).ok_or_else(not_found)?;
     // A Member-owned map's grants are its active owners' to change.
     if let Some(area) = super::clan_maps::member_owned_target(st, clan.id, &grant.scope) {
         let record = st.areas.get(&area).ok_or_else(not_found)?;
         if !super::clan_maps::has_authority(st, caller, record) {
             return Err(not_found());
         }
-        return Ok((grant.clone(), true));
+        return Ok((grant.clone(), Writer::MapOwner));
     }
     if !clan.may_inspect(caller, grant, &placed) {
         return Err(not_found());
     }
-    if clan.is_owner(caller) {
-        return Ok((grant.clone(), true));
-    }
-    let delegates = grant.actions.contains("grant.manage") || !grant.may_grant.is_empty();
-    if delegates
-        || clan
-            .delegation_for(caller, &grant.scope, &grant.actions, &placed)
-            .is_none()
-    {
-        return Err(not_found());
-    }
-    Ok((grant.clone(), false))
+    let writer = if clan.is_owner(caller) {
+        Writer::Owner
+    } else {
+        Writer::Delegate
+    };
+    Ok((grant.clone(), writer))
 }
 
 pub async fn patch_grant(
@@ -2391,128 +2803,107 @@ pub async fn patch_grant(
         let clan_id = clan_param(&raw_clan)?;
         let caller = gate(&st, &headers)?;
         let fields = json_object(&body)?;
-        let (actions, may_grant) = bundle_of(&fields)?;
+        let change = Change::of(&fields)?;
         let clan = active_clan(&st, clan_id)?;
-        let (grant, owner) = managed(&st, clan, caller, grant_id)?;
-        inline_refusal(&grant.scope, &actions, &may_grant)?;
+        let (grant, writer) = managed(&st, clan, caller, grant_id)?;
+        inline_refusal(&grant.scope, &change.add, &change.ceiling_add)?;
         if matches!(grant.recipient, ClanRecipient::User(_))
             && !names_one_map(&grant.scope)
-            && actions.iter().any(|action| grants_map_access(action))
+            && change.add.iter().any(|action| grants_map_access(action))
         {
             return Err(bad_request(MEMBER_MAP_ACCESS));
         }
-        let actions = match super::clan_maps::member_owned_target(&st, clan_id, &grant.scope) {
-            Some(area) => super::clan_maps::member_grant_actions(
-                &st,
-                caller,
-                area,
-                &grant.scope,
-                &actions,
-                &may_grant,
-            )?,
-            None => actions,
+        let placed = |area: Uuid| super::clan_maps::placement(&st, clan_id, area).and_then(|p| p.0);
+        let mut changed = grant.clone();
+        match writer {
+            Writer::Owner => {
+                for action in &change.add {
+                    changed.add(action, Source::Own);
+                }
+            }
+            Writer::MapOwner => {
+                super::clan_maps::member_grant_change(
+                    &change.add,
+                    &change.remove,
+                    change.touches_ceiling(),
+                )?;
+                for action in &change.add {
+                    changed.add(action, Source::Own);
+                }
+            }
+            Writer::Delegate => {
+                // Never delegation itself; each action within one of their
+                // delegations over the grant's scope; and on a grant that
+                // delegates, never one of its own.
+                if change.touches_ceiling()
+                    || change.add.contains("grant.manage")
+                    || change.remove.contains("grant.manage")
+                {
+                    return Err(not_found());
+                }
+                for action in &change.add {
+                    let delegation = clan
+                        .delegation_through(caller, &grant.scope, action, &placed)
+                        .ok_or_else(not_found)?;
+                    changed.add(action, Source::Through(delegation));
+                }
+                for action in &change.remove {
+                    if clan
+                        .delegation_through(caller, &grant.scope, action, &placed)
+                        .is_none()
+                        || (grant.delegates() && grant.owns(action))
+                    {
+                        return Err(not_found());
+                    }
+                }
+            }
+        }
+        for action in &change.remove {
+            changed.remove(action);
+        }
+        changed.may_grant.extend(change.ceiling_add.iter().cloned());
+        changed
+            .may_grant
+            .retain(|action| !change.ceiling_remove.contains(action));
+        if changed.delegates() == changed.may_grant.is_empty() {
+            return Err(bad_request(
+                "a grant carrying `grant.manage` hands out something, and only such a grant",
+            ));
+        }
+        // A delegation that stops delegating takes every action that came
+        // through it; a narrower ceiling, those it leaves out.
+        let retired = grant.delegates()
+            && (!changed.delegates() || !grant.may_grant.is_subset(&changed.may_grant));
+        let kept = if changed.delegates() {
+            changed.may_grant.clone()
+        } else {
+            BTreeSet::new()
         };
-        if !owner {
-            let placed =
-                |area: Uuid| super::clan_maps::placement(&st, clan_id, area).and_then(|p| p.0);
-            if actions.contains("grant.manage") {
-                return Err(not_found());
-            }
-            let delegation = clan
-                .delegation_for(caller, &grant.scope, &actions, &placed)
-                .ok_or_else(not_found)?;
-            if grant.parent_id != Some(delegation) {
-                return widen_under(&mut st, clan_id, caller, &grant, delegation, actions);
-            }
+        if !changed.holds_as(&grant) {
+            changed.updated_at = Utc::now();
         }
         let clan = active_clan_mut(&mut st, clan_id)?;
-        // A delegation that no longer delegates takes its issued grants.
-        if grant.actions.contains("grant.manage") && !actions.contains("grant.manage") {
-            let issued: Vec<Uuid> = clan
-                .grants
-                .iter()
-                .filter(|other| other.parent_id == Some(grant_id))
-                .map(|other| other.id)
-                .collect();
-            clan.remove_grants(&issued);
-        }
-        let record = clan
+        *clan
             .grants
             .iter_mut()
             .find(|other| other.id == grant_id)
-            .expect("found above");
-        record.actions = actions;
-        record.may_grant = may_grant;
-        record.updated_at = Utc::now();
-        let record = record.clone();
-        let view = clan.grant_view(&record);
-        super::shares::sweep_outside_shares(&mut st);
-        Ok(ok(view))
-    })())
-}
-
-/// A delegate's change to a grant not issued under their delegation: the
-/// grant keeps only the requested actions it had, and the added ones go into
-/// a grant issued under the delegation to the same recipient over the same
-/// scope, joining one already there (docs/clans.md §1.2). Answers the changed
-/// grant, or the issued one when nothing of the grant was kept.
-fn widen_under(
-    st: &mut MockState,
-    clan_id: Uuid,
-    caller: Uuid,
-    grant: &ClanGrantRecord,
-    delegation: Uuid,
-    actions: BTreeSet<String>,
-) -> Handled {
-    let kept: BTreeSet<String> = grant.actions.intersection(&actions).cloned().collect();
-    let added: BTreeSet<String> = actions.difference(&grant.actions).cloned().collect();
-    let seq = st.next_seq();
-    let now = Utc::now();
-    let clan = active_clan_mut(st, clan_id)?;
-    if kept.is_empty() {
-        clan.remove_grants(&[grant.id]);
-    } else if kept.len() < grant.actions.len()
-        && let Some(record) = clan.grants.iter_mut().find(|other| other.id == grant.id)
-    {
-        record.actions = kept;
-        record.may_grant.clear();
-        record.updated_at = now;
-    }
-    let mut issued = None;
-    if !added.is_empty() {
-        if let Some(sibling) = clan.grants.iter_mut().find(|other| {
-            other.parent_id == Some(delegation)
-                && other.recipient == grant.recipient
-                && other.scope == grant.scope
-        }) {
-            sibling.actions.extend(added);
-            sibling.updated_at = now;
-            issued = Some(sibling.id);
-        } else {
-            let id = Uuid::new_v4();
-            clan.grants.push(ClanGrantRecord {
-                id,
-                recipient: grant.recipient,
-                scope: grant.scope.clone(),
-                actions: added,
-                may_grant: BTreeSet::new(),
-                issuer_id: caller,
-                parent_id: Some(delegation),
-                created_at: now,
-                updated_at: now,
-                seq,
-            });
-            issued = Some(id);
+            .expect("found above") = changed;
+        if retired {
+            clan.retire_through(grant_id, &kept);
         }
-    }
-    let answered = clan
-        .grants
-        .iter()
-        .find(|other| other.id == grant.id)
-        .or_else(|| issued.and_then(|issued| clan.grants.iter().find(|other| other.id == issued)))
-        .cloned()
-        .ok_or_else(not_found)?;
-    Ok(ok(clan.grant_view(&answered)))
+        if clan
+            .grant(grant_id)
+            .is_some_and(|grant| grant.actions.is_empty())
+        {
+            clan.delete(&[grant_id]);
+        }
+        clan.check();
+        let answer = clan
+            .grant(grant_id)
+            .map_or(Value::Null, |grant| clan.grant_view(grant));
+        super::shares::sweep_outside_shares(&mut st);
+        Ok(ok(answer))
+    })())
 }
 
 pub async fn delete_grant(
@@ -2526,7 +2917,21 @@ pub async fn delete_grant(
         let clan_id = clan_param(&raw_clan)?;
         let caller = gate(&st, &headers)?;
         let clan = active_clan(&st, clan_id)?;
-        managed(&st, clan, caller, grant_id)?;
+        let (grant, writer) = managed(&st, clan, caller, grant_id)?;
+        // A delegate deletes a grant that does not delegate, when each of
+        // its actions is within one of their delegations over its scope.
+        if writer == Writer::Delegate {
+            let placed =
+                |area: Uuid| super::clan_maps::placement(&st, clan_id, area).and_then(|p| p.0);
+            if grant.delegates()
+                || grant.actions.iter().any(|action| {
+                    clan.delegation_through(caller, &grant.scope, action, &placed)
+                        .is_none()
+                })
+            {
+                return Err(not_found());
+            }
+        }
         active_clan_mut(&mut st, clan_id)?.remove_grants(&[grant_id]);
         super::shares::sweep_outside_shares(&mut st);
         Ok(ok(Value::Null))
@@ -2538,8 +2943,8 @@ pub async fn delete_grant(
 // ---------------------------------------------------------------------------
 
 impl MockHandle {
-    /// Seeds a grant in a clan, the way an owner would write one, and returns
-    /// its ID.
+    /// Seeds actions in a clan, the way an owner writes them: they join the
+    /// recipient's grant over the scope, or make it. Returns its ID.
     pub fn clan_grant(
         &self,
         clan: Uuid,
@@ -2547,25 +2952,7 @@ impl MockHandle {
         scope: ClanGrantScope,
         actions: &[&str],
     ) -> Uuid {
-        let mut st = self.state.lock();
-        let seq = st.next_seq();
-        let clan = st.clans.clans.get_mut(&clan).expect("clan exists");
-        let id = Uuid::new_v4();
-        let issuer = clan.owners.iter().next().copied().unwrap_or_default();
-        let now = Utc::now();
-        clan.grants.push(ClanGrantRecord {
-            id,
-            recipient,
-            scope,
-            actions: actions.iter().map(ToString::to_string).collect(),
-            may_grant: BTreeSet::new(),
-            issuer_id: issuer,
-            parent_id: None,
-            created_at: now,
-            updated_at: now,
-            seq,
-        });
-        id
+        self.clan_delegation(clan, recipient, scope, actions, &[])
     }
 
     /// The grants a clan holds (IDs and recipients), to observe what a
@@ -2579,6 +2966,11 @@ impl MockHandle {
             .collect()
     }
 
+    /// One of a clan's grants as the service holds it.
+    pub fn clan_grant_record(&self, clan: Uuid, grant: Uuid) -> Option<ClanGrantRecord> {
+        self.state.lock().clans.clans[&clan].grant(grant).cloned()
+    }
+
     /// Seeds a delegating grant (`grant.manage`) with what it may hand out,
     /// as a clan owner writes one, and returns its ID.
     pub fn clan_delegation(
@@ -2589,19 +2981,13 @@ impl MockHandle {
         actions: &[&str],
         may_grant: &[&str],
     ) -> Uuid {
-        let id = self.clan_grant(clan, recipient, scope, actions);
         let mut st = self.state.lock();
-        let grant = st
-            .clans
-            .clans
-            .get_mut(&clan)
-            .expect("clan exists")
-            .grants
-            .iter_mut()
-            .find(|grant| grant.id == id)
-            .expect("just seeded");
-        grant.may_grant = may_grant.iter().map(ToString::to_string).collect();
-        id
+        let seq = st.next_seq();
+        let clan = st.clans.clans.get_mut(&clan).expect("clan exists");
+        let issuer = clan.owners.iter().next().copied().unwrap_or_default();
+        let ceiling = may_grant.iter().map(ToString::to_string).collect();
+        clan.upsert(recipient, scope, &own(actions), &ceiling, issuer, seq)
+            .0
     }
 
     /// Seeds a package the clan owns, and returns its ID.

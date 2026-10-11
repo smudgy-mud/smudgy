@@ -413,7 +413,7 @@ pub enum ClanModal {
         /// Whether the viewer accepts a given folder (on the clan).
         accepts_folders: bool,
     },
-    Share(super::clan_share::ClanShareDialog),
+    Share(Box<super::clan_share::ClanShareDialog>),
 }
 
 /// An open Incoming maps dialog follows the clan's refreshed lists, so an
