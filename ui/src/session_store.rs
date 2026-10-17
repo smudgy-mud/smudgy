@@ -743,17 +743,19 @@ impl Message {
 }
 
 /// The unit a per-server cloud-map scope association is written against, mirrored
-/// from the map editor's `ScopeTarget`: a whole cloud atlas, or a genuinely
+/// from the map editor's `ScopeTarget`: a clan, a whole cloud atlas, or a genuinely
 /// atlas-less cloud area. Local and ephemeral areas never become a `BindTarget`
 /// — the daemon filters them out before one is formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindTarget {
     Atlas(AtlasId),
     Area(AreaId),
+    /// A clan's folders and maps, which are scoped together.
+    Clan(smudgy_cloud::Uuid),
 }
 
-/// How many consecutive location updates into the same unassigned atlas (or
-/// atlas-less cloud area) it takes for bind-on-use to associate it with the
+/// How many consecutive location updates into the same unassigned clan, atlas
+/// (or atlas-less cloud area) it takes for bind-on-use to associate it with the
 /// session's server entry. Ten is long enough that a handful of incidental
 /// cross-scope locate matches never bind (they can't sustain a streak against
 /// the real map), yet short enough to converge within a minute of ordinary
@@ -768,7 +770,8 @@ pub const LOCATE_BIND_STREAK: u32 = 10;
 /// already-resolved `(target, unassigned)` inputs.
 #[derive(Debug, Default)]
 pub struct BindTracker {
-    /// The atlas/area the current locate streak is accruing for, and its length.
+    /// The clan, atlas or area the current locate streak is accruing for, and
+    /// its length.
     streak: Option<(BindTarget, u32)>,
 }
 
@@ -1427,11 +1430,7 @@ impl ManagedSession {
             // associated only with other entries are excluded here. Keyed on the
             // entry name and preserved until the area lands, like the disabled
             // set above. The daemon re-pushes this whenever associations change.
-            let scopes = MapScopes::load();
-            mapper.set_scope_exclusions(
-                scopes.excluded_atlases(&server_name),
-                scopes.excluded_areas(&server_name),
-            );
+            mapper.set_scope_exclusions(MapScopes::load().exclusions(&server_name));
             Some(mapper)
         };
 

@@ -1283,7 +1283,7 @@ async fn clan_secrets_round_trip() {
     let client = CloudApiClient::new(base_url, credentials);
     let suffix = Uuid::new_v4().simple().to_string();
     let clan = client
-        .create_clan(&format!("live-clan-{}", &suffix[..12]))
+        .create_clan(&format!("live-clan-{}", &suffix[..12]), &[])
         .await
         .expect("create a clan")
         .id;
@@ -1631,7 +1631,7 @@ async fn a_map_transferred_into_a_clan() {
     let client = CloudApiClient::new(base_url, credentials);
     let suffix = Uuid::new_v4().simple().to_string();
     let clan = client
-        .create_clan(&format!("live-format-3-clan-{}", &suffix[..12]))
+        .create_clan(&format!("live-format-3-clan-{}", &suffix[..12]), &[])
         .await
         .expect("create a clan")
         .id;

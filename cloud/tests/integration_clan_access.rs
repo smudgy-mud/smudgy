@@ -60,7 +60,12 @@ async fn clan() -> Clan {
     let mira = member(&server, "mira");
     let nessa = member(&server, "nessa");
     let arun = member(&server, "arun");
-    let id = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let id = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(id, &nessa.user);
     server.join_clan(id, &arun.user);
     let everyone = server.clan_builtin_group(id, "members");
@@ -1795,6 +1800,7 @@ async fn the_profile_changes_with_edit_profile() {
             &ClanProfilePatch {
                 name: None,
                 description: Some("Ours".to_string()),
+                hosts: None,
             },
         )
         .await;
@@ -1807,6 +1813,7 @@ async fn the_profile_changes_with_edit_profile() {
             &ClanProfilePatch {
                 name: Some("Lantern Co.".to_string()),
                 description: Some("Maps for the next run.".to_string()),
+                hosts: None,
             },
         )
         .await
@@ -1830,6 +1837,7 @@ async fn the_profile_changes_with_edit_profile() {
             &ClanProfilePatch {
                 name: None,
                 description: Some(String::new()),
+                hosts: None,
             },
         )
         .await
@@ -1843,6 +1851,7 @@ async fn the_profile_changes_with_edit_profile() {
             &ClanProfilePatch {
                 name: Some("  ".to_string()),
                 description: None,
+                hosts: None,
             },
         )
         .await;

@@ -78,7 +78,7 @@ pub mod room_cache;
 use places::Sources;
 pub mod room_connection;
 pub mod sync_engine;
-pub use atlas_cache::{AtlasCache, ElsewhereMatch};
+pub use atlas_cache::{AtlasCache, ElsewhereMatch, ScopeExclusions};
 pub use pending::{AreaSaveStatus, MapperEvent};
 pub use sync_engine::{SyncState, SyncStatus};
 
@@ -2152,24 +2152,19 @@ impl Mapper {
             .find_room_elsewhere_by_external_id(external_id)
     }
 
-    /// Replaces the per-server scope-exclusion sets wholesale (rcu-swapping the
-    /// atlas cache like [`Self::set_disabled_areas`]). Scope-excluded atlases
-    /// and atlas-less areas drop out of every room-identification lookup table
-    /// and are treated as walls in routing — semantically identical to a manual
-    /// disable, but stored on a separate axis so the user's manual toggle stays
-    /// intact. Keying by atlas id means an area that later syncs into an
-    /// excluded atlas is excluded automatically, with no recomputation. Full
-    /// table rebuild; scope changes are rare.
-    pub fn set_scope_exclusions(
-        &self,
-        excluded_atlases: HashSet<AtlasId>,
-        excluded_areas: HashSet<AreaId>,
-    ) {
-        let atlases = Arc::new(excluded_atlases);
-        let areas = Arc::new(excluded_areas);
+    /// Replaces the per-server scope exclusions wholesale (rcu-swapping the
+    /// atlas cache like [`Self::set_disabled_areas`]). Scope-excluded atlases,
+    /// atlas-less areas and clans drop out of every room-identification lookup
+    /// table and are treated as walls in routing — semantically identical to a
+    /// manual disable, but stored on a separate axis so the user's manual
+    /// toggle stays intact. Keying by atlas and clan id means an area that
+    /// later syncs into an excluded atlas or clan is excluded automatically,
+    /// with no recomputation. Full table rebuild; scope changes are rare.
+    pub fn set_scope_exclusions(&self, scope: ScopeExclusions) {
+        let scope = Arc::new(scope);
         self.inner
             .atlas_cache
-            .rcu(|cache| Arc::new(cache.with_scope_exclusions(atlases.clone(), areas.clone())));
+            .rcu(|cache| Arc::new(cache.with_scope_exclusions(scope.clone())));
     }
 
     /// Create an area in the default durable tier — cloud when signed in,
@@ -8671,7 +8666,10 @@ mod tests {
 
         // Scope-exclude the resident area: invisible to identification and to
         // a filtered area listing, but it must still count as present.
-        mapper.set_scope_exclusions(HashSet::new(), std::iter::once(a_id).collect());
+        mapper.set_scope_exclusions(ScopeExclusions {
+            areas: std::iter::once(a_id).collect(),
+            ..ScopeExclusions::default()
+        });
 
         let mut duplicate = sample_area(AreaId(Uuid::new_v4()), "Copy");
         duplicate.area.name.clone_from(&resident_name);
@@ -10206,7 +10204,10 @@ mod tests {
         mapper.load_all_areas().await.expect("load");
 
         // Scope-exclude B (by area id, since these sample areas are atlas-less).
-        mapper.set_scope_exclusions(HashSet::new(), std::iter::once(b_id).collect());
+        mapper.set_scope_exclusions(ScopeExclusions {
+            areas: std::iter::once(b_id).collect(),
+            ..ScopeExclusions::default()
+        });
 
         let atlas = mapper.get_current_atlas();
         let by_title: Vec<AreaId> = atlas
@@ -10265,10 +10266,11 @@ mod tests {
 
         // Only cloud atlas/area ids ever enter the scope store, so excluding a
         // pile of arbitrary cloud ids can never touch a session-tier area.
-        mapper.set_scope_exclusions(
-            std::iter::once(AtlasId(Uuid::new_v4())).collect(),
-            std::iter::once(AreaId(Uuid::new_v4())).collect(),
-        );
+        mapper.set_scope_exclusions(ScopeExclusions {
+            atlases: std::iter::once(AtlasId(Uuid::new_v4())).collect(),
+            areas: std::iter::once(AreaId(Uuid::new_v4())).collect(),
+            ..ScopeExclusions::default()
+        });
 
         assert!(
             mapper.is_area_included(&area_id),

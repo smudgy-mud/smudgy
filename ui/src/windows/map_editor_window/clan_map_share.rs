@@ -2277,6 +2277,9 @@ pub enum PutInClanMessage {
     Submitted {
         dialog: Uuid,
         result: Result<(), CloudError>,
+        /// Where the map showed when it was submitted, for a clan shown
+        /// nowhere yet.
+        servers_before: BTreeSet<String>,
     },
 }
 
@@ -2356,6 +2359,12 @@ pub(super) fn update_put_in_clan(
     message: PutInClanMessage,
 ) -> Update<Message, super::Event> {
     dismiss_stale(window);
+    let servers_before = match (&message, &window.modal) {
+        (PutInClanMessage::Submit, Some(modals::Modal::PutInClan(dialog))) => {
+            window.servers_before_move(window.scope_target_for_area(dialog.area_id))
+        }
+        _ => BTreeSet::new(),
+    };
     let Some(modals::Modal::PutInClan(dialog)) = &mut window.modal else {
         return Update::none();
     };
@@ -2427,28 +2436,35 @@ pub(super) fn update_put_in_clan(
                     put(PutInClanMessage::Submitted {
                         dialog: dialog_id,
                         result,
+                        servers_before,
                     })
                 },
             ));
         }
-        PutInClanMessage::Submitted { result, .. } => {
+        PutInClanMessage::Submitted {
+            result,
+            servers_before,
+            ..
+        } => {
             if !dialog.busy {
                 return Update::none();
             }
             dialog.busy = false;
             match result {
                 Ok(()) => {
-                    let clan = dialog
-                        .clan
+                    let clan_id = dialog.clan;
+                    let clan = clan_id
                         .and_then(|clan| dialog.clans.iter().find(|(id, _)| *id == clan))
                         .map(|(_, name)| name.clone())
                         .unwrap_or_default();
                     dialog.done = Some(crate::i18n::t!("clan-share-put-done", "clan" => clan));
+                    let seeded = clan_id
+                        .and_then(|clan_id| window.seed_clan_servers(clan_id, servers_before));
                     window.mapper.sync_now();
-                    return Update::with_task(Task::batch([
-                        super::clan_maps::fetch(window),
-                        super::follow_up_syncs(),
-                    ]));
+                    return Update::new(
+                        Task::batch([super::clan_maps::fetch(window), super::follow_up_syncs()]),
+                        seeded,
+                    );
                 }
                 Err(error) => {
                     dialog.error = Some(match error {
@@ -3243,10 +3259,12 @@ mod tests {
                 PutInClanMessage::Submitted {
                     dialog: original,
                     result: Ok(()),
+                    servers_before: BTreeSet::new(),
                 },
                 PutInClanMessage::Submitted {
                     dialog: original,
                     result: Err(CloudError::NotFoundOrNoAccess),
+                    servers_before: BTreeSet::new(),
                 },
             ] {
                 assert_eq!(update_put_in_clan(&mut window, message).task.units(), 0);
@@ -3257,6 +3275,7 @@ mod tests {
                 PutInClanMessage::Submitted {
                     dialog: active,
                     result: Ok(()),
+                    servers_before: BTreeSet::new(),
                 },
             );
             let Some(modals::Modal::PutInClan(state)) = &window.modal else {
@@ -3273,6 +3292,7 @@ mod tests {
             PutInClanMessage::Submitted {
                 dialog: original,
                 result: Ok(()),
+                servers_before: BTreeSet::new(),
             },
         );
         assert!(window.modal.is_none());
@@ -3310,6 +3330,7 @@ mod tests {
             PutInClanMessage::Submitted {
                 dialog: original,
                 result: Ok(()),
+                servers_before: BTreeSet::new(),
             },
         );
         let Some(modals::Modal::PutInClan(state)) = &window.modal else {

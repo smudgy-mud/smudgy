@@ -90,7 +90,12 @@ async fn clan_with_folder(
     owner: &Person,
     members: &[&Person],
 ) -> (Uuid, AtlasId) {
-    let clan = owner.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = owner
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     for member in members {
         server.join_clan(clan, &member.user);
     }
@@ -610,7 +615,7 @@ async fn transfers_into_a_clan_refuse_what_they_must() {
 
     // A folder of another clan, or one the acceptor may not fill, is refused
     // and the offer stands.
-    let other = kai.api.create_clan("Other Company").await.unwrap().id;
+    let other = kai.api.create_clan("Other Company", &[]).await.unwrap().id;
     let theirs = kai.api.create_clan_atlas(other, "Theirs").await.unwrap().id;
     let offer = server
         .legacy_clan_transfer(&tomas.user, Some(area), None, clan, MapOwnership::Clan)

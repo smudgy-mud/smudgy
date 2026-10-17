@@ -8,6 +8,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
+use smudgy_cloud::clan_access::ClanProfilePatch;
 use smudgy_cloud::clans::{ClanGrantFilter, ClanGroupPatch, action};
 use smudgy_cloud::{CloudApiClient, CloudError, Credential, CredentialSource};
 use support::clans::{ClanGrantScope, ClanRecipient};
@@ -80,7 +81,10 @@ async fn a_clan_is_created_listed_renamed_and_dissolved() {
     let (_, tomas) = user(&server, "tomas");
 
     assert!(mira.clans().await.unwrap().clans.is_empty());
-    let clan = mira.create_clan("Lantern Company").await.expect("create");
+    let clan = mira
+        .create_clan("Lantern Company", &[])
+        .await
+        .expect("create");
     assert!(clan.is_owner);
     assert_eq!(clan.member_count, 1);
     assert_eq!(clan.group_ids.len(), 2, "the creator is in both built-ins");
@@ -96,12 +100,14 @@ async fn a_clan_is_created_listed_renamed_and_dissolved() {
 
     // A blank or overlong name is a 400.
     for bad in [String::from("   "), "x".repeat(65)] {
-        let error = mira.create_clan(&bad).await.expect_err("bad name");
+        let error = mira.create_clan(&bad, &[]).await.expect_err("bad name");
         assert!(matches!(error, CloudError::InvalidInput(_)), "{error:?}");
     }
 
     // Listed by name; there is no directory, so others never see it.
-    mira.create_clan("Archivists").await.expect("second clan");
+    mira.create_clan("Archivists", &[])
+        .await
+        .expect("second clan");
     let listed = mira.clans().await.unwrap();
     let names: Vec<&str> = listed.clans.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["Archivists", "Lantern Company"]);
@@ -144,13 +150,13 @@ async fn clan_names_and_user_nicknames_cannot_collide() {
     for creator in [&owner, &outsider] {
         for name in ["NameHolder", "nameholder", "NAMEHOLDER"] {
             assert!(matches!(
-                creator.create_clan(name).await,
+                creator.create_clan(name, &[]).await,
                 Err(CloudError::NameInUse)
             ));
         }
         assert!(creator.clans().await.unwrap().clans.is_empty());
     }
-    let clan = owner.create_clan("Lanterns").await.unwrap();
+    let clan = owner.create_clan("Lanterns", &[]).await.unwrap();
     assert!(matches!(
         owner.rename_clan(clan.id, "OUTSIDER").await,
         Err(CloudError::NameInUse)
@@ -178,8 +184,8 @@ async fn names_are_released_after_rename_and_completed_dissolution() {
     let (_, owner) = user(&server, "FormerNickname");
     let (_, claimant) = user(&server, "Claimant");
     owner.set_nickname("NewNickname").await.unwrap();
-    let clan = owner.create_clan("formernickname").await.unwrap();
-    let duplicate = owner.create_clan("FORMERNICKNAME").await.unwrap();
+    let clan = owner.create_clan("formernickname", &[]).await.unwrap();
+    let duplicate = owner.create_clan("FORMERNICKNAME", &[]).await.unwrap();
     owner.rename_clan(clan.id, "AfterRename").await.unwrap();
     assert!(matches!(
         claimant.set_nickname("FormerNickname").await,
@@ -203,7 +209,7 @@ async fn first_verification_leaves_a_clan_name_unclaimed() {
     let server = MockServer::spawn().await;
     let (_, owner) = user(&server, "OwnerName");
     let pending = server.create_user("pending@example.com", "firstclaim", false);
-    owner.create_clan("FirstClaim").await.unwrap();
+    owner.create_clan("FirstClaim", &[]).await.unwrap();
     let pending = client(&server, &pending);
     pending.login("pending@example.com").await.unwrap();
     let code = server.verify_code_for("pending@example.com").unwrap();
@@ -221,7 +227,7 @@ async fn an_owner_repeating_a_dissolution_whose_answer_was_lost_gets_null() {
     let server = MockServer::spawn().await;
     let (_, mira) = user(&server, "mira");
     let (_, tomas) = user(&server, "tomas");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
 
     server.lose_next_dissolution_answers(1);
@@ -245,7 +251,7 @@ async fn invitations_are_sent_answered_and_revoked() {
     let (mira_user, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
     let (arun_user, arun) = user(&server, "arun");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
 
     // Invite by nickname: the invitee sees it in both listings.
     let found = mira.lookup("tomas").await.expect("lookup");
@@ -341,7 +347,7 @@ async fn a_block_hides_the_invitee_behind_the_uniform_404() {
     let server = MockServer::spawn().await;
     let (mira_user, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
 
     server.block(&tomas_user, &mira_user);
     assert!(is_not_found(
@@ -360,7 +366,7 @@ async fn an_invitation_is_void_once_its_inviter_may_no_longer_invite() {
     let (_, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
     let (arun_user, arun) = user(&server, "arun");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
     let grant = server.clan_grant(
         clan.id,
@@ -397,7 +403,7 @@ async fn owners_change_hands_and_the_last_owner_stays() {
     let server = MockServer::spawn().await;
     let (mira_user, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
 
     // The last owner can neither give up ownership nor leave.
@@ -449,7 +455,7 @@ async fn members_are_listed_owners_first_and_removed_by_the_rules() {
     let (mira_user, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
     let (arun_user, arun) = user(&server, "arun");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
     invite_and_join(&mira, &arun, clan.id, "arun").await;
     mira.set_clan_owner(clan.id, arun_user.id, true)
@@ -529,7 +535,7 @@ async fn leaving_drops_custom_groups_direct_grants_and_issued_invitations() {
     let (_, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
     let (arun_user, arun) = user(&server, "arun");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
     let scouts = mira
         .create_clan_group(clan.id, "Scouts", Some("#336699"))
@@ -588,7 +594,7 @@ async fn groups_are_created_renamed_filled_and_deleted() {
     let server = MockServer::spawn().await;
     let (_, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
 
     let groups = mira.clan_groups(clan.id).await.unwrap();
@@ -782,7 +788,7 @@ async fn actions_come_from_grants_and_gate_each_route() {
     let server = MockServer::spawn().await;
     let (_, mira) = user(&server, "mira");
     let (tomas_user, tomas) = user(&server, "tomas");
-    let clan = mira.create_clan("Lantern Company").await.unwrap();
+    let clan = mira.create_clan("Lantern Company", &[]).await.unwrap();
     invite_and_join(&mira, &tomas, clan.id, "tomas").await;
     let mappers = mira
         .create_clan_group(clan.id, "City mappers", None)
@@ -872,4 +878,83 @@ async fn actions_come_from_grants_and_gate_each_route() {
     );
     let summary = arun.clan(clan.id).await.unwrap();
     assert_eq!(summary.actions, with_founding(&[action::INVITE]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clan_plays_on_hosts_every_member_sees() {
+    let server = MockServer::spawn().await;
+    let (_, mira) = user(&server, "mira");
+    let (_, iris) = user(&server, "iris");
+    let hosts = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let clan = mira
+        .create_clan(
+            "Arctic Rangers",
+            &hosts(&[" Mud.Arctic.org ", "arcticmud.org", "", "MUD.ARCTIC.ORG"]),
+        )
+        .await
+        .expect("create");
+    assert_eq!(clan.hosts, ["mud.arctic.org", "arcticmud.org"]);
+    invite_and_join(&mira, &iris, clan.id, "iris").await;
+    assert_eq!(
+        iris.clans().await.unwrap().clans[0].hosts,
+        ["mud.arctic.org", "arcticmud.org"]
+    );
+
+    // Members without clan.edit_profile cannot change them.
+    let refused = iris
+        .update_clan_profile(
+            clan.id,
+            &ClanProfilePatch {
+                hosts: Some(hosts(&["evil.example.org"])),
+                ..ClanProfilePatch::default()
+            },
+        )
+        .await;
+    assert!(is_not_found(&refused));
+
+    // A patch replaces the list; one that names no hosts keeps them.
+    let replaced = mira
+        .update_clan_profile(
+            clan.id,
+            &ClanProfilePatch {
+                hosts: Some(hosts(&["mud.arctic.org:2700"])),
+                ..ClanProfilePatch::default()
+            },
+        )
+        .await
+        .expect("replace");
+    assert_eq!(replaced.hosts, ["mud.arctic.org:2700"]);
+    let renamed = mira.rename_clan(clan.id, "Rangers").await.expect("rename");
+    assert_eq!(renamed.hosts, ["mud.arctic.org:2700"]);
+    let cleared = mira
+        .update_clan_profile(
+            clan.id,
+            &ClanProfilePatch {
+                hosts: Some(Vec::new()),
+                ..ClanProfilePatch::default()
+            },
+        )
+        .await
+        .expect("clear");
+    assert!(cleared.hosts.is_empty());
+
+    for bad in [
+        "telnet://mud.arctic.org",
+        "mud arctic.org",
+        ":2700",
+        "mud.arctic.org:65536",
+        "mud.arctic.org:",
+        "[::1]:4000",
+        "mud.\u{e4}rctic.org",
+    ] {
+        let error = mira
+            .create_clan("Rangers", &hosts(&[bad]))
+            .await
+            .expect_err(bad);
+        assert!(
+            matches!(error, CloudError::InvalidInput(_)),
+            "{bad}: {error:?}"
+        );
+    }
 }

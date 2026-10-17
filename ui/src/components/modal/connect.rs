@@ -82,6 +82,8 @@ pub enum Event {
     /// per their connection intent and apply the stored arrangement (the
     /// full user-restore flow, owned by the daemon).
     RestoreLastSession(ServerName),
+    /// A server entry was created, edited or deleted on disk.
+    ServersChanged,
 }
 
 // Messages handled internally by this modal's update logic
@@ -1606,6 +1608,9 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             // This keeps the cancellation logic simple.
         }
         Message::ServerOperationFinished(completion) => {
+            if completion.result.is_ok() {
+                event = Some(Event::ServersChanged);
+            }
             task = handle_server_operation_completion(state, completion);
         }
         Message::RequestCreateProfile => {

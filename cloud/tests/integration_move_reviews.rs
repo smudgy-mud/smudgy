@@ -355,7 +355,7 @@ async fn empty_groups_still_have_different_future_audiences() {
         server.base_url.clone(),
         CredentialSource::new(Some(Credential::Session(owner.session_token.clone()))),
     );
-    let clan = api.create_clan("Exploration").await.unwrap().id;
+    let clan = api.create_clan("Exploration", &[]).await.unwrap().id;
     server.join_clan(clan, &bob);
     let explorers = api
         .create_clan_group(clan, "Explorers", None)
@@ -529,7 +529,7 @@ async fn filing_needs_sharing_authority_even_with_copy_and_rechecks_the_named_gr
         server.base_url.clone(),
         CredentialSource::new(Some(Credential::Session(owner.session_token.clone()))),
     );
-    let clan = api.create_clan("Exploration").await.unwrap().id;
+    let clan = api.create_clan("Exploration", &[]).await.unwrap().id;
     server.join_clan(clan, &bob);
     let explorers = api
         .create_clan_group(clan, "Explorers", None)

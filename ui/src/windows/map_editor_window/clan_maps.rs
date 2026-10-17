@@ -28,6 +28,7 @@ use crate::widgets::dropdown::Dropdown;
 
 use super::area_list::{AreaSummary, Folder, name_order, sort_by_name, sort_folders};
 use super::{FolderKey, MapEditorWindow, Message, ScopeTarget, modals};
+use smudgy_core::models::map_scopes::ScopeState;
 
 /// What the map editor knows about the viewer's clans.
 #[derive(Debug, Clone, Default)]
@@ -65,6 +66,20 @@ impl ClanState {
 
     fn clan(&self, clan_id: Uuid) -> Option<&ClanSummary> {
         self.clans.iter().find(|clan| clan.id == clan_id)
+    }
+
+    /// The clan's "Plays on" hosts; none for a clan the viewer isn't in.
+    #[must_use]
+    pub fn hosts(&self, clan_id: Uuid) -> &[String] {
+        self.clan(clan_id).map_or(&[], |clan| clan.hosts.as_slice())
+    }
+
+    /// Whether opening one of the clan's maps may place the clan on this
+    /// server: only a listed clan with no hosts. A clan with hosts is placed
+    /// by homing, and one not listed yet may have hosts.
+    #[must_use]
+    pub fn binds_on_use(&self, clan_id: Uuid) -> bool {
+        self.clan(clan_id).is_some_and(|clan| clan.hosts.is_empty())
     }
 
     /// The clan's name, as the clan list or a map row or folder last named it.
@@ -168,6 +183,28 @@ pub(super) fn clan_folder(window: &MapEditorWindow, atlas_id: AtlasId) -> Option
         .find(|atlas| atlas.id == atlas_id && atlas.clan_id.is_some())
 }
 
+/// The clan a folder belongs to: from the folder inventory, or, for a folder
+/// not in it (one an outside share reached, or before the inventory loads),
+/// from the maps filed there.
+#[must_use]
+pub fn folder_clan(window: &MapEditorWindow, atlas_id: AtlasId) -> Option<Uuid> {
+    window
+        .atlases
+        .iter()
+        .find(|atlas| atlas.id == atlas_id)
+        .and_then(|atlas| atlas.clan_id)
+        .or_else(|| {
+            window
+                .mapper
+                .get_current_atlas()
+                .areas()
+                .find(|area| {
+                    area.meta().atlas_id == Some(atlas_id) && area.meta().clan_id.is_some()
+                })
+                .and_then(|area| area.meta().clan_id)
+        })
+}
+
 /// Whether `atlas_id` is one of the viewer's clans' folders.
 #[must_use]
 pub fn is_clan_folder(window: &MapEditorWindow, atlas_id: AtlasId) -> bool {
@@ -201,7 +238,7 @@ pub enum ClanMessage {
     NewFolderRequested(Uuid),
     FolderNameChanged(String),
     FolderConfirmed,
-    FolderCreated(Result<AtlasId, CloudError>),
+    FolderCreated(Uuid, Result<AtlasId, CloudError>),
     DeleteFolderRequested(AtlasId),
     DeleteFolderConfirmed,
     FolderDeleted(Result<(), CloudError>),
@@ -461,11 +498,13 @@ pub(super) fn update(
             if auth_projection_revision != window.mapper.auth_projection_revision() {
                 return Update::none();
             }
+            let mut listed = None;
             match clans {
                 Ok(overview) => {
                     for summary in &overview.clans {
                         window.clans.names.insert(summary.id, summary.name.clone());
                     }
+                    listed = Some(super::Event::ClansListed(overview.clans.clone()));
                     window.clans.clans = overview.clans;
                 }
                 Err(CloudError::Unauthorized(_) | CloudError::EmailNotVerified) => {
@@ -505,7 +544,7 @@ pub(super) fn update(
                 }
             }
             reconcile_open_dialog(window);
-            Update::none()
+            Update::new(Task::none(), listed)
         }
         ClanMessage::MenuToggled(open) => {
             window.clans.menu = open;
@@ -550,17 +589,23 @@ pub(super) fn update(
             let client = window.cloud.client.clone();
             Update::with_task(Task::perform(
                 async move { client.create_clan_atlas(clan_id, &name).await },
-                |result| clan(ClanMessage::FolderCreated(result.map(|atlas| atlas.id))),
+                move |result| {
+                    clan(ClanMessage::FolderCreated(
+                        clan_id,
+                        result.map(|atlas| atlas.id),
+                    ))
+                },
             ))
         }
-        ClanMessage::FolderCreated(result) => match result {
+        ClanMessage::FolderCreated(clan_id, result) => match result {
             Ok(atlas_id) => {
                 if matches!(modal_mut(window), Some(ClanModal::NewFolder { .. })) {
                     window.modal = None;
                 }
                 window.collapsed_folders.remove(&FolderKey::Atlas(atlas_id));
-                // Like any new folder, it shows on the server it was made from.
-                let associated = window.associate_new_atlas(atlas_id);
+                // A clan shown nowhere yet shows on the server its folder was
+                // made from.
+                let associated = window.associate_new_clan_content(clan_id);
                 Update::new(window.fetch_atlases(), associated)
             }
             Err(failure) => {
@@ -1028,13 +1073,8 @@ fn dots_menu(
 }
 
 /// A clan's header: its name, how many maps wait for a folder, and its ⋯
-/// menu (New folder, Share…, Incoming maps…). `with_menu` is false where the
-/// clan's name only labels folders in another section.
-pub fn clan_header<'a>(
-    window: &MapEditorWindow,
-    group: &ClanGroup,
-    with_menu: bool,
-) -> ThemedElement<'a, Message> {
+/// menu (New folder, Incoming maps…, Show on {server}, Servers…).
+pub fn clan_header<'a>(window: &MapEditorWindow, group: &ClanGroup) -> ThemedElement<'a, Message> {
     let mut header = row![
         text(group.label.clone())
             .size(12)
@@ -1045,37 +1085,45 @@ pub fn clan_header<'a>(
     .spacing(6)
     .align_y(Vertical::Center)
     .width(Length::Fill);
-    if with_menu && group.incoming > 0 {
+    if group.incoming > 0 {
         header = header.push(badge(
             crate::i18n::t!("clan-maps-incoming-badge", "count" => group.incoming),
         ));
     }
     header = header.push(space::horizontal());
-    if with_menu {
-        let summary = window.clans.clan(group.clan_id);
-        let mut entries: Vec<(String, Message)> = Vec::new();
-        if summary.is_some_and(|clan| clan.can(action::CREATE_ATLAS)) {
-            entries.push((
-                crate::i18n::t!("clan-maps-new-folder"),
-                clan(ClanMessage::NewFolderRequested(group.clan_id)),
-            ));
-        }
-        if group.incoming > 0 {
-            entries.push((
-                crate::i18n::t!("clan-maps-incoming"),
-                clan(ClanMessage::IncomingRequested(group.clan_id)),
-            ));
-        }
-        if !entries.is_empty() {
-            let open = window.clans.menu == Some(group.clan_id);
-            header = header.push(dots_menu(
-                entries,
-                open,
-                clan(ClanMessage::MenuToggled((!open).then_some(group.clan_id))),
-                clan(ClanMessage::MenuToggled(None)),
-            ));
-        }
+    let summary = window.clans.clan(group.clan_id);
+    let mut entries: Vec<(String, Message)> = Vec::new();
+    if summary.is_some_and(|clan| clan.can(action::CREATE_ATLAS)) {
+        entries.push((
+            crate::i18n::t!("clan-maps-new-folder"),
+            clan(ClanMessage::NewFolderRequested(group.clan_id)),
+        ));
     }
+    if group.incoming > 0 {
+        entries.push((
+            crate::i18n::t!("clan-maps-incoming"),
+            clan(ClanMessage::IncomingRequested(group.clan_id)),
+        ));
+    }
+    if let Some(server) = window.server_name.as_deref()
+        && window.map_scopes.clan_scope(&group.clan_id, server) != ScopeState::Here
+    {
+        entries.push((
+            crate::i18n::t!("clan-maps-show-here", "server" => server),
+            Message::ShowClanHere(group.clan_id),
+        ));
+    }
+    entries.push((
+        crate::i18n::t!("area-list-servers-action"),
+        Message::ServersChecklistRequested(ScopeTarget::Clan(group.clan_id)),
+    ));
+    let open = window.clans.menu == Some(group.clan_id);
+    header = header.push(dots_menu(
+        entries,
+        open,
+        clan(ClanMessage::MenuToggled((!open).then_some(group.clan_id))),
+        clan(ClanMessage::MenuToggled(None)),
+    ));
     container(header)
         .padding(Padding {
             top: 4.0,
@@ -1087,14 +1135,11 @@ pub fn clan_header<'a>(
 }
 
 /// A clan folder's ⋯ entries, as its actions allow: New map in folder,
-/// Rename, Share…, Servers…, Delete folder.
+/// Rename, Share…, Delete folder. Its servers are its clan's.
 #[must_use]
 pub fn folder_entries(window: &MapEditorWindow, atlas_id: AtlasId) -> Vec<(String, Message)> {
     let Some(folder) = clan_folder(window, atlas_id) else {
-        return vec![(
-            crate::i18n::t!("area-list-servers-action"),
-            Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
-        )];
+        return Vec::new();
     };
     let mut entries = Vec::new();
     if folder.can(action::CREATE_AREA) || folder.can(action::CREATE_MEMBER_OWNED_AREA) {
@@ -1115,10 +1160,6 @@ pub fn folder_entries(window: &MapEditorWindow, atlas_id: AtlasId) -> Vec<(Strin
             clan(ClanMessage::ShareFolderRequested(atlas_id)),
         ));
     }
-    entries.push((
-        crate::i18n::t!("area-list-servers-action"),
-        Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
-    ));
     if folder.can(action::DELETE_ATLAS) {
         entries.push((
             crate::i18n::t!("area-list-delete-folder"),
@@ -1671,6 +1712,7 @@ mod tests {
             id: clan_id,
             name: "Lantern Company".to_string(),
             description: None,
+            hosts: Vec::new(),
             created_at: chrono::Utc::now(),
             member_count: 2,
             is_owner,

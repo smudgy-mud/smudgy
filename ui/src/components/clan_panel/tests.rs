@@ -15,6 +15,7 @@ fn summary(is_owner: bool, actions: &[&str]) -> ClanSummary {
         id: id(1),
         name: "Lantern Company".to_string(),
         description: None,
+        hosts: Vec::new(),
         created_at: "2026-10-01T00:00:00Z".parse().unwrap(),
         member_count: 3,
         is_owner,
@@ -881,4 +882,96 @@ fn a_group_is_renamed_only_with_rename() {
         matches!(&page.modal, Some(Modal::Group { error: None, .. })),
         "nothing is saved and the dialog stays"
     );
+}
+
+fn local(session_host: Option<&str>, servers: &[&str]) -> LocalContext {
+    LocalContext {
+        session_host: session_host.map(ToString::to_string),
+        servers: servers.iter().map(ToString::to_string).collect(),
+        scopes: MapScopes::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_new_clan_plays_on_the_session_host_until_removed() {
+    let mut panel = ClanPanel::new(crate::cloud_account::test_handles_signed_in("mira"));
+    assert_eq!(panel.new_clan_host(), None);
+    panel.set_local(local(Some("mud.arctic.org"), &["arctic"]));
+    assert_eq!(panel.new_clan_host(), Some("mud.arctic.org"));
+    let _ = panel.update(Message::NewClanHostRemoved);
+    assert_eq!(panel.new_clan_host(), None);
+    // A fresh session host doesn't bring back what the viewer removed.
+    panel.set_local(local(Some("arcticmud.org"), &["arctic"]));
+    assert_eq!(panel.new_clan_host(), None);
+}
+
+#[tokio::test]
+async fn showing_a_clan_here_hands_over_a_clan_delta() {
+    let mut panel = panel_with(ClanPage::new(summary(false, &[])));
+    panel.set_local(local(None, &["arctic", "aardwolf"]));
+    let _ = panel.update(Message::ShownHereToggled {
+        entry: "arctic".to_string(),
+        show: true,
+    });
+    assert_eq!(
+        panel.local.scopes.clan_entries(&id(1)),
+        BTreeSet::from(["arctic".to_string()])
+    );
+    match panel.take_handoff() {
+        Some(Handoff::Scopes(deltas)) => assert_eq!(
+            deltas,
+            vec![ScopeDelta::SetClanEntry {
+                clan_id: id(1),
+                entry: "arctic".to_string(),
+                show: true,
+            }]
+        ),
+        other => panic!("expected a scope handoff, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_listed_clan_list_and_changed_hosts_are_handed_over() {
+    let mut panel = ClanPanel::new(crate::cloud_account::test_handles_signed_in("mira"));
+    let account = panel.account();
+    let _ = panel.update(Message::Loaded(
+        account,
+        Ok(ClansOverview {
+            clans: vec![summary(true, &[])],
+            invitations: Vec::new(),
+        }),
+    ));
+    assert!(matches!(panel.take_handoff(), Some(Handoff::Clans(clans)) if clans.len() == 1));
+
+    // A clan page that loads with different hosts updates the list and hands
+    // it over again.
+    let mut fresher = summary(true, &[]);
+    fresher.hosts = vec!["mud.arctic.org".to_string()];
+    panel.adopt_summary(fresher);
+    match panel.take_handoff() {
+        Some(Handoff::Clans(clans)) => assert_eq!(clans[0].hosts, ["mud.arctic.org"]),
+        other => panic!("expected the clans, got {other:?}"),
+    }
+    // Unchanged hosts hand nothing over.
+    let mut same = summary(true, &[]);
+    same.hosts = vec!["mud.arctic.org".to_string()];
+    panel.adopt_summary(same);
+    assert!(panel.take_handoff().is_none());
+}
+
+#[tokio::test]
+async fn use_everywhere_names_no_server_and_leaving_it_names_every_one() {
+    let mut panel = panel_with(ClanPage::new(summary(false, &[])));
+    panel.set_local(local(None, &["arctic", "aardwolf"]));
+    let _ = panel.update(Message::UseEverywhereToggled(false));
+    assert_eq!(
+        panel.local.scopes.clan_entries(&id(1)),
+        BTreeSet::from(["aardwolf".to_string(), "arctic".to_string()])
+    );
+    assert!(matches!(
+        panel.take_handoff(),
+        Some(Handoff::Scopes(deltas)) if matches!(deltas[..], [ScopeDelta::SetClanEntries { .. }])
+    ));
+    let _ = panel.update(Message::UseEverywhereToggled(true));
+    assert!(panel.local.scopes.clan_entries(&id(1)).is_empty());
 }

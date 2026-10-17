@@ -182,6 +182,8 @@ pub enum Message {
 
     Social(social_panel::Message),
     Clans(clan_panel::Message),
+    /// What this computer knows that the Clans pages show, from the daemon.
+    ClanLocal(clan_panel::LocalContext),
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +214,14 @@ pub enum Event {
     OpenMapAccess(smudgy_cloud::AreaId),
     /// Settings › Clans › Access asks Automations to show a package, by name.
     OpenPackage(String),
+    /// The account's clans as the Clans page last listed them, for homing
+    /// them onto server entries.
+    ClansListed(Vec<smudgy_cloud::clans::ClanSummary>),
+    /// The viewer changed which of this computer's servers show a clan.
+    ScopeAssociationsChanged(Vec<smudgy_core::models::map_scopes::ScopeDelta>),
+    /// The Clans tab opened: the daemon answers with a fresh
+    /// [`Message::ClanLocal`].
+    ClanLocalRequested,
 }
 
 pub struct SettingsWindow {
@@ -446,11 +456,14 @@ impl SettingsWindow {
                 {
                     return Update::with_task(self.social.refresh().map(Message::Social));
                 }
-                if tab == Tab::Clans
-                    && self.cloud.snapshot.get().email_verified
-                    && !self.clans.is_loaded()
-                {
-                    return Update::with_task(self.clans.refresh().map(Message::Clans));
+                if tab == Tab::Clans {
+                    let refresh =
+                        if self.cloud.snapshot.get().email_verified && !self.clans.is_loaded() {
+                            self.clans.refresh().map(Message::Clans)
+                        } else {
+                            Task::none()
+                        };
+                    return Update::new(refresh, Some(Event::ClanLocalRequested));
                 }
                 if tab == Tab::Licenses && self.notices.is_none() {
                     self.notices = Some(markdown::Content::parse(THIRD_PARTY_NOTICES));
@@ -1053,8 +1066,14 @@ impl SettingsWindow {
                     clan_panel::Handoff::Map(area) => Event::OpenMap(area),
                     clan_panel::Handoff::MapAccess(area) => Event::OpenMapAccess(area),
                     clan_panel::Handoff::Package(name) => Event::OpenPackage(name),
+                    clan_panel::Handoff::Clans(clans) => Event::ClansListed(clans),
+                    clan_panel::Handoff::Scopes(deltas) => Event::ScopeAssociationsChanged(deltas),
                 });
                 Update { task, event }
+            }
+            Message::ClanLocal(local) => {
+                self.clans.set_local(local);
+                Update::none()
             }
         }
     }
@@ -2332,6 +2351,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "Lantern Company".to_string(),
             description: None,
+            hosts: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             member_count: 1,
             is_owner: true,

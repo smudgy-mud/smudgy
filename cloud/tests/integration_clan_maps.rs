@@ -77,7 +77,12 @@ async fn clan_folders_and_maps_follow_the_clans_grants() {
     let mira = member(&server, "mira");
     let tomas = member(&server, "tomas");
     let outsider = member(&server, "outsider");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &tomas.user);
 
     // Only a holder of atlas.create makes folders.
@@ -374,7 +379,12 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 async fn the_mapper_makes_a_map_in_a_clan_folder_in_the_clan() {
     let server = MockServer::spawn().await;
     let mira = member(&server, "mira");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
 
     let cache = TempCacheDir::new();
@@ -435,7 +445,12 @@ async fn a_new_clan_map_assumes_its_creators_access_until_the_servers_copy() {
     let server = MockServer::spawn().await;
     let mira = member(&server, "mira");
     let tomas = member(&server, "tomas");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &tomas.user);
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
     let members = everyone(&mira, clan).await;
@@ -531,7 +546,12 @@ async fn the_mapper_makes_a_member_owned_map_its_creator_owns() {
     let server = MockServer::spawn().await;
     let mira = member(&server, "mira");
     let tomas = member(&server, "tomas");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &tomas.user);
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
     let everyone = everyone(&mira, clan).await;
@@ -581,7 +601,12 @@ async fn no_map_enters_a_clan_while_it_dissolves() {
     let server = MockServer::spawn().await;
     let mira = member(&server, "mira");
     let tomas = member(&server, "tomas");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &tomas.user);
     let roads = mira.api.create_clan_atlas(clan, "Roads").await.unwrap();
 

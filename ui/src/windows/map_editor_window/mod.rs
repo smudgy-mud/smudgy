@@ -68,15 +68,16 @@ use smudgy_cloud::mapper::{AtlasCache, area_cache::AreaCache};
 use smudgy_cloud::{
     Area, AreaAccess, AreaId, AtlasId, AtlasListItem, AtlasRelocation, CloudError, ConnectionId,
     ConnectionRouting, ConnectionUpdates, MapDestination, MapStorage, Mapper, PortMode,
-    RelocationMode, RoomNumber, RoomSide, SegmentShape, SourceId,
+    RelocationMode, RoomNumber, RoomSide, SegmentShape, SourceId, Uuid,
     automatic_routing::{AutoRouteResult, RouteValidation},
+    clans::ClanSummary,
     mapper::RoomKey,
     mutation::OperationId,
 };
 
 use area_list::SharerIndex;
 use smudgy_core::models::map_scopes::{
-    HostEntry, MapScopes, ScopeDelta, ScopeState, match_host_hints,
+    MapScopes, ScopeDelta, ScopeState, host_entries, match_host_hints,
 };
 use smudgy_map_widget::map_editor::{
     self, EntityId, ExitTarget, MapEditor, MutationRequest, PlacedRoom, SelectedConnectionHandle,
@@ -371,8 +372,12 @@ pub enum Message {
     ScopeAllToggled(bool),
     ScopeMenuToggled(bool),
     MapListFilterChanged(String),
-    /// Open the "Servers…" checklist for an atlas or atlas-less area.
+    /// Open the "Servers…" checklist for a clan, an atlas or an atlas-less
+    /// area.
     ServersChecklistRequested(ScopeTarget),
+    /// A clan header's "Show on {server}": show the clan on the editor's
+    /// server entry too.
+    ShowClanHere(Uuid),
     /// Show/hide the checklist's target on one server entry.
     ScopeServerToggled {
         entry: String,
@@ -399,6 +404,9 @@ pub enum Event {
     /// snapshot; the daemon persists, recomputes each server's exclusions, and
     /// mirrors the corrected store back into every editor.
     ScopeAssociationsChanged(Vec<ScopeDelta>),
+    /// The account's clans as the editor last listed them. The daemon adopts
+    /// their "Plays on" hosts and homes them onto matching server entries.
+    ClansListed(Vec<ClanSummary>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,12 +523,58 @@ pub enum FolderKey {
     Unassigned,
 }
 
-/// A cloud-map scope association target: a whole atlas, or a genuinely
-/// atlas-less area. The unit the "Servers…" checklist writes.
+/// A cloud-map scope association target: a clan (its folders and maps
+/// together), a whole atlas, or a genuinely atlas-less area. The unit the
+/// "Servers…" checklist writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeTarget {
+    Clan(Uuid),
     Atlas(AtlasId),
     Area(AreaId),
+}
+
+impl ScopeTarget {
+    /// The entries the target is shown on (empty = Unassigned).
+    #[must_use]
+    pub fn entries(self, scopes: &MapScopes) -> std::collections::BTreeSet<String> {
+        match self {
+            Self::Clan(clan_id) => scopes.clan_entries(&clan_id),
+            Self::Atlas(atlas_id) => scopes.atlas_entries(&atlas_id),
+            Self::Area(area_id) => scopes.area_entries(&area_id),
+        }
+    }
+
+    /// Where the target sits relative to `entry`.
+    #[must_use]
+    pub fn scope(self, scopes: &MapScopes, entry: &str) -> ScopeState {
+        match self {
+            Self::Clan(clan_id) => scopes.clan_scope(&clan_id, entry),
+            Self::Atlas(atlas_id) => scopes.atlas_scope(&atlas_id, entry),
+            Self::Area(area_id) => scopes.area_scope(&area_id, entry),
+        }
+    }
+
+    /// The delta that shows or hides the target on one entry.
+    #[must_use]
+    pub fn toggle(self, entry: String, show: bool) -> ScopeDelta {
+        match self {
+            Self::Clan(clan_id) => ScopeDelta::SetClanEntry {
+                clan_id,
+                entry,
+                show,
+            },
+            Self::Atlas(atlas_id) => ScopeDelta::SetAtlasEntry {
+                atlas_id,
+                entry,
+                show,
+            },
+            Self::Area(area_id) => ScopeDelta::SetAreaEntry {
+                area_id,
+                entry,
+                show,
+            },
+        }
+    }
 }
 
 pub struct MapEditorWindow {
@@ -1001,6 +1055,15 @@ impl MapEditorWindow {
         if self.mapper.local_atlas_ids().contains(&atlas_id) {
             return None;
         }
+        // A clan's folder shows wherever its clan does.
+        if let Some(clan_id) = self
+            .atlases
+            .iter()
+            .find(|atlas| atlas.id == atlas_id)
+            .and_then(|atlas| atlas.clan_id)
+        {
+            return self.associate_new_clan_content(clan_id);
+        }
         let delta = ScopeDelta::SetAtlasEntry {
             atlas_id,
             entry: server,
@@ -1010,11 +1073,85 @@ impl MapEditorWindow {
         Some(Event::ScopeAssociationsChanged(vec![delta]))
     }
 
+    /// Creation-associates a clan's new folder or map from a session-scoped
+    /// editor: the clan shows on the session's entry when it is shown nowhere
+    /// yet. Creation is deliberate, so a clan with "Plays on" hosts is
+    /// associated too.
+    pub(super) fn associate_new_clan_content(&mut self, clan_id: Uuid) -> Option<Event> {
+        let server = self.server_name.clone()?;
+        if self.map_scopes.clan_scope(&clan_id, &server) != ScopeState::Unassigned {
+            return None;
+        }
+        let delta = ScopeTarget::Clan(clan_id).toggle(server, true);
+        self.map_scopes.apply(&delta);
+        Some(Event::ScopeAssociationsChanged(vec![delta]))
+    }
+
+    /// A map or folder moving into a clan that shows nowhere yet gives the
+    /// clan the servers it was shown on, so it stays where it was. `entries`
+    /// are where the moved content showed, taken before it moved.
+    pub(super) fn seed_clan_servers(
+        &mut self,
+        clan_id: Uuid,
+        entries: std::collections::BTreeSet<String>,
+    ) -> Option<Event> {
+        if entries.is_empty() || !self.map_scopes.clan_entries(&clan_id).is_empty() {
+            return None;
+        }
+        let deltas: Vec<ScopeDelta> = entries
+            .into_iter()
+            .map(|entry| ScopeTarget::Clan(clan_id).toggle(entry, true))
+            .collect();
+        for delta in &deltas {
+            self.map_scopes.apply(delta);
+        }
+        Some(Event::ScopeAssociationsChanged(deltas))
+    }
+
+    /// Where a map shows before it moves into a clan, for
+    /// [`Self::seed_clan_servers`]; nothing for content already in a clan.
+    pub(super) fn servers_before_move(
+        &self,
+        target: Option<ScopeTarget>,
+    ) -> std::collections::BTreeSet<String> {
+        match target {
+            Some(ScopeTarget::Clan(_)) | None => std::collections::BTreeSet::new(),
+            Some(target) => target.entries(&self.map_scopes),
+        }
+    }
+
+    /// The scope target a cloud map is written against: its clan, its atlas,
+    /// or the atlas-less map itself. `None` for local and session maps, which
+    /// are never scoped. A Secret's or Private source's id resolves to its map.
+    pub(super) fn scope_target_for_area(&self, area_id: AreaId) -> Option<ScopeTarget> {
+        let atlas = self.mapper.get_current_atlas();
+        let area_id = atlas.map_of(&area_id).unwrap_or(area_id);
+        if self.mapper.area_storage(&area_id) == MapStorage::Session
+            || self.mapper.local_area_ids().contains(&area_id)
+        {
+            return None;
+        }
+        let (atlas_id, clan_id) = atlas.get_area(&area_id).map_or((None, None), |area| {
+            let meta = area.meta();
+            (meta.atlas_id, meta.clan_id)
+        });
+        match (clan_id, atlas_id) {
+            (Some(clan_id), _) => Some(ScopeTarget::Clan(clan_id)),
+            (None, Some(atlas_id)) if self.mapper.local_atlas_ids().contains(&atlas_id) => None,
+            (None, Some(atlas_id)) => Some(ScopeTarget::Atlas(atlas_id)),
+            (None, None) => Some(ScopeTarget::Area(area_id)),
+        }
+    }
+
     /// Creation-associates: a cloud *atlas-less* area created from a
     /// session-scoped editor gets an area-level association (an area filed into
-    /// an atlas is scoped by its atlas, so it needs none). Local/ephemeral areas
-    /// stay entry-isolated.
+    /// an atlas is scoped by its atlas, so it needs none), and a clan's new map
+    /// associates its clan when the clan is shown nowhere yet. Local/ephemeral
+    /// areas stay entry-isolated.
     fn associate_new_area(&mut self, area_id: AreaId) -> Option<Event> {
+        if let Some(ScopeTarget::Clan(clan_id)) = self.scope_target_for_area(area_id) {
+            return self.associate_new_clan_content(clan_id);
+        }
         let server = self.server_name.clone()?;
         let atlas = self.mapper.get_current_atlas();
         let has_atlas = atlas
@@ -1048,42 +1185,18 @@ impl MapEditorWindow {
         if self.scope_all {
             return None;
         }
-        if self.mapper.area_storage(&area_id) == MapStorage::Session
-            || self.mapper.local_area_ids().contains(&area_id)
+        let target = self.scope_target_for_area(area_id)?;
+        // A clan with "Plays on" hosts is placed by homing alone, and one not
+        // listed yet may have hosts.
+        if let ScopeTarget::Clan(clan_id) = target
+            && !self.clans.binds_on_use(clan_id)
         {
             return None;
         }
-        let atlas_id = self
-            .mapper
-            .get_current_atlas()
-            .get_area(&area_id)
-            .and_then(|area| area.meta().atlas_id);
-        if let Some(atlas_id) = atlas_id
-            && self.mapper.local_atlas_ids().contains(&atlas_id)
-        {
+        if target.scope(&self.map_scopes, &server) != ScopeState::Unassigned {
             return None;
         }
-        let unassigned = match atlas_id {
-            Some(atlas_id) => {
-                self.map_scopes.atlas_scope(&atlas_id, &server) == ScopeState::Unassigned
-            }
-            None => self.map_scopes.area_scope(&area_id, &server) == ScopeState::Unassigned,
-        };
-        if !unassigned {
-            return None;
-        }
-        let delta = match atlas_id {
-            Some(atlas_id) => ScopeDelta::SetAtlasEntry {
-                atlas_id,
-                entry: server,
-                show: true,
-            },
-            None => ScopeDelta::SetAreaEntry {
-                area_id,
-                entry: server,
-                show: true,
-            },
-        };
+        let delta = target.toggle(server, true);
         self.map_scopes.apply(&delta);
         Some(Event::ScopeAssociationsChanged(vec![delta]))
     }
@@ -1135,15 +1248,7 @@ impl MapEditorWindow {
     ) -> Vec<ScopeDelta> {
         // The local server entries are the homing evidence (§5.1). Hosts are
         // consumed here once and never stored as keys.
-        let entries: Vec<HostEntry> = smudgy_core::models::server::list_servers()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|server| HostEntry {
-                name: server.name,
-                host: server.config.host,
-                port: server.config.port,
-            })
-            .collect();
+        let entries = host_entries();
 
         // area id -> atlas id, so an area-scope grant can home the *atlas* its
         // area belongs to (the §6 walkthrough: area grants from "Cities" home
@@ -1152,6 +1257,12 @@ impl MapEditorWindow {
             .iter()
             .filter_map(|area| area.atlas_id.map(|atlas_id| (area.id, atlas_id)))
             .collect();
+        // A clan's maps are scoped by their clan, never by these grants.
+        let clan_content: HashSet<AreaId> = areas
+            .iter()
+            .filter(|area| area.clan_id.is_some())
+            .map(|area| area.id)
+            .collect();
 
         // Aggregate the covering grants' host hints per homing target.
         let mut atlas_hints: std::collections::HashMap<AtlasId, Vec<String>> =
@@ -1159,6 +1270,13 @@ impl MapEditorWindow {
         let mut area_hints: std::collections::HashMap<AreaId, Vec<String>> =
             std::collections::HashMap::new();
         for row in grants {
+            if row
+                .grant
+                .area_id
+                .is_some_and(|area_id| clan_content.contains(&area_id))
+            {
+                continue;
+            }
             let hints = row.grant.host_hints.clone().unwrap_or_default();
             match (row.grant.atlas_id, row.grant.area_id) {
                 (Some(atlas_id), _) => atlas_hints.entry(atlas_id).or_default().extend(hints),
@@ -4374,6 +4492,7 @@ impl MapEditorWindow {
                 // inventory. Local atlases and ephemeral areas never get here
                 // (no affordance is drawn for them).
                 let name = match target {
+                    ScopeTarget::Clan(clan_id) => self.clans.name(clan_id).unwrap_or_default(),
                     ScopeTarget::Atlas(atlas_id) => self
                         .atlases
                         .iter()
@@ -4387,20 +4506,32 @@ impl MapEditorWindow {
                         .map(|a| a.get_name().to_string())
                         .unwrap_or_default(),
                 };
+                let plays_on = match target {
+                    ScopeTarget::Clan(clan_id) => self.clans.hosts(clan_id).to_vec(),
+                    ScopeTarget::Atlas(_) | ScopeTarget::Area(_) => Vec::new(),
+                };
                 let servers = smudgy_core::models::server::list_servers()
                     .map(|servers| servers.into_iter().map(|s| s.name).collect::<Vec<_>>())
                     .unwrap_or_default();
-                let checked = match target {
-                    ScopeTarget::Atlas(atlas_id) => self.map_scopes.atlas_entries(&atlas_id),
-                    ScopeTarget::Area(area_id) => self.map_scopes.area_entries(&area_id),
-                };
+                let checked = target.entries(&self.map_scopes);
+                self.clans.menu = None;
                 self.modal = Some(modals::Modal::ServersChecklist {
                     target,
                     name,
+                    plays_on,
                     servers,
                     checked,
                 });
                 Update::none()
+            }
+            Message::ShowClanHere(clan_id) => {
+                self.clans.menu = None;
+                let Some(server) = self.server_name.clone() else {
+                    return Update::none();
+                };
+                let delta = ScopeTarget::Clan(clan_id).toggle(server, true);
+                self.map_scopes.apply(&delta);
+                Update::with_event(Event::ScopeAssociationsChanged(vec![delta]))
             }
             Message::ScopeServerToggled { entry, show } => {
                 let Some(modals::Modal::ServersChecklist {
@@ -4414,18 +4545,7 @@ impl MapEditorWindow {
                 } else {
                     checked.remove(&entry);
                 }
-                let delta = match *target {
-                    ScopeTarget::Atlas(atlas_id) => ScopeDelta::SetAtlasEntry {
-                        atlas_id,
-                        entry,
-                        show,
-                    },
-                    ScopeTarget::Area(area_id) => ScopeDelta::SetAreaEntry {
-                        area_id,
-                        entry,
-                        show,
-                    },
-                };
+                let delta = target.toggle(entry, show);
                 self.map_scopes.apply(&delta);
                 Update::with_event(Event::ScopeAssociationsChanged(vec![delta]))
             }
@@ -4439,10 +4559,7 @@ impl MapEditorWindow {
                     target, checked, ..
                 }) = &mut self.modal
                 {
-                    *checked = match *target {
-                        ScopeTarget::Atlas(atlas_id) => self.map_scopes.atlas_entries(&atlas_id),
-                        ScopeTarget::Area(area_id) => self.map_scopes.area_entries(&area_id),
-                    };
+                    *checked = target.entries(&self.map_scopes);
                 }
                 self.refresh_multi_servers();
                 Update::none()

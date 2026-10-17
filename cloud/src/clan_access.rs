@@ -186,6 +186,8 @@ impl IndexedResource {
 pub struct ClanProfilePatch {
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Replaces the clan's hosts; an empty list clears them.
+    pub hosts: Option<Vec<String>>,
 }
 
 impl ClanProfilePatch {
@@ -196,6 +198,9 @@ impl ClanProfilePatch {
         }
         if let Some(description) = &self.description {
             body.insert("description".to_string(), json!(description));
+        }
+        if let Some(hosts) = &self.hosts {
+            body.insert("hosts".to_string(), json!(hosts));
         }
         Value::Object(body)
     }
@@ -550,8 +555,14 @@ mod tests {
         let patch = ClanProfilePatch {
             name: None,
             description: Some(String::new()),
+            hosts: None,
         };
         assert_eq!(patch.to_body(), json!({ "description": "" }));
+        let cleared = ClanProfilePatch {
+            hosts: Some(Vec::new()),
+            ..ClanProfilePatch::default()
+        };
+        assert_eq!(cleared.to_body(), json!({ "hosts": [] }));
     }
 
     #[test]

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A clan's maps show on the game the clan plays.** A clan lists the hosts its
+  game answers on, under "Plays on" in Settings › Clans; a game reached under
+  several names lists each. A clan made while you're connected starts with that
+  server's host. Join a clan, connect to its game, and its maps are on that
+  server with nothing to set up. A clan's folders always move together: "Show on
+  …" and "Servers…" on the clan's ⋯ menu place all of them at once, and with
+  more than one server you can pick which of your MUDs use the clan's maps in
+  the clan's Settings tab. Moving a map or folder into a clan that isn't on any
+  server yet takes the servers the map or folder was on.
 - User scripts and Smudgy package modules can import `@name` or `@name/subpath`
   as shorthand for `smudgy:@name` or `smudgy:@name/subpath`. Static imports,
   re-exports, and dynamic imports share the same package instance and checks.
@@ -146,6 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deleting a server no longer hides folders on every other server.** A folder
+  shown only on the deleted server goes back to showing on every server.
 - **The connection rule no longer flips to "Disconnected" when a connect attempt
   is replaced mid-dial.** A newer attempt's "Connecting to …" is left alone when
   the attempt it replaced reports its own end.

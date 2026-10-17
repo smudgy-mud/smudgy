@@ -159,6 +159,8 @@ pub enum Modal {
     ServersChecklist {
         target: super::ScopeTarget,
         name: String,
+        /// A clan's "Plays on" hosts; empty for a folder or map.
+        plays_on: Vec<String>,
         servers: Vec<String>,
         checked: std::collections::BTreeSet<String>,
     },
@@ -685,7 +687,9 @@ pub enum TransferMessage {
     /// Whose the maps become in the picked clan.
     OwnershipPicked(smudgy_cloud::clan_maps::MapOwnership),
     Submit,
-    Submitted(Result<(), CloudError>),
+    /// The transfer's answer, and where its subject showed when it was
+    /// submitted, for a clan shown nowhere yet.
+    Submitted(Result<(), CloudError>, std::collections::BTreeSet<String>),
     CloseTick,
 }
 
@@ -728,13 +732,21 @@ pub(super) fn update_transfer(
     window: &mut MapEditorWindow,
     message: TransferMessage,
 ) -> Update<Message, super::Event> {
+    let servers_before = match (&message, &window.modal) {
+        (TransferMessage::Submit, Some(Modal::TransferOffer(dialog))) => window
+            .servers_before_move(match &dialog.subject {
+                TransferSubject::Area(area, _) => window.scope_target_for_area(*area),
+                TransferSubject::Atlas(atlas, _) => Some(super::ScopeTarget::Atlas(*atlas)),
+            }),
+        _ => std::collections::BTreeSet::new(),
+    };
     let Some(Modal::TransferOffer(dialog)) = &mut window.modal else {
         return Update::none();
     };
     if dialog.submitting
         && !matches!(
             message,
-            TransferMessage::Submitted(_)
+            TransferMessage::Submitted(..)
                 | TransferMessage::CloseTick
                 | TransferMessage::FriendsLoaded(_)
         )
@@ -818,22 +830,31 @@ pub(super) fn update_transfer(
                         }
                     }
                 },
-                |result| transfer(TransferMessage::Submitted(result)),
+                move |result| transfer(TransferMessage::Submitted(result, servers_before)),
             ))
         }
-        TransferMessage::Submitted(result) => match result {
+        TransferMessage::Submitted(result, servers_before) => match result {
             Ok(()) => {
                 dialog.sent = true;
+                let into_clan = match dialog.selected {
+                    Some(TransferRecipient::Clan(clan, _)) => Some(clan),
+                    _ => None,
+                };
+                let seeded =
+                    into_clan.and_then(|clan| window.seed_clan_servers(clan, servers_before));
                 window.mapper.sync_now();
                 // A transfer into a clan answers once ownership moves; its
                 // maps keep arriving for a while.
-                Update::with_task(Task::batch([
-                    Task::perform(
-                        async { tokio::time::sleep(Duration::from_millis(1600)).await },
-                        |()| transfer(TransferMessage::CloseTick),
-                    ),
-                    super::follow_up_syncs(),
-                ]))
+                Update::new(
+                    Task::batch([
+                        Task::perform(
+                            async { tokio::time::sleep(Duration::from_millis(1600)).await },
+                            |()| transfer(TransferMessage::CloseTick),
+                        ),
+                        super::follow_up_syncs(),
+                    ]),
+                    seeded,
+                )
             }
             Err(error) => {
                 dialog.submitting = false;
@@ -1504,13 +1525,15 @@ pub(super) fn open_share_dialog_on(
         .find(|place| place.source == target)
         .and_then(|place| place.clan_id);
 
-    // §4.2: snapshot the hosts of the shared thing's associated entries. For an
-    // atlas-filed area that's its atlas's entries (atlas-level association is
-    // the norm); for a genuinely atlas-less area, the area's own entries.
-    let host_hints = disclose_hosts(&match area.meta().atlas_id {
-        Some(atlas_id) => window.map_scopes.atlas_entries(&atlas_id),
-        None => window.map_scopes.area_entries(&area_id),
-    });
+    // §4.2: snapshot the hosts of the shared thing's associated entries: its
+    // clan's, its atlas's (atlas-level association is the norm), or for a
+    // genuinely atlas-less area, the area's own.
+    let host_hints = disclose_hosts(
+        &window
+            .scope_target_for_area(area_id)
+            .map(|target| target.entries(&window.map_scopes))
+            .unwrap_or_default(),
+    );
     window.modal = Some(Modal::Share(Box::new(ShareDialog {
         area_id,
         area_name: area.get_name().to_string(),
@@ -3114,12 +3137,13 @@ impl Modal {
             ),
             Modal::ServersChecklist {
                 name,
+                plays_on,
                 servers,
                 checked,
                 ..
             } => (
                 crate::i18n::t!("mapper-show-on-servers"),
-                servers_checklist_view(name, servers, checked),
+                servers_checklist_view(name, plays_on, servers, checked),
             ),
             Modal::Multi(dialog) => (dialog.title(), dialog.view()),
             Modal::Clan(modal) => modal.view(),
@@ -3173,11 +3197,22 @@ pub(super) fn section_label(label: String) -> iced::widget::Text<'static, crate:
 /// everywhere).
 fn servers_checklist_view<'a>(
     name: &'a str,
+    plays_on: &'a [String],
     servers: &'a [String],
     checked: &'a std::collections::BTreeSet<String>,
 ) -> ThemedElement<'a, Message> {
     let mut list =
         column![text(crate::i18n::t!("mapper-show-name-on", "name" => name)).size(13)].spacing(6);
+    if !plays_on.is_empty() {
+        list = list.push(
+            text(crate::i18n::t!(
+                "clan-maps-plays-on",
+                "hosts" => plays_on.join(&crate::i18n::t!("mapper-multi-list-separator"))
+            ))
+            .size(12)
+            .style(muted),
+        );
+    }
 
     if servers.is_empty() {
         list = list.push(

@@ -16,7 +16,9 @@
 //!   grants, each a scope, preset chips and a note) and Members.
 //! - **Access**: the clan's Clan-owned maps and folders, its packages and the
 //!   Clan Secrets the caller reads, each with the groups that reach it.
-//! - **Settings**: the clan's name and description, leaving, and deleting.
+//! - **Settings**: the clan's name and description, the hosts its game plays
+//!   on, which of this computer's servers show its maps, leaving, and
+//!   deleting.
 //!
 //! Controls gate on what the server says the caller may do: the clan's
 //! `actions`, each group's `actions`, each indexed resource's `actions`, and
@@ -39,6 +41,7 @@ use smudgy_cloud::clans::{
 };
 use smudgy_cloud::cloud_api::UserRef;
 use smudgy_cloud::{AreaId, CloudError, SourceId, Uuid};
+use smudgy_core::models::map_scopes::{MapScopes, ScopeDelta};
 use smudgy_palette::{ColorSequence, Rgb};
 
 use crate::cloud_account::CloudHandles;
@@ -103,6 +106,20 @@ pub enum Handoff {
     MapAccess(AreaId),
     /// Show a package in Automations, by name.
     Package(String),
+    /// The account's clans as last listed, for homing them onto servers.
+    Clans(Vec<ClanSummary>),
+    /// The viewer changed which of this computer's servers show a clan.
+    Scopes(Vec<ScopeDelta>),
+}
+
+/// What this computer knows that the clan pages show, which the host keeps
+/// current: the active session's host, the default "Plays on" for a new
+/// clan; the server entries; and where the clans' maps show on them.
+#[derive(Debug, Clone, Default)]
+pub struct LocalContext {
+    pub session_host: Option<String>,
+    pub servers: Vec<String>,
+    pub scopes: MapScopes,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +131,8 @@ pub enum Message {
     Loaded(u64, Result<ClansOverview, CloudError>),
 
     NewClanNameChanged(String),
+    /// Leave the active session's host out of the new clan's "Plays on".
+    NewClanHostRemoved,
     CreateClan,
     ClanCreated(Result<ClanSummary, CloudError>),
 
@@ -205,6 +224,20 @@ pub enum Message {
 
     // ===== settings =====
     ProfileNameChanged(String),
+    HostInputChanged(String),
+    /// Add a host to the open clan's "Plays on".
+    AddHost(String),
+    RemoveHost(String),
+    /// A "Plays on" change landed, with the clan as it now stands.
+    HostsSaved(Uuid, Result<ClanSummary, CloudError>),
+    /// Use the open clan's maps on every server (no server named), or on the
+    /// servers checked below it.
+    UseEverywhereToggled(bool),
+    /// Show the open clan on one of this computer's servers, or not.
+    ShownHereToggled {
+        entry: String,
+        show: bool,
+    },
     ProfileDescriptionChanged(String),
     SaveProfile,
     LeaveClanPressed,
@@ -323,6 +356,9 @@ pub struct ClanPage {
 
     profile_name: String,
     profile_description: String,
+    host_input: String,
+    /// A "Plays on" change is on its way; further ones wait for it.
+    saving_hosts: bool,
 
     confirm: Option<Confirm>,
     modal: Option<Modal>,
@@ -353,6 +389,8 @@ impl ClanPage {
             secret_grants: None,
             profile_name,
             profile_description,
+            host_input: String::new(),
+            saving_hosts: false,
             confirm: None,
             modal: None,
         }
@@ -534,6 +572,9 @@ pub struct ClanPanel {
     /// Leaving copies the caller's Member-owned maps to My maps first.
     leave_copy: bool,
     new_clan_name: String,
+    /// The viewer took the session's host off the new clan's "Plays on".
+    new_clan_host_removed: bool,
+    local: LocalContext,
     open: Option<ClanPage>,
     /// What the panel asked another window to show, for the host to take.
     handoff: Option<Handoff>,
@@ -555,6 +596,8 @@ impl ClanPanel {
             map_offers: clan_map_offers::MapOffers::default(),
             leave_copy: true,
             new_clan_name: String::new(),
+            new_clan_host_removed: false,
+            local: LocalContext::default(),
             open: None,
             handoff: None,
             busy: false,
@@ -562,6 +605,20 @@ impl ClanPanel {
             notice: None,
             email_unverified: false,
         }
+    }
+
+    /// Adopts what this computer knows: the active session's host and where
+    /// the clans' maps show.
+    pub fn set_local(&mut self, local: LocalContext) {
+        self.local = local;
+    }
+
+    /// The new clan's default "Plays on": the active session's host, unless
+    /// the viewer removed it.
+    fn new_clan_host(&self) -> Option<&str> {
+        (!self.new_clan_host_removed)
+            .then_some(self.local.session_host.as_deref())
+            .flatten()
     }
 
     /// Whether the list has loaded yet (the host refreshes on first open).
@@ -778,6 +835,7 @@ impl ClanPanel {
             Message::Loaded(_, result) => {
                 match result {
                     Ok(overview) => {
+                        self.handoff = Some(Handoff::Clans(overview.clans.clone()));
                         self.clans = Some(overview.clans);
                         self.invitations = overview.invitations;
                     }
@@ -791,6 +849,10 @@ impl ClanPanel {
                 self.new_clan_name = name;
                 Task::none()
             }
+            Message::NewClanHostRemoved => {
+                self.new_clan_host_removed = true;
+                Task::none()
+            }
             Message::CreateClan => {
                 if self.busy {
                     return Task::none();
@@ -802,9 +864,14 @@ impl ClanPanel {
                     return Task::none();
                 }
                 self.busy = true;
+                let hosts: Vec<String> = self
+                    .new_clan_host()
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect();
                 let client = self.cloud.client.clone();
                 Task::perform(
-                    async move { client.create_clan(&name).await },
+                    async move { client.create_clan(&name, &hosts).await },
                     Message::ClanCreated,
                 )
             }
@@ -813,6 +880,7 @@ impl ClanPanel {
                 match result {
                     Ok(clan) => {
                         self.new_clan_name.clear();
+                        self.new_clan_host_removed = false;
                         let clan_id = clan.id;
                         self.open = Some(ClanPage::new(clan));
                         self.refresh_after(clan_id)
@@ -1477,6 +1545,90 @@ impl ClanPanel {
                 Task::none()
             }
             Message::SaveProfile => self.save_profile(),
+            Message::HostInputChanged(value) => {
+                if let Some(page) = self.open.as_mut() {
+                    page.host_input = value;
+                }
+                Task::none()
+            }
+            Message::AddHost(host) => {
+                let host = host.trim().to_ascii_lowercase();
+                let Some(page) = self.open.as_mut() else {
+                    return Task::none();
+                };
+                if page.saving_hosts || host.is_empty() {
+                    return Task::none();
+                }
+                if page.clan.hosts.contains(&host) {
+                    page.host_input.clear();
+                    return Task::none();
+                }
+                let mut hosts = page.clan.hosts.clone();
+                hosts.push(host);
+                self.save_hosts(hosts)
+            }
+            Message::RemoveHost(host) => {
+                let Some(page) = self.open.as_ref() else {
+                    return Task::none();
+                };
+                if page.saving_hosts {
+                    return Task::none();
+                }
+                let hosts = page
+                    .clan
+                    .hosts
+                    .iter()
+                    .filter(|kept| **kept != host)
+                    .cloned()
+                    .collect();
+                self.save_hosts(hosts)
+            }
+            Message::HostsSaved(clan_id, result) => {
+                let page = self.page_for(clan_id);
+                if let Some(page) = page {
+                    page.saving_hosts = false;
+                }
+                match result {
+                    Ok(summary) => {
+                        if let Some(page) = self.page_for(clan_id) {
+                            page.host_input.clear();
+                            page.clan.hosts.clone_from(&summary.hosts);
+                        }
+                        self.adopt_summary(summary);
+                    }
+                    Err(err) => self.absorb_error(&err),
+                }
+                Task::none()
+            }
+            Message::UseEverywhereToggled(everywhere) => {
+                let Some(clan_id) = self.open_id() else {
+                    return Task::none();
+                };
+                // Leaving "everywhere" names every server, so nothing changes
+                // until one is unchecked.
+                let entries = if everywhere {
+                    BTreeSet::new()
+                } else {
+                    self.local.servers.iter().cloned().collect()
+                };
+                let delta = ScopeDelta::SetClanEntries { clan_id, entries };
+                self.local.scopes.apply(&delta);
+                self.handoff = Some(Handoff::Scopes(vec![delta]));
+                Task::none()
+            }
+            Message::ShownHereToggled { entry, show } => {
+                let Some(clan_id) = self.open_id() else {
+                    return Task::none();
+                };
+                let delta = ScopeDelta::SetClanEntry {
+                    clan_id,
+                    entry,
+                    show,
+                };
+                self.local.scopes.apply(&delta);
+                self.handoff = Some(Handoff::Scopes(vec![delta]));
+                Task::none()
+            }
             Message::LeaveClanPressed => {
                 self.set_confirm(Confirm::LeaveClan);
                 Task::none()
@@ -1573,6 +1725,22 @@ impl ClanPanel {
         self.load_page(clan_id)
     }
 
+    /// Keeps the clan list in step with a clan page's fresher summary, and
+    /// hands the list over when the clan's hosts changed.
+    fn adopt_summary(&mut self, summary: ClanSummary) {
+        let Some(clans) = self.clans.as_mut() else {
+            return;
+        };
+        let Some(listed) = clans.iter_mut().find(|clan| clan.id == summary.id) else {
+            return;
+        };
+        let hosts_changed = listed.hosts != summary.hosts;
+        *listed = summary;
+        if hosts_changed && self.handoff.is_none() {
+            self.handoff = Some(Handoff::Clans(clans.clone()));
+        }
+    }
+
     fn page_loaded(
         &mut self,
         clan_id: Uuid,
@@ -1587,6 +1755,11 @@ impl ClanPanel {
                     return Task::none();
                 };
                 page.apply(data);
+                let summary = page.clan.clone();
+                self.adopt_summary(summary);
+                let Some(page) = self.page_for(clan_id) else {
+                    return Task::none();
+                };
                 let roster = page
                     .selected_group
                     .and_then(|id| page.group(id).cloned())
@@ -1880,6 +2053,25 @@ impl ClanPanel {
         )
     }
 
+    /// Replaces the open clan's "Plays on" hosts.
+    fn save_hosts(&mut self, hosts: Vec<String>) -> Task<Message> {
+        let Some(page) = self.open.as_mut() else {
+            return Task::none();
+        };
+        page.saving_hosts = true;
+        let clan_id = page.clan.id;
+        self.clear_feedback();
+        let patch = ClanProfilePatch {
+            hosts: Some(hosts),
+            ..ClanProfilePatch::default()
+        };
+        let client = self.cloud.client.clone();
+        Task::perform(
+            async move { client.update_clan_profile(clan_id, &patch).await },
+            move |result| Message::HostsSaved(clan_id, result),
+        )
+    }
+
     fn save_profile(&mut self) -> Task<Message> {
         let Some(page) = self.open.as_ref() else {
             return Task::none();
@@ -1894,6 +2086,7 @@ impl ClanPanel {
             name: (name != page.clan.name).then_some(name),
             description: (description != page.clan.description.clone().unwrap_or_default())
                 .then_some(description),
+            hosts: None,
         };
         if patch == ClanProfilePatch::default() {
             return Task::none();

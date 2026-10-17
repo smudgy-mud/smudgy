@@ -281,6 +281,7 @@ mod tests {
             id: Uuid::from_u128(id),
             name: name.to_string(),
             description: None,
+            hosts: Vec::new(),
             created_at: chrono::DateTime::UNIX_EPOCH,
             member_count: 3,
             is_owner: false,

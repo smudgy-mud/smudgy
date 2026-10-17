@@ -128,7 +128,7 @@ async fn the_last_owner_of_a_clan_is_refused_and_nothing_changes() {
     let (_, tomas_client) = user(&server, "tomas");
     let mira_map = server.create_area(&mira, "Lantern Docks");
     let clan = mira_client
-        .create_clan("Lantern Company")
+        .create_clan("Lantern Company", &[])
         .await
         .expect("clan");
 

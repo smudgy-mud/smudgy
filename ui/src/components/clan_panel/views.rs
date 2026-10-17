@@ -140,6 +140,19 @@ impl ClanPanel {
             .align_y(Alignment::Center),
         ]
         .spacing(12);
+        if let Some(host) = self.new_clan_host() {
+            col = col.push(
+                row![
+                    muted(crate::i18n::t!("clans-new-plays-on", "host" => host)),
+                    button(text("×").size(13))
+                        .style(theme::builtins::button::quiet_link)
+                        .padding([0, 4])
+                        .on_press(Message::NewClanHostRemoved),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+        }
 
         if !self.invitations.is_empty() {
             col = col.push(rule::horizontal(1));
@@ -1350,6 +1363,11 @@ impl ClanPanel {
         }
 
         col = col.push(rule::horizontal(1));
+        col = col.push(self.plays_on(page, editable));
+        if let Some(shown_here) = self.shown_here(page) {
+            col = col.push(shown_here);
+        }
+        col = col.push(rule::horizontal(1));
         let last_owner = me.is_some_and(|me| is_last_owner(clan, page.members.as_deref(), me));
         let leave = button(text(crate::i18n::t!("clans-leave-clan")).size(13))
             .style(theme::builtins::button::secondary)
@@ -1399,6 +1417,116 @@ impl ClanPanel {
             _ => {}
         }
         col.into()
+    }
+
+    /// The clan's "Plays on" hosts, which holders of `clan.edit_profile` add
+    /// and remove.
+    fn plays_on<'a>(&'a self, page: &'a ClanPage, editable: bool) -> ThemedElement<'a, Message> {
+        let clan = &page.clan;
+        let mut col = column![
+            text(crate::i18n::t!("clans-plays-on-label")).size(16),
+            muted(crate::i18n::t!("clans-plays-on-help")),
+        ]
+        .spacing(6);
+        if clan.hosts.is_empty() {
+            col = col.push(muted(crate::i18n::t!("clans-plays-on-none")));
+        }
+        for host in &clan.hosts {
+            let mut host_row = row![text(host.clone()).size(13)]
+                .spacing(8)
+                .align_y(Alignment::Center);
+            if editable {
+                host_row = host_row.push(
+                    button(text(crate::i18n::t!("action-remove")).size(12))
+                        .style(theme::builtins::button::secondary)
+                        .padding([2, 8])
+                        .on_press_maybe(
+                            (!page.saving_hosts).then(|| Message::RemoveHost(host.clone())),
+                        ),
+                );
+            }
+            col = col.push(host_row);
+        }
+        if editable {
+            col = col.push(
+                row![
+                    text_input(
+                        crate::i18n::ts!("clans-plays-on-placeholder"),
+                        &page.host_input
+                    )
+                    .on_input(Message::HostInputChanged)
+                    .on_submit(Message::AddHost(page.host_input.clone()))
+                    .width(260),
+                    button(text(crate::i18n::t!("action-add")).size(13))
+                        .style(theme::builtins::button::secondary)
+                        .padding([4, 10])
+                        .on_press_maybe(
+                            (!page.saving_hosts).then(|| Message::AddHost(page.host_input.clone())),
+                        ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+            if let Some(host) = self.local.session_host.as_ref()
+                && !clan.hosts.contains(host)
+            {
+                col = col.push(
+                    button(
+                        text(crate::i18n::t!(
+                            "clans-plays-on-add-host",
+                            "host" => host.clone(),
+                            "clan" => clan.name.clone()
+                        ))
+                        .size(12),
+                    )
+                    .style(theme::builtins::button::quiet_link)
+                    .padding([2, 0])
+                    .on_press_maybe((!page.saving_hosts).then(|| Message::AddHost(host.clone()))),
+                );
+            }
+        }
+        col.max_width(560).into()
+    }
+
+    /// Which of this computer's servers show the clan's maps: a choice kept
+    /// on this computer, offered only to a viewer with more than one server.
+    /// "Use everywhere" (no server named) heads the list; while it holds, each
+    /// server reads as checked and can't be changed, and the last server
+    /// checked can't be unchecked.
+    fn shown_here<'a>(&'a self, page: &'a ClanPage) -> Option<ThemedElement<'a, Message>> {
+        if self.local.servers.len() < 2 {
+            return None;
+        }
+        let shown = self.local.scopes.clan_entries(&page.clan.id);
+        let everywhere = shown.is_empty();
+        let mut col = column![
+            text(crate::i18n::t!("clans-shown-here-label")).size(16),
+            checkbox(everywhere)
+                .label(crate::i18n::t!("clans-use-everywhere"))
+                .size(14)
+                .text_size(13)
+                .on_toggle(Message::UseEverywhereToggled),
+            container(rule::horizontal(1)).width(Length::Fixed(220.0)),
+        ]
+        .spacing(6);
+        for server in &self.local.servers {
+            let checked = everywhere || shown.contains(server);
+            let last = !everywhere && checked && shown.len() == 1;
+            let entry = server.clone();
+            col = col.push(
+                checkbox(checked)
+                    .label(server.clone())
+                    .size(14)
+                    .text_size(13)
+                    .on_toggle_maybe((!everywhere && !last).then_some(move |show| {
+                        Message::ShownHereToggled {
+                            entry: entry.clone(),
+                            show,
+                        }
+                    })),
+            );
+        }
+        Some(col.into())
     }
 
     fn feedback(&self) -> ThemedElement<'_, Message> {

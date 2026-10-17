@@ -3,8 +3,8 @@
 //! cloud ("My shared maps"), each of their clans, one "Shared by" group per
 //! sharer, and session maps. Folders sit one step in under their group, and
 //! maps one step further in under their folder. The active area is
-//! highlighted. A map shows in every folder holding it; "Shared by" leaves
-//! out maps in a clan folder.
+//! highlighted. "Shared by" leaves out maps in a clan folder. A clan's
+//! folders show wherever the clan is shown: the clan is scoped as one.
 //!
 //! Shared rows are grouped by the *sharer's* identity (the friend who handed
 //! the map to the viewer), resolved from the received-grants list, falling
@@ -738,8 +738,7 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
         &ephemeral,
     );
     // Each clan's folders list between the viewer's own maps and "Shared
-    // by"; a map in a clan folder lists there, and in every other folder
-    // holding it.
+    // by".
     let mut clans = clan_maps::clan_groups(window, &atlas, &family_members, &ephemeral);
     let in_clans = clan_maps::in_clan_folders(&atlas);
     let mut shared = shared_groups(&atlas, window.sharers.as_ref(), &family_members, &in_clans);
@@ -869,26 +868,10 @@ fn partition_shared_group(
     frags
 }
 
-/// Split one clan's folders into the three scope buckets for `server`. The
-/// clan's name labels each bucket its folders land in.
-fn partition_clan(window: &MapEditorWindow, group: ClanGroup, server: &str) -> [ClanGroup; 3] {
-    let mut parts = std::array::from_fn(|_| ClanGroup {
-        clan_id: group.clan_id,
-        label: group.label.clone(),
-        incoming: group.incoming,
-        folders: Vec::new(),
-        unfiled: Vec::new(),
-    });
-    for folder in group.folders {
-        let idx = scope_index(folder_scope(window, &folder, server));
-        parts[idx].folders.push(folder);
-    }
-    // A map in no folder is scoped by its own area record.
-    for area in group.unfiled {
-        let idx = scope_index(window.map_scopes.area_scope(&area.id, server));
-        parts[idx].unfiled.push(area);
-    }
-    parts
+/// Where one clan sits for `server`: a clan's folders and maps are scoped
+/// together, by the clan.
+fn clan_scope(window: &MapEditorWindow, group: &ClanGroup, server: &str) -> ScopeState {
+    window.map_scopes.clan_scope(&group.clan_id, server)
 }
 
 /// Splits the viewer's own folders into the three scope buckets
@@ -907,13 +890,11 @@ fn partition_owned(window: &MapEditorWindow, owned: OwnedGroups, server: &str) -
     parts
 }
 
-/// Renders one clan: its header (with its ⋯ menu where `with_menu`), then
-/// its folders.
+/// Renders one clan: its header with its ⋯ menu, then its folders.
 fn push_clan<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
     group: ClanGroup,
-    with_menu: bool,
     selected: Option<AreaId>,
 ) -> Column<'a, Message, crate::Theme> {
     if !window.map_list_filter.trim().is_empty()
@@ -922,9 +903,7 @@ fn push_clan<'a>(
     {
         return list;
     }
-    list = list.push(group_header(clan_maps::clan_header(
-        window, &group, with_menu,
-    )));
+    list = list.push(group_header(clan_maps::clan_header(window, &group)));
     for folder in group.folders {
         list = push_folder(list, window, folder, selected);
     }
@@ -981,14 +960,33 @@ fn render_this_server<'a>(
 ) -> Column<'a, Message, crate::Theme> {
     let [owned_here, owned_unassigned, _elsewhere] = partition_owned(window, owned, server);
 
-    // Every clan heads its folders here, so its menu is always at hand.
-    let mut clans_here: Vec<ClanGroup> = Vec::new();
+    // Every clan keeps its header here, so its menu is always at hand. A clan
+    // shown only on other servers hides its folders behind a note, and one
+    // shown nowhere yet lists under Unassigned.
+    let mut clans_here: Vec<(ClanGroup, Option<String>)> = Vec::new();
     let mut clans_unassigned: Vec<ClanGroup> = Vec::new();
     for group in clans {
-        let [here, unassigned, _elsewhere] = partition_clan(window, group, server);
-        clans_here.push(here);
-        if !unassigned.folders.is_empty() || !unassigned.unfiled.is_empty() {
-            clans_unassigned.push(unassigned);
+        let empty = group.folders.is_empty() && group.unfiled.is_empty();
+        match clan_scope(window, &group, server) {
+            ScopeState::Here => clans_here.push((group, None)),
+            ScopeState::Unassigned if empty => clans_here.push((group, None)),
+            ScopeState::Unassigned => clans_unassigned.push(group),
+            ScopeState::Elsewhere => {
+                let shown_on = window
+                    .map_scopes
+                    .clan_entries(&group.clan_id)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(&crate::i18n::t!("mapper-multi-list-separator"));
+                clans_here.push((
+                    ClanGroup {
+                        folders: Vec::new(),
+                        unfiled: Vec::new(),
+                        ..group
+                    },
+                    Some(crate::i18n::t!("clan-maps-shown-on", "servers" => shown_on)),
+                ));
+            }
         }
     }
 
@@ -1005,8 +1003,16 @@ fn render_this_server<'a>(
     }
 
     list = push_owned_groups(list, window, owned_here, selected);
-    for group in clans_here {
-        list = push_clan(list, window, group, true, selected);
+    let filtering = !window.map_list_filter.trim().is_empty();
+    for (group, note) in clans_here {
+        match note {
+            Some(_) if filtering => {}
+            Some(note) => {
+                list = push_clan(list, window, group, selected);
+                list = list.push(group_label(note));
+            }
+            None => list = push_clan(list, window, group, selected),
+        }
     }
     list = render_shared_frags(list, window, shared_here, selected);
 
@@ -1027,7 +1033,7 @@ fn render_this_server<'a>(
         if !collapsed {
             list = push_owned_groups(list, window, owned_unassigned, selected);
             for group in clans_unassigned {
-                list = push_clan(list, window, group, false, selected);
+                list = push_clan(list, window, group, selected);
             }
             list = render_shared_frags(list, window, shared_unassigned, selected);
         }
@@ -1048,21 +1054,21 @@ fn render_all_buckets<'a>(
     server: &str,
 ) -> Column<'a, Message, crate::Theme> {
     let mut owned = partition_owned(window, owned, server);
-    // Every clan heads its folders on this server, with its menu; elsewhere
-    // its name labels the folders that land there.
+    // Each clan lists, whole, in the section its scope puts it in; one with
+    // nothing in it yet heads this server's section, as in the This-server
+    // view. While filtering, a clan with no match lists nowhere.
+    let filtering = !window.map_list_filter.trim().is_empty();
     let mut clan_buckets: [Vec<ClanGroup>; 3] = std::array::from_fn(|_| Vec::new());
     for group in clans {
-        for (idx, part) in partition_clan(window, group, server)
-            .into_iter()
-            .enumerate()
-        {
-            if (idx == 0 && window.map_list_filter.trim().is_empty())
-                || !part.folders.is_empty()
-                || !part.unfiled.is_empty()
-            {
-                clan_buckets[idx].push(part);
-            }
+        let empty = group.folders.is_empty() && group.unfiled.is_empty();
+        if filtering && empty {
+            continue;
         }
+        let idx = match clan_scope(window, &group, server) {
+            ScopeState::Unassigned if empty => 0,
+            state => scope_index(state),
+        };
+        clan_buckets[idx].push(group);
     }
     let mut shared_buckets: [Vec<SharedFrag>; 3] = std::array::from_fn(|_| Vec::new());
     for group in shared {
@@ -1095,7 +1101,7 @@ fn render_all_buckets<'a>(
         list = list.push(bucket_header(header));
         list = push_owned_groups(list, window, owned_bucket, selected);
         for group in clan_bucket {
-            list = push_clan(list, window, group, idx == 0, selected);
+            list = push_clan(list, window, group, selected);
         }
         list = render_shared_frags(list, window, shared_bucket, selected);
     }
@@ -1115,7 +1121,7 @@ fn render_flat<'a>(
 ) -> Column<'a, Message, crate::Theme> {
     list = push_owned_groups(list, window, owned, selected);
     for group in clans {
-        list = push_clan(list, window, group, true, selected);
+        list = push_clan(list, window, group, selected);
     }
     for group in shared {
         list = push_shared(
@@ -1555,8 +1561,8 @@ fn folder_menu(
     }
     // Which server entries the folder shows on. The associations are
     // per-user, so this works on a shared folder too; a local folder is never
-    // scoped.
-    if !atlas_is_local && !clan_folder {
+    // scoped, and a clan's folder shows where its clan does.
+    if !atlas_is_local && clan_maps::folder_clan(window, atlas_id).is_none() {
         entries.push((
             crate::i18n::t!("area-list-servers-action"),
             Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
@@ -1956,9 +1962,10 @@ mod tests {
             folder_item(1, "City", None),
             folder_item(2, "Roads", Some(7)),
         ];
+        // The Roads folder belongs to clan 7, which shows only elsewhere.
         window
             .map_scopes
-            .set_atlas_entry(AtlasId(uuid(2)), "another server", true);
+            .set_clan_entry(uuid(7), "another server", true);
         window
             .collapsed_folders
             .insert(FolderKey::Atlas(AtlasId(uuid(1))));
@@ -1998,6 +2005,95 @@ mod tests {
         assert!(window.multi.order.borrow().is_empty());
         assert_eq!(window.collapsed_folders, collapsed);
         assert_eq!(window.editor.area_id(), Some(AreaId(uuid(10))));
+    }
+
+    fn clan_summary(n: u128, hosts: &[&str]) -> smudgy_cloud::clans::ClanSummary {
+        smudgy_cloud::clans::ClanSummary {
+            id: uuid(n),
+            name: format!("Clan {n}"),
+            description: None,
+            hosts: hosts.iter().map(ToString::to_string).collect(),
+            created_at: Utc::now(),
+            member_count: 2,
+            is_owner: false,
+            group_ids: Vec::new(),
+            actions: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// A clan shown only on other servers keeps its header in the
+    /// This-server view and hides its folders; "Show on {server}" brings them
+    /// here with one delta for the whole clan.
+    #[tokio::test]
+    async fn a_clan_shown_elsewhere_is_one_click_from_this_server() {
+        let mapper = super::super::links::fixture::serving(vec![
+            created_map(10, "North Gate", 1, None),
+            created_map(12, "North Road", 2, Some(7)),
+        ])
+        .await;
+        let mut window = super::super::test_window(mapper, AreaId(uuid(10)));
+        window.map_scopes = smudgy_core::models::map_scopes::MapScopes::default();
+        window.atlases = vec![
+            folder_item(1, "City", None),
+            folder_item(2, "Roads", Some(7)),
+        ];
+        window.clans.clans = vec![clan_summary(7, &[])];
+        window
+            .map_scopes
+            .set_clan_entry(uuid(7), "another server", true);
+        let roads = ListItem::Folder(AtlasId(uuid(2)));
+        drop(view(&window));
+        assert!(!window.multi.order.borrow().contains(&roads));
+
+        let update = window.update(Message::ShowClanHere(uuid(7)));
+        assert!(matches!(
+            update.event,
+            Some(super::super::Event::ScopeAssociationsChanged(ref deltas))
+                if deltas == &[smudgy_core::models::map_scopes::ScopeDelta::SetClanEntry {
+                    clan_id: uuid(7),
+                    entry: "test".to_string(),
+                    show: true,
+                }]
+        ));
+        drop(view(&window));
+        assert!(window.multi.order.borrow().contains(&roads));
+    }
+
+    /// Opening a clan's map from the This-server view places an unplaced clan
+    /// here only when the clan is listed and has no "Plays on" hosts.
+    #[tokio::test]
+    async fn opening_a_clan_map_places_only_a_listed_hostless_clan() {
+        let mapper = super::super::links::fixture::serving(vec![
+            created_map(10, "North Gate", 1, None),
+            created_map(12, "North Road", 2, Some(7)),
+        ])
+        .await;
+        let mut window = super::super::test_window(mapper, AreaId(uuid(10)));
+        window.map_scopes = smudgy_core::models::map_scopes::MapScopes::default();
+
+        // Not listed yet: its hosts are unknown.
+        assert!(window.associate_opened_area(AreaId(uuid(12))).is_none());
+        // Listed with hosts: homing places it.
+        window.clans.clans = vec![clan_summary(7, &["mud.arctic.org"])];
+        assert!(window.associate_opened_area(AreaId(uuid(12))).is_none());
+        assert_eq!(
+            window.map_scopes.clan_scope(&uuid(7), "test"),
+            smudgy_core::models::map_scopes::ScopeState::Unassigned
+        );
+        // Listed with none: opening places the whole clan.
+        window.clans.clans = vec![clan_summary(7, &[])];
+        assert!(window.associate_opened_area(AreaId(uuid(12))).is_some());
+        assert_eq!(
+            window.map_scopes.clan_scope(&uuid(7), "test"),
+            smudgy_core::models::map_scopes::ScopeState::Here
+        );
+        assert!(
+            window
+                .map_scopes
+                .atlas_entries(&AtlasId(uuid(2)))
+                .is_empty(),
+            "the folder gets no record of its own"
+        );
     }
 
     /// A map as a create reply describes it: no word of what the viewer may

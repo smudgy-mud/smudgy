@@ -499,6 +499,8 @@ pub struct ClanRecord {
     pub id: Uuid,
     pub name: String,
     pub description: String,
+    /// "Plays on": the hosts the clan's game answers on, normalized.
+    pub hosts: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub dissolved: bool,
     /// A dissolution has been checked and has not committed: no map enters
@@ -682,6 +684,7 @@ impl ClanRecord {
             "id": self.id,
             "name": self.name,
             "description": self.description,
+            "hosts": self.hosts,
             "created_at": self.created_at,
             "member_count": self.active_members(),
             "is_owner": self.is_owner(user),
@@ -1425,6 +1428,68 @@ fn description(value: String) -> Result<String, Response> {
     Ok(value)
 }
 
+/// A clan's `hosts` (docs/clans.md §2): each a hostname or IPv4 address
+/// (dot-separated ASCII labels of letters, digits, `-` and `_`), optionally
+/// with `:port` from 1 to 65535, trimmed and ASCII-lowercased, blanks and
+/// repeats dropped; at most 32 entries of at most 255 characters. Absent and
+/// null are `None`; an empty list clears the hosts.
+fn clan_hosts(fields: &Map<String, Value>) -> Result<Option<Vec<String>>, Response> {
+    let values = match fields.get("hosts") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(values)) => values,
+        Some(_) => return Err(bad_request("expected an array for `hosts`")),
+    };
+    if values.len() > 32 {
+        return Err(bad_request("at most 32 host entries are allowed"));
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for value in values {
+        let host = value
+            .as_str()
+            .ok_or_else(|| bad_request("expected strings in `hosts`"))?
+            .trim()
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            continue;
+        }
+        if host.chars().count() > 255 {
+            return Err(bad_request("each host must be at most 255 characters"));
+        }
+        if !is_host(&host) {
+            return Err(bad_request(
+                "each host must be a hostname or IPv4 address, optionally with :port",
+            ));
+        }
+        if !kept.contains(&host) {
+            kept.push(host);
+        }
+    }
+    Ok(Some(kept))
+}
+
+/// `name` or `name:port`: dot-separated labels of `[a-z0-9_-]`, and a port of
+/// one to five digits from 1 to 65535.
+fn is_host(host: &str) -> bool {
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let labels_ok = name.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    });
+    let port_ok = port.is_none_or(|port| {
+        (1..=5).contains(&port.len())
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port
+                .parse::<u32>()
+                .is_ok_and(|port| (1..=65535).contains(&port))
+    });
+    labels_ok && port_ok
+}
+
 fn check_clan_name(st: &MockState, name: &str) -> Result<(), Response> {
     if st.users.iter().any(|user| {
         user.nickname
@@ -1572,6 +1637,7 @@ pub async fn create_clan(
         let fields = json_object(&body)?;
         let name = clan_name(required_string(&fields, "name")?)?;
         let about = description(optional_string(&fields, "description")?.unwrap_or_default())?;
+        let hosts = clan_hosts(&fields)?.unwrap_or_default();
         check_clan_name(&st, &name)?;
         let seq = st.next_seq();
         let id = Uuid::new_v4();
@@ -1591,6 +1657,7 @@ pub async fn create_clan(
             id,
             name,
             description: about,
+            hosts,
             created_at: now,
             dissolved: false,
             dissolving: false,
@@ -1669,6 +1736,7 @@ pub async fn patch_clan(
         let about = optional_string(&fields, "description")?
             .map(description)
             .transpose()?;
+        let hosts = clan_hosts(&fields)?;
         let clan = active_clan(&st, clan_id)?;
         if !clan.may(caller, "clan.edit_profile") {
             return Err(not_found());
@@ -1680,6 +1748,9 @@ pub async fn patch_clan(
         }
         if let Some(about) = about {
             clan.description = about;
+        }
+        if let Some(hosts) = hosts {
+            clan.hosts = hosts;
         }
         Ok(ok(clan.summary(caller)))
     })())

@@ -43,15 +43,38 @@ struct SourceArea {
 ///
 /// - `disabled`: the user's manual per-area active/inactive toggle
 ///   (`Mapper::set_disabled_areas`). May carry ids the cache has not seen yet.
-/// - `atlases`/`areas`: the per-server scope associations
-///   (`Mapper::set_scope_exclusions`). Keying exclusion by *atlas* is
-///   deliberate: an area that later syncs into an excluded atlas is excluded
-///   automatically, with no recomputation.
+/// - `scope`: the per-server scope associations
+///   (`Mapper::set_scope_exclusions`). Keying exclusion by *atlas* and *clan*
+///   is deliberate: an area that later syncs into an excluded atlas or clan is
+///   excluded automatically, with no recomputation.
 #[derive(Clone, Default)]
 struct Exclusions {
     disabled: Arc<HashSet<AreaId>>,
-    atlases: Arc<HashSet<AtlasId>>,
-    areas: Arc<HashSet<AreaId>>,
+    scope: Arc<ScopeExclusions>,
+}
+
+/// What the per-server scope keeps out on one server entry: the atlases,
+/// atlas-less areas and clans shown only on other entries. A clan's map is
+/// decided by its clan alone, whatever its atlas or area records say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeExclusions {
+    pub atlases: HashSet<AtlasId>,
+    pub areas: HashSet<AreaId>,
+    pub clans: HashSet<Uuid>,
+}
+
+impl ScopeExclusions {
+    /// Whether the map `area_id`, filed in `atlas_id` and belonging to
+    /// `clan_id`, is kept out.
+    fn excludes(&self, area_id: &AreaId, atlas_id: Option<AtlasId>, clan_id: Option<Uuid>) -> bool {
+        match clan_id {
+            Some(clan) => self.clans.contains(&clan),
+            None => {
+                self.areas.contains(area_id)
+                    || atlas_id.is_some_and(|atlas| self.atlases.contains(&atlas))
+            }
+        }
+    }
 }
 
 impl Exclusions {
@@ -63,11 +86,8 @@ impl Exclusions {
     /// about. A manually-disabled area is the user's own toggle, not another
     /// entry's map, so it is never a rescue candidate.
     fn scope_excludes(&self, area_id: &AreaId, area: &AreaCache) -> bool {
-        self.areas.contains(area_id)
-            || area
-                .meta()
-                .atlas_id
-                .is_some_and(|atlas| self.atlases.contains(&atlas))
+        let meta = area.meta();
+        self.scope.excludes(area_id, meta.atlas_id, meta.clan_id)
     }
 }
 
@@ -956,17 +976,12 @@ impl AtlasCache {
     /// once, so this is the full from-scratch rebuild of the lookup tables;
     /// scope changes are rare. The exit targets carry over as they are.
     #[must_use]
-    pub(super) fn with_scope_exclusions(
-        &self,
-        excluded_atlases: Arc<HashSet<AtlasId>>,
-        excluded_areas: Arc<HashSet<AreaId>>,
-    ) -> Self {
+    pub(super) fn with_scope_exclusions(&self, scope: Arc<ScopeExclusions>) -> Self {
         Self::new_with_exit_targets(
             self.areas.clone(),
             Exclusions {
                 disabled: self.exclusions.disabled.clone(),
-                atlases: excluded_atlases,
-                areas: excluded_areas,
+                scope,
             },
             self.exit_targets.clone(),
         )
@@ -1260,16 +1275,16 @@ impl AtlasCache {
     }
 
     /// Whether either axis excludes `area_id` from identification/routing. The
-    /// atlas axis is resolved by looking the area up to read its `atlas_id`.
+    /// scope axis is resolved by looking the map up to read its atlas and clan.
     fn area_is_excluded(&self, area_id: &AreaId) -> bool {
         let map_id = self.placed_by(area_id);
-        if self.exclusions.disabled.contains(&map_id) || self.exclusions.areas.contains(&map_id) {
+        if self.exclusions.disabled.contains(&map_id) {
             return true;
         }
-        self.areas
-            .get(&map_id)
-            .and_then(|area| area.meta().atlas_id)
-            .is_some_and(|atlas| self.exclusions.atlases.contains(&atlas))
+        match self.areas.get(&map_id) {
+            Some(area) => self.exclusions.scope_excludes(&map_id, area),
+            None => self.exclusions.scope.areas.contains(&map_id),
+        }
     }
 
     /// The full set of manually-disabled areas (may contain ids the cache has
@@ -1734,8 +1749,11 @@ mod tests {
             areas,
             Exclusions {
                 disabled: Arc::new(HashSet::new()),
-                atlases: Arc::new(excluded_atlases.into_iter().collect()),
-                areas: Arc::new(excluded_areas.into_iter().collect()),
+                scope: Arc::new(ScopeExclusions {
+                    atlases: excluded_atlases.into_iter().collect(),
+                    areas: excluded_areas.into_iter().collect(),
+                    clans: HashSet::new(),
+                }),
             },
         )
     }
@@ -1749,6 +1767,16 @@ mod tests {
     fn cache_area_in_atlas(
         id: AreaId,
         atlas: Option<AtlasId>,
+        owned: bool,
+        rooms: Vec<RoomWithDetails>,
+    ) -> (AreaId, Arc<AreaCache>) {
+        cache_area_in(id, atlas, None, owned, rooms)
+    }
+
+    fn cache_area_in(
+        id: AreaId,
+        atlas: Option<AtlasId>,
+        clan: Option<Uuid>,
         owned: bool,
         rooms: Vec<RoomWithDetails>,
     ) -> (AreaId, Arc<AreaCache>) {
@@ -1769,8 +1797,8 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
-                clan_id: None,
-                clan_name: None,
+                clan_id: clan,
+                clan_name: clan.map(|_| "Lantern Company".to_string()),
                 actions: None,
                 clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
@@ -2760,6 +2788,46 @@ mod tests {
             .map(|(area_id, _)| area_id)
             .collect();
         assert_eq!(by_title, vec![owned_id, shared_id]);
+    }
+
+    #[test]
+    fn a_clan_map_is_scoped_by_its_clan_alone() {
+        let clan = Uuid::from_u128(77);
+        let folder = atlas_id(10);
+        let map = area_id(1);
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area_in(
+            map,
+            Some(folder),
+            Some(clan),
+            false,
+            vec![room(1, "Midgaard", Vec::new())],
+        );
+        areas.insert(id, cache);
+
+        // A stale record for the clan's folder, or for the map itself, does not
+        // keep a clan map out.
+        let by_records = AtlasCache::new_with_exclusions(
+            areas.clone(),
+            Exclusions {
+                disabled: Arc::new(HashSet::new()),
+                scope: Arc::new(ScopeExclusions {
+                    atlases: HashSet::from([folder]),
+                    areas: HashSet::from([map]),
+                    clans: HashSet::new(),
+                }),
+            },
+        );
+        assert!(by_records.is_area_included(&map));
+        assert_eq!(by_records.get_rooms_by_title("Midgaard").count(), 1);
+
+        // Its clan shown only elsewhere does.
+        let by_clan = by_records.with_scope_exclusions(Arc::new(ScopeExclusions {
+            clans: HashSet::from([clan]),
+            ..ScopeExclusions::default()
+        }));
+        assert!(!by_clan.is_area_included(&map));
+        assert_eq!(by_clan.get_rooms_by_title("Midgaard").count(), 0);
     }
 
     #[test]

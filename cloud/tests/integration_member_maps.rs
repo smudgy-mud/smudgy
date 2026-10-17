@@ -71,7 +71,12 @@ struct Clan {
 async fn clan(others: &[&str]) -> (Clan, Vec<Member>) {
     let server = MockServer::spawn().await;
     let mira = member(&server, "mira");
-    let id = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let id = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     let roads = mira.api.create_clan_atlas(id, "Roads").await.unwrap().id;
     let everyone = server.clan_builtin_group(id, "members");
     server.clan_grant(

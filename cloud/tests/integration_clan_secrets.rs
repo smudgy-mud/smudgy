@@ -113,7 +113,12 @@ async fn fixture() -> Fixture {
     let owner = member(&server, "mira");
     let ann = member(&server, "ann");
     let bo = member(&server, "bo");
-    let clan = owner.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = owner
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &ann.user);
     server.join_clan(clan, &bo.user);
     let atlas = server.create_clan_atlas(clan, "Roads");

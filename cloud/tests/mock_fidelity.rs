@@ -343,7 +343,12 @@ async fn deleting_an_account_ends_its_clan_secret_grants_and_offers() {
     let mira = person(&server, "mira");
     let ann = person(&server, "ann");
     let bo = person(&server, "bo");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     for joining in [&ann, &bo] {
         server.join_clan(clan, &joining.user);
     }
@@ -1125,7 +1130,12 @@ async fn clan_routes_judge_credentials_before_shape() {
 
     let server = MockServer::spawn().await;
     let mira = person(&server, "mira");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     let requests = [
         (
             Method::GET,
@@ -1195,7 +1205,12 @@ async fn a_dissolving_clans_map_keeps_its_owners() {
     let mira = person(&server, "mira");
     let ann = person(&server, "ann");
     let bo = person(&server, "bo");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     for joining in [&ann, &bo] {
         server.join_clan(clan, &joining.user);
     }
@@ -1244,7 +1259,12 @@ async fn an_ownership_offer_names_at_most_sixteen_users() {
     let server = MockServer::spawn().await;
     let mira = person(&server, "mira");
     let ann = person(&server, "ann");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     server.join_clan(clan, &ann.user);
     let atlas = server.create_clan_atlas(clan, "Roads");
     let grove = server.create_member_owned_area(clan, atlas, "Grove", &[ann.user.id]);

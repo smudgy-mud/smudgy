@@ -15,16 +15,22 @@
 //! cross-game stock-zone collisions (every Diku Midgaard) drop out of room
 //! identification on the entries they don't belong to.
 //!
+//! A clan's folders and maps are scoped by their **clan** alone: one record per
+//! clan, never per folder or map, because a clan plays one game. A clan's
+//! "Plays on" hosts home it onto the matching entries ([`MapScopes::home_clans`]).
+//!
 //! **Invariant:** the scope key is the server-entry *name*, which is immutable
 //! today (no rename operation exists; a server's name is its directory name). If
 //! a server-entry rename operation is ever built, it MUST rewrite the
-//! association targets in this store within the same operation — otherwise every
-//! association keyed on the old name silently detaches.
+//! association targets in this store — atlas, area and clan records and the
+//! homed-clan ledger — within the same operation, otherwise every association
+//! keyed on the old name silently detaches.
 
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use smudgy_cloud::{AreaId, AtlasId};
+use smudgy_cloud::mapper::ScopeExclusions;
+use smudgy_cloud::{AreaId, AtlasId, Uuid};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::{fs, io};
 
@@ -87,6 +93,17 @@ pub enum ScopeDelta {
     },
     /// Record first sight of an atlas (the §5 homing bookkeeping).
     MarkSeen { atlas_id: AtlasId },
+    /// Replace the full entry set a clan's folders and maps are shown on.
+    SetClanEntries {
+        clan_id: Uuid,
+        entries: BTreeSet<String>,
+    },
+    /// Show or hide a clan on a single entry.
+    SetClanEntry {
+        clan_id: Uuid,
+        entry: String,
+        show: bool,
+    },
 }
 
 /// Where an atlas/area sits relative to one server entry.
@@ -119,6 +136,15 @@ pub struct MapScopes {
     /// it never affects exclusion.
     #[serde(default)]
     seen_atlases: HashSet<AtlasId>,
+    /// Clan id → the entries the clan's folders and maps are shown on. Atlas
+    /// and area records are never consulted for a clan's content.
+    #[serde(default)]
+    clans: HashMap<Uuid, ScopeAssociation>,
+    /// Clan id → the entries homing has added to it from the clan's hosts.
+    /// Homing adds an entry to a clan at most once, so an entry the user later
+    /// unchecks stays unchecked.
+    #[serde(default)]
+    homed_clans: HashMap<Uuid, BTreeSet<String>>,
 }
 
 /// One local server entry as recipient-homing evidence (§5): its name — the
@@ -132,6 +158,21 @@ pub struct HostEntry {
     pub host: String,
     /// The entry's configured port.
     pub port: u16,
+}
+
+/// Every local server entry as homing evidence. Entries whose configuration
+/// cannot be read are left out; an unreadable smudgy home yields none.
+#[must_use]
+pub fn host_entries() -> Vec<HostEntry> {
+    crate::models::server::list_servers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|server| HostEntry {
+            name: server.name,
+            host: server.config.host,
+            port: server.config.port,
+        })
+        .collect()
 }
 
 /// Split a grantor host hint into its host and optional port. A port is
@@ -232,6 +273,8 @@ impl MapScopes {
         let mut pruned = self.clone();
         pruned.atlases.retain(|_, assoc| !assoc.is_unassigned());
         pruned.areas.retain(|_, assoc| !assoc.is_unassigned());
+        pruned.clans.retain(|_, assoc| !assoc.is_unassigned());
+        pruned.homed_clans.retain(|_, homed| !homed.is_empty());
 
         let path = get_smudgy_home()?.join(MAP_SCOPES_FILE);
         let json =
@@ -284,6 +327,118 @@ impl MapScopes {
     #[must_use]
     pub fn area_scope(&self, area_id: &AreaId, entry: &str) -> ScopeState {
         classify(self.areas.get(area_id), entry)
+    }
+
+    /// The entries a clan's folders and maps are shown on (empty = Unassigned).
+    #[must_use]
+    pub fn clan_entries(&self, clan_id: &Uuid) -> BTreeSet<String> {
+        self.clans
+            .get(clan_id)
+            .map(|assoc| assoc.entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where the clan `clan_id` sits relative to `entry`.
+    #[must_use]
+    pub fn clan_scope(&self, clan_id: &Uuid, entry: &str) -> ScopeState {
+        classify(self.clans.get(clan_id), entry)
+    }
+
+    /// Replaces the full entry set a clan is shown on.
+    pub fn set_clan_entries(&mut self, clan_id: Uuid, entries: BTreeSet<String>) {
+        self.clans.insert(clan_id, ScopeAssociation { entries });
+    }
+
+    /// Shows or hides the clan `clan_id` on a single `entry`.
+    pub fn set_clan_entry(&mut self, clan_id: Uuid, entry: &str, show: bool) {
+        let assoc = self.clans.entry(clan_id).or_default();
+        if show {
+            assoc.entries.insert(entry.to_string());
+        } else {
+            assoc.entries.remove(entry);
+        }
+    }
+
+    /// Homes clans onto server entries from their "Plays on" hosts: every
+    /// entry whose host matches one of a clan's hosts ([`match_host_hints`])
+    /// and that homing has not added to that clan before is added to it and
+    /// recorded. Homing only adds, so it never undoes a choice, and an entry
+    /// the user unchecks after homing added it stays unchecked. Returns
+    /// whether the store changed.
+    pub fn home_clans<'a>(
+        &mut self,
+        clans: impl IntoIterator<Item = (Uuid, &'a [String])>,
+        entries: &[HostEntry],
+    ) -> bool {
+        let mut changed = false;
+        for (clan_id, hosts) in clans {
+            for entry in match_host_hints(hosts, entries) {
+                if self
+                    .homed_clans
+                    .entry(clan_id)
+                    .or_default()
+                    .insert(entry.clone())
+                {
+                    self.clans.entry(clan_id).or_default().entries.insert(entry);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Every server-entry name the store refers to.
+    #[must_use]
+    pub fn entry_names(&self) -> BTreeSet<String> {
+        self.atlases
+            .values()
+            .chain(self.areas.values())
+            .chain(self.clans.values())
+            .flat_map(|assoc| assoc.entries.iter())
+            .chain(self.homed_clans.values().flatten())
+            .cloned()
+            .collect()
+    }
+
+    /// Removes the names of deleted server entries — those
+    /// [`crate::models::server::server_exists`] reports gone — and homes clans
+    /// onto the remaining entries from `clan_hosts` ([`Self::home_clans`]). A
+    /// name whose existence can't be checked is kept. Returns whether the store
+    /// changed.
+    pub fn reconcile_with_servers(&mut self, clan_hosts: &HashMap<Uuid, Vec<String>>) -> bool {
+        let mut changed = false;
+        for name in self.entry_names() {
+            if matches!(crate::models::server::server_exists(&name), Ok(false)) {
+                changed |= self.forget_entry(&name);
+            }
+        }
+        if !clan_hosts.is_empty() {
+            changed |= self.home_clans(
+                clan_hosts.iter().map(|(id, hosts)| (*id, hosts.as_slice())),
+                &host_entries(),
+            );
+        }
+        changed
+    }
+
+    /// Removes a deleted server entry's name from every record and from the
+    /// homed-clan ledger. A dangling name would leave a folder associated only
+    /// with an entry that no longer exists, which excludes it on every
+    /// remaining entry. Returns whether the store changed.
+    pub fn forget_entry(&mut self, entry: &str) -> bool {
+        let mut changed = false;
+        for assoc in self
+            .atlases
+            .values_mut()
+            .chain(self.areas.values_mut())
+            .chain(self.clans.values_mut())
+        {
+            changed |= assoc.entries.remove(entry);
+        }
+        for homed in self.homed_clans.values_mut() {
+            changed |= homed.remove(entry);
+        }
+        changed
     }
 
     /// Replaces the full entry set an atlas is shown on. Passing an empty set
@@ -343,6 +498,14 @@ impl MapScopes {
             ScopeDelta::MarkSeen { atlas_id } => {
                 self.mark_seen(*atlas_id);
             }
+            ScopeDelta::SetClanEntries { clan_id, entries } => {
+                self.set_clan_entries(*clan_id, entries.clone());
+            }
+            ScopeDelta::SetClanEntry {
+                clan_id,
+                entry,
+                show,
+            } => self.set_clan_entry(*clan_id, entry, *show),
         }
     }
 
@@ -367,6 +530,27 @@ impl MapScopes {
             .filter(|(_, assoc)| classify(Some(assoc), entry) == ScopeState::Elsewhere)
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// The clans excluded on `entry`: those shown only on other entries.
+    #[must_use]
+    pub fn excluded_clans(&self, entry: &str) -> HashSet<Uuid> {
+        self.clans
+            .iter()
+            .filter(|(_, assoc)| classify(Some(assoc), entry) == ScopeState::Elsewhere)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Everything the scope keeps out on `entry`, for
+    /// `Mapper::set_scope_exclusions`.
+    #[must_use]
+    pub fn exclusions(&self, entry: &str) -> ScopeExclusions {
+        ScopeExclusions {
+            atlases: self.excluded_atlases(entry),
+            areas: self.excluded_areas(entry),
+            clans: self.excluded_clans(entry),
+        }
     }
 }
 
@@ -608,6 +792,188 @@ mod tests {
         ];
         let matched = match_host_hints(&hints(&["arctic.org", "aardwolf.org:4000"]), &servers);
         assert_eq!(matched, entries(&["Aardwolf", "Arctic"]));
+    }
+
+    fn clan(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_clan_is_scoped_as_one() {
+        let mut scopes = MapScopes::default();
+        // A record for one of the clan's folders is a separate record; the
+        // clan's own decides its content.
+        scopes.set_atlas_entries(atlas(5), entries(&["Aardwolf"]));
+        assert_eq!(
+            scopes.clan_scope(&clan(1), "Arctic"),
+            ScopeState::Unassigned
+        );
+        scopes.set_clan_entry(clan(1), "Arctic", true);
+        assert_eq!(scopes.clan_scope(&clan(1), "Arctic"), ScopeState::Here);
+        assert_eq!(
+            scopes.clan_scope(&clan(1), "Aardwolf"),
+            ScopeState::Elsewhere
+        );
+        let on_aardwolf = scopes.exclusions("Aardwolf");
+        assert_eq!(on_aardwolf.clans, [clan(1)].into_iter().collect());
+        assert!(scopes.exclusions("Arctic").clans.is_empty());
+    }
+
+    #[test]
+    fn homing_adds_each_matching_entry_once() {
+        let servers = [
+            host_entry("Arctic", "mud.arctic.org", 2700),
+            host_entry("arctic-alias", "ArcticMud.org", 2700),
+            host_entry("Aardwolf", "aardwolf.org", 4000),
+        ];
+        let plays_on = hints(&["mud.arctic.org", "arcticmud.org"]);
+        let mut scopes = MapScopes::default();
+        assert!(scopes.home_clans([(clan(1), plays_on.as_slice())], &servers));
+        assert_eq!(
+            scopes.clan_entries(&clan(1)),
+            entries(&["Arctic", "arctic-alias"])
+        );
+        // Nothing new to add: no change.
+        assert!(!scopes.home_clans([(clan(1), plays_on.as_slice())], &servers));
+
+        // The user unchecks one; homing never re-adds it.
+        scopes.set_clan_entry(clan(1), "arctic-alias", false);
+        assert!(!scopes.home_clans([(clan(1), plays_on.as_slice())], &servers));
+        assert_eq!(scopes.clan_entries(&clan(1)), entries(&["Arctic"]));
+
+        // A new entry for the game is added once it exists.
+        let mut more = servers.to_vec();
+        more.push(host_entry("arctic-laptop", "mud.arctic.org", 2700));
+        assert!(scopes.home_clans([(clan(1), plays_on.as_slice())], &more));
+        assert_eq!(
+            scopes.clan_entries(&clan(1)),
+            entries(&["Arctic", "arctic-laptop"])
+        );
+    }
+
+    #[test]
+    fn homing_respects_a_clan_host_port_and_skips_hostless_clans() {
+        let servers = [
+            host_entry("Arctic", "mud.arctic.org", 2700),
+            host_entry("arctic-builder", "mud.arctic.org", 4000),
+        ];
+        let mut scopes = MapScopes::default();
+        let plays_on = hints(&["mud.arctic.org:2700"]);
+        assert!(scopes.home_clans(
+            [(clan(1), plays_on.as_slice()), (clan(2), &[][..])],
+            &servers
+        ));
+        assert_eq!(scopes.clan_entries(&clan(1)), entries(&["Arctic"]));
+        assert_eq!(
+            scopes.clan_scope(&clan(2), "Arctic"),
+            ScopeState::Unassigned
+        );
+    }
+
+    #[test]
+    fn forgetting_an_entry_removes_it_everywhere() {
+        let mut scopes = MapScopes::default();
+        scopes.set_atlas_entries(atlas(1), entries(&["Arctic", "old"]));
+        scopes.set_area_entries(area(2), entries(&["old"]));
+        scopes.set_clan_entries(clan(3), entries(&["old"]));
+        scopes.home_clans(
+            [(clan(3), hints(&["old.example.org"]).as_slice())],
+            &[host_entry("old", "old.example.org", 23)],
+        );
+        assert!(scopes.forget_entry("old"));
+        assert_eq!(scopes.atlas_entries(&atlas(1)), entries(&["Arctic"]));
+        assert_eq!(
+            scopes.area_scope(&area(2), "Arctic"),
+            ScopeState::Unassigned
+        );
+        assert_eq!(
+            scopes.clan_scope(&clan(3), "Arctic"),
+            ScopeState::Unassigned
+        );
+        assert!(scopes.exclusions("Arctic").atlases.is_empty());
+        // A new entry under the same name is homed afresh.
+        assert!(scopes.home_clans(
+            [(clan(3), hints(&["old.example.org"]).as_slice())],
+            &[host_entry("old", "old.example.org", 23)],
+        ));
+        assert!(!scopes.forget_entry("missing"));
+    }
+
+    #[test]
+    fn entry_names_cover_every_record_and_the_ledger() {
+        let mut scopes = MapScopes::default();
+        scopes.set_atlas_entries(atlas(1), entries(&["a"]));
+        scopes.set_area_entries(area(2), entries(&["b"]));
+        scopes.set_clan_entries(clan(3), entries(&["c"]));
+        scopes.home_clans(
+            [(clan(4), hints(&["d.example.org"]).as_slice())],
+            &[host_entry("d", "d.example.org", 23)],
+        );
+        scopes.set_clan_entry(clan(4), "d", false);
+        assert_eq!(scopes.entry_names(), entries(&["a", "b", "c", "d"]));
+    }
+
+    #[test]
+    fn clan_deltas_replay() {
+        let mut scopes = MapScopes::default();
+        scopes.apply(&ScopeDelta::SetClanEntries {
+            clan_id: clan(1),
+            entries: entries(&["Arctic", "Aardwolf"]),
+        });
+        scopes.apply(&ScopeDelta::SetClanEntry {
+            clan_id: clan(1),
+            entry: "Aardwolf".to_string(),
+            show: false,
+        });
+        assert_eq!(scopes.clan_entries(&clan(1)), entries(&["Arctic"]));
+        let json = serde_json::to_string(&scopes).expect("serialize");
+        let parsed: MapScopes = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed, scopes);
+    }
+
+    /// A temporary smudgy home shared by this binary's tests (the first
+    /// override wins), and a server name no other test uses.
+    fn temp_server_name(label: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TEST_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        TEST_HOME.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "smudgy-map-scopes-test-home-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp home");
+            crate::set_smudgy_home(dir.clone());
+            dir
+        });
+        format!(
+            "scopes-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn reconcile_drops_deleted_entries_and_homes_clans() {
+        use crate::models::server::{ServerConfig, create_server, delete_server};
+        let live = temp_server_name("live");
+        let gone = temp_server_name("gone");
+        let host = format!("{live}.example.org");
+        create_server(&live, ServerConfig::new(host.clone(), 2700)).expect("create server");
+
+        let mut scopes = MapScopes::default();
+        scopes.set_atlas_entries(atlas(1), entries(&[&live, &gone]));
+        scopes.set_clan_entries(clan(2), entries(&[&gone]));
+        let clan_hosts = HashMap::from([(clan(3), vec![host.to_uppercase()])]);
+        assert!(scopes.reconcile_with_servers(&clan_hosts));
+        assert_eq!(scopes.atlas_entries(&atlas(1)), entries(&[&live]));
+        assert_eq!(scopes.clan_scope(&clan(2), &live), ScopeState::Unassigned);
+        assert_eq!(scopes.clan_entries(&clan(3)), entries(&[&live]));
+        assert!(!scopes.reconcile_with_servers(&clan_hosts), "nothing new");
+
+        delete_server(&live).expect("delete server");
+        assert!(scopes.reconcile_with_servers(&clan_hosts));
+        assert!(scopes.entry_names().is_empty());
     }
 
     #[test]

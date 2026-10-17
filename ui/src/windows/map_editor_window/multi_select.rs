@@ -337,7 +337,9 @@ impl Action {
             (Self::Share, ListItem::Map(_)) => cloud && facts.may_share,
             (Self::Share, ListItem::Folder(_)) => cloud && facts.owned,
             (Self::Transfer, _) => cloud && facts.is_owner && !facts.clan_owned,
-            (Self::Servers, ListItem::Map(_)) => cloud && facts.atlas_id.is_none(),
+            (Self::Servers, ListItem::Map(_)) => {
+                cloud && facts.atlas_id.is_none() && !facts.clan_owned
+            }
             (Self::Servers, ListItem::Folder(_)) => cloud && !facts.clan_owned,
             (Self::Delete, _) => facts.owned,
         }
@@ -720,10 +722,7 @@ pub struct ServersDialog {
 }
 
 fn scope_entries(scopes: &MapScopes, target: ScopeTarget) -> BTreeSet<String> {
-    match target {
-        ScopeTarget::Atlas(atlas_id) => scopes.atlas_entries(&atlas_id),
-        ScopeTarget::Area(area_id) => scopes.area_entries(&area_id),
-    }
+    target.entries(scopes)
 }
 
 /// Whether all, some or none of `targets` show on `server`.
@@ -750,18 +749,7 @@ fn server_deltas(
     targets
         .iter()
         .filter(|target| scope_entries(scopes, **target).contains(server) != show)
-        .map(|target| match *target {
-            ScopeTarget::Atlas(atlas_id) => ScopeDelta::SetAtlasEntry {
-                atlas_id,
-                entry: server.to_string(),
-                show,
-            },
-            ScopeTarget::Area(area_id) => ScopeDelta::SetAreaEntry {
-                area_id,
-                entry: server.to_string(),
-                show,
-            },
-        })
+        .map(|target| target.toggle(server.to_string(), show))
         .collect()
 }
 
@@ -853,7 +841,7 @@ impl MapEditorWindow {
                     storage,
                     owned: false,
                     is_owner: false,
-                    clan_owned: false,
+                    clan_owned: shared.meta().clan_id.is_some(),
                     may_share: false,
                     atlas_id: None,
                     owner_id: shared.meta().owner_id,

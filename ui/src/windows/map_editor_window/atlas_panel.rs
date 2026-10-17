@@ -21,7 +21,7 @@ use super::area_list::name_order;
 use super::clan_maps::{self, ClanMessage};
 use super::default_atlases;
 use super::panels::{self, PanelMessage, Section, muted};
-use super::{MapEditorWindow, Message, modals};
+use super::{MapEditorWindow, Message, ScopeTarget, modals};
 
 /// A map as the Maps section lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,15 +208,20 @@ pub fn view(window: &MapEditorWindow, atlas_id: AtlasId) -> Column<'_, Message, 
         Kind::Own | Kind::Clan(_) | Kind::Shared => {}
     }
 
-    // Which servers show it: a per-viewer choice on any cloud folder.
+    // Which servers show it: a per-viewer choice on any cloud folder. A
+    // clan's folders all show where their clan does.
     if !local {
-        let checked = window.map_scopes.atlas_entries(&atlas_id);
+        let (target, clan_name) = match clan_maps::folder_clan(window, atlas_id) {
+            Some(clan_id) => (ScopeTarget::Clan(clan_id), window.clans.name(clan_id)),
+            None => (ScopeTarget::Atlas(atlas_id), None),
+        };
+        let checked = target.entries(&window.map_scopes);
         content = content.push(panels::section(
             window,
             Section::Servers,
             crate::i18n::t!("mapper-panel-servers"),
             Some(shown_on(&window.panel.servers, &checked)),
-            || servers_section(window, atlas_id, &checked),
+            || servers_section(window, target, clan_name, &checked),
         ));
     }
 
@@ -364,7 +369,8 @@ fn shares_section(
 /// as the folder's Servers dialog sets them.
 fn servers_section<'a>(
     window: &'a MapEditorWindow,
-    atlas_id: AtlasId,
+    target: ScopeTarget,
+    clan_name: Option<String>,
     checked: &BTreeSet<String>,
 ) -> ThemedElement<'a, Message> {
     let servers = &window.panel.servers;
@@ -372,6 +378,11 @@ fn servers_section<'a>(
         return panels::note(crate::i18n::t!("mapper-no-server-entries"));
     }
     let mut list = Column::new().spacing(6);
+    if let Some(clan) = clan_name {
+        list = list.push(panels::note(
+            crate::i18n::t!("clan-maps-folders-follow-clan", "clan" => clan),
+        ));
+    }
     for server in servers {
         let entry = server.clone();
         list = list.push(
@@ -381,7 +392,7 @@ fn servers_section<'a>(
                 .text_size(13)
                 .on_toggle(move |show| {
                     Message::Panel(PanelMessage::ServerToggled {
-                        atlas_id,
+                        target,
                         entry: entry.clone(),
                         show,
                     })

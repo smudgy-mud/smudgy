@@ -1,7 +1,7 @@
 #![allow(clippy::pedantic)]
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::session_store::BindTarget;
 use chrono::{DateTime, Utc};
@@ -11,8 +11,9 @@ use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
 #[cfg(feature = "web-audio-cpal")]
 use smudgy_audio::{MixerOutputFailure, MixerOutputFailureReceiver};
+use smudgy_cloud::clans::{ClanSummary, ClansOverview};
 use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
-use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, Mapper};
+use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, Mapper, Uuid};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 #[cfg(feature = "web-audio-cpal")]
 use smudgy_core::models::settings::{AudioGainSettings, AudioSettings};
@@ -115,6 +116,7 @@ fn preview_build_stamp() -> String {
 }
 
 use crate::cloud_account::CloudAccount;
+use crate::components::clan_panel;
 use crate::components::pending_invitations::{self, Pending};
 use crate::discord_presence::DiscordPresence;
 use crate::session_store::SessionStore;
@@ -224,6 +226,13 @@ struct Smudgy {
     /// out to every live session mapper and open map editor window whenever an
     /// association changes.
     map_scopes: MapScopes,
+    /// The "Plays on" hosts of the signed-in account's clans, as last listed
+    /// (`GET /clans`, or a list the Clans page or a map editor loaded); `None`
+    /// until a list arrives. Homing reads them, and bind-on-use leaves a clan
+    /// that has hosts to homing.
+    clan_hosts: Option<HashMap<Uuid, Vec<String>>>,
+    /// When `GET /clans` last went out, so a burst of connections asks once.
+    clans_fetched_at: Option<Instant>,
     /// One app-global clipboard shared by every map editor window, so the
     /// two-window merge workflow can copy/paste between them.
     map_editor_clipboard: SharedClipboard,
@@ -591,6 +600,9 @@ enum Message {
     PendingInvitationsTick,
     /// The counts landed, for the account they were read under.
     PendingInvitationsFetched(Option<pending_invitations::Account>, Pending),
+    /// `GET /clans` landed, tagged with the credential generation it went
+    /// out under: adopt the clans' "Plays on" hosts and home them.
+    ClansFetched(u64, Result<ClansOverview, CloudError>),
     /// A `PUT /me/area-prefs/{id}` push completed; adopt the server-stamped
     /// `updated_at` (or, on a uniform 404 / error, leave the local pref as-is).
     AreaPrefPushed {
@@ -802,7 +814,13 @@ fn init(
     let disabled_map_areas = disabled_set_from_prefs(&area_prefs);
     // Per-server cloud-map scope associations, applied to each session's mapper
     // as it opens and re-pushed here whenever the editor changes an association.
-    let map_scopes = MapScopes::load();
+    let mut map_scopes = MapScopes::load();
+    // Drop the names of server entries deleted since the store was written.
+    if map_scopes.reconcile_with_servers(&HashMap::new())
+        && let Err(e) = map_scopes.save()
+    {
+        log::warn!("Failed to persist map scopes: {e}");
+    }
 
     // Split a pre-0.4.1 global local-map store into the per-server stores and
     // delete it, before any session or map editor opens a LocalBackend.
@@ -811,7 +829,10 @@ fn init(
     let (account, account_task) = CloudAccount::new();
     // If we resumed a signed-in session, reconcile against the cloud at once.
     let reconcile_task = if account.snapshot().signed_in {
-        reconcile_area_prefs_task(&account.handles().client)
+        Task::batch([
+            reconcile_area_prefs_task(&account.handles().client),
+            fetch_clans_task(&account.handles()),
+        ])
     } else {
         Task::none()
     };
@@ -922,6 +943,8 @@ fn init(
             area_prefs,
             area_prefs_push_parked: HashSet::new(),
             map_scopes,
+            clan_hosts: None,
+            clans_fetched_at: None,
             map_editor_clipboard: Arc::new(arc_swap::ArcSwap::from_pointee(
                 map_editor_window::commands::EntityClipboard::default(),
             )),
@@ -4221,6 +4244,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Some(SmudgyWindowEvent::RestoreProfileLayout { session }) => {
                     Task::batch([task, restore_profile_layout(smudgy, session)])
                 }
+                Some(SmudgyWindowEvent::ServersChanged) => {
+                    Task::batch([task, reconcile_scopes(smudgy), push_clan_local(smudgy)])
+                }
                 Some(SmudgyWindowEvent::RestoreLastSession { server }) => {
                     let apply = apply_workspace_template(
                         smudgy,
@@ -4356,6 +4382,14 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 SessionEvent::MapAtlasCreated(atlas_id) => {
                     associate_created_atlas(smudgy, session_id, *atlas_id)
                 }
+                // A connection is when an entry created or edited since the
+                // last listing first matters: home clans onto it, and refresh
+                // the clans in case the account joined one elsewhere.
+                SessionEvent::Connected => Task::batch([
+                    reconcile_scopes(smudgy),
+                    refresh_clans(smudgy),
+                    push_clan_local(smudgy),
+                ]),
                 SessionEvent::ObservedServerChanged => {
                     // A session rewrote its server's observed.json sidecar:
                     // refresh any open Connect modal's copy so the metadata
@@ -5174,6 +5208,10 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         let commit = commit_scope_change(smudgy);
                         Task::batch([update.task, commit])
                     }
+                    Some(map_editor_window::Event::ClansListed(clans)) => {
+                        let adopted = adopt_clans(smudgy, &clans);
+                        Task::batch([update.task, adopted])
+                    }
                     None => update.task,
                 }
             } else {
@@ -5209,11 +5247,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // outlive its originating pane; both setters are idempotent), and
             // hand it the app-global clipboard so all editor windows share one
             // (merge workflow) plus a snapshot of the scope associations.
+            let reconciled = reconcile_scopes(smudgy);
             mapper.set_disabled_areas(smudgy.disabled_map_areas.clone());
-            mapper.set_scope_exclusions(
-                smudgy.map_scopes.excluded_atlases(&server_name),
-                smudgy.map_scopes.excluded_areas(&server_name),
-            );
+            mapper.set_scope_exclusions(smudgy.map_scopes.exclusions(&server_name));
             let window = MapEditorWindow::with_clipboard(
                 id,
                 mapper,
@@ -5228,21 +5264,23 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Some(message) => Task::done(Message::MapEditorWindowMessage(id, message)),
                 None => Task::none(),
             };
-            Task::batch([shown, fetch_pending_invitations(smudgy)])
+            Task::batch([reconciled, shown, fetch_pending_invitations(smudgy)])
         }
         Message::CreateSettingsWindow => {
             // Reuse an existing settings window rather than stacking copies.
             if let Some((&id, _)) = smudgy.settings_windows.iter().next() {
-                window::gain_focus(id)
+                Task::batch([window::gain_focus(id), push_clan_local(smudgy)])
             } else {
                 let (_, task) = window::open(secondary_window_settings(Size::new(640.0, 480.0)));
                 task.map(Message::NewSettingsWindow)
             }
         }
         Message::NewSettingsWindow(id) => {
-            smudgy
-                .settings_windows
-                .insert(id, SettingsWindow::new(smudgy.account.handles()));
+            let mut window = SettingsWindow::new(smudgy.account.handles());
+            window.update(settings_window::Message::ClanLocal(clan_local_context(
+                smudgy,
+            )));
+            smudgy.settings_windows.insert(id, window);
             fetch_pending_invitations(smudgy)
         }
         Message::SettingsWindowMessage(id, msg) => {
@@ -5273,13 +5311,23 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         Task::batch([
                             task,
                             reconcile_area_prefs(smudgy),
+                            fetch_clans(smudgy),
                             notify_automations_account_changed(smudgy),
                         ])
                     }
                     Some(SettingsWindowEvent::SignOut { everywhere }) => {
                         let task = smudgy.account.sign_out(everywhere).map(Message::Account);
+                        smudgy.clan_hosts = None;
                         poke_all_mappers(smudgy);
                         Task::batch([task, notify_automations_account_changed(smudgy)])
+                    }
+                    Some(SettingsWindowEvent::ClansListed(clans)) => adopt_clans(smudgy, &clans),
+                    Some(SettingsWindowEvent::ClanLocalRequested) => push_clan_local(smudgy),
+                    Some(SettingsWindowEvent::ScopeAssociationsChanged(deltas)) => {
+                        for delta in &deltas {
+                            smudgy.map_scopes.apply(delta);
+                        }
+                        commit_scope_change(smudgy)
                     }
                     Some(SettingsWindowEvent::DeletionRequested(key)) => {
                         smudgy.account.deletion_requested(key);
@@ -5404,6 +5452,19 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             smudgy.pending_invitations.absorb(account, counts);
             Task::none()
         }
+        Message::ClansFetched(generation, result) => match result {
+            Ok(overview)
+                if smudgy.account.snapshot().signed_in
+                    && generation == smudgy.account.handles().credentials.generation() =>
+            {
+                adopt_clans(smudgy, &overview.clans)
+            }
+            Ok(_) => Task::none(),
+            Err(err) => {
+                log::warn!("clans fetch failed: {err}");
+                Task::none()
+            }
+        },
         Message::AreaPrefsFetched(result) => {
             let server = match result {
                 Ok(server) => server,
@@ -7498,18 +7559,14 @@ fn apply_disabled_map_areas(smudgy: &Smudgy, set: &HashSet<AreaId>) {
 fn apply_scope_exclusions(smudgy: &Smudgy) {
     for (_, session) in smudgy.sessions.iter() {
         if let Some(mapper) = &session.mapper {
-            mapper.set_scope_exclusions(
-                smudgy.map_scopes.excluded_atlases(&session.server_name),
-                smudgy.map_scopes.excluded_areas(&session.server_name),
-            );
+            mapper.set_scope_exclusions(smudgy.map_scopes.exclusions(&session.server_name));
         }
     }
     for window in smudgy.map_editor_windows.values() {
         if let Some(server) = window.server_name() {
-            window.mapper().set_scope_exclusions(
-                smudgy.map_scopes.excluded_atlases(server),
-                smudgy.map_scopes.excluded_areas(server),
-            );
+            window
+                .mapper()
+                .set_scope_exclusions(smudgy.map_scopes.exclusions(server));
         }
     }
 }
@@ -7522,24 +7579,28 @@ fn apply_scope_exclusions(smudgy: &Smudgy) {
 // rescue hits, creations); the policy lives entirely in these functions.
 
 /// Resolve a session location/navigation area to the scope target it would bind
-/// (its atlas, or the atlas-less cloud area itself), or `None` when the area is
-/// ephemeral or local-tier — neither ever binds. Local ids collide across
+/// (its clan, its atlas, or the atlas-less cloud area itself), or `None` when
+/// the area is ephemeral or local-tier — neither ever binds. A Secret's or
+/// Private source's rooms resolve to their map. Local ids collide across
 /// entries (the 0.4.1 migration seeded verbatim copies with preserved ids), so
 /// scoping a local area would wrongly hide its twin on another entry; ephemeral
 /// areas are session-scoped by nature.
 fn bind_target_for_area(mapper: &Mapper, area_id: AreaId) -> Option<BindTarget> {
+    let atlas = mapper.get_current_atlas();
+    let area_id = atlas.map_of(&area_id).unwrap_or(area_id);
     if mapper.area_storage(&area_id) == MapStorage::Session
         || mapper.local_area_ids().contains(&area_id)
     {
         return None;
     }
-    let atlas = mapper.get_current_atlas();
-    let atlas_id = atlas
-        .get_area(&area_id)
-        .and_then(|area| area.meta().atlas_id);
-    Some(match atlas_id {
-        Some(atlas_id) => BindTarget::Atlas(atlas_id),
-        None => BindTarget::Area(area_id),
+    let (atlas_id, clan_id) = atlas.get_area(&area_id).map_or((None, None), |area| {
+        let meta = area.meta();
+        (meta.atlas_id, meta.clan_id)
+    });
+    Some(match (clan_id, atlas_id) {
+        (Some(clan_id), _) => BindTarget::Clan(clan_id),
+        (None, Some(atlas_id)) => BindTarget::Atlas(atlas_id),
+        (None, None) => BindTarget::Area(area_id),
     })
 }
 
@@ -7548,6 +7609,7 @@ fn target_scope(scopes: &MapScopes, target: BindTarget, entry: &str) -> ScopeSta
     match target {
         BindTarget::Atlas(atlas_id) => scopes.atlas_scope(&atlas_id, entry),
         BindTarget::Area(area_id) => scopes.area_scope(&area_id, entry),
+        BindTarget::Clan(clan_id) => scopes.clan_scope(&clan_id, entry),
     }
 }
 
@@ -7556,6 +7618,82 @@ fn set_scope_entry(scopes: &mut MapScopes, target: BindTarget, entry: &str, show
     match target {
         BindTarget::Atlas(atlas_id) => scopes.set_atlas_entry(atlas_id, entry, show),
         BindTarget::Area(area_id) => scopes.set_area_entry(area_id, entry, show),
+        BindTarget::Clan(clan_id) => scopes.set_clan_entry(clan_id, entry, show),
+    }
+}
+
+/// Whether bind-on-use may bind `target`. A clan with "Plays on" hosts is
+/// placed by homing alone: its hosts say where it belongs, and play elsewhere
+/// (a stock zone another game shares) must not bind it there. Until the clan
+/// list arrives (`clan_hosts` is `None`), no clan binds: whether it has hosts
+/// isn't known yet. A clan missing from the list (a map an outside share
+/// reached) has none.
+fn binds_on_use(clan_hosts: Option<&HashMap<Uuid, Vec<String>>>, target: BindTarget) -> bool {
+    match target {
+        BindTarget::Clan(clan_id) => {
+            clan_hosts.is_some_and(|clans| clans.get(&clan_id).is_none_or(Vec::is_empty))
+        }
+        BindTarget::Atlas(_) | BindTarget::Area(_) => true,
+    }
+}
+
+/// How long a clan list stays fresh enough that a session connecting skips
+/// asking again.
+const CLANS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// `GET /clans` when signed in, else a no-op.
+fn fetch_clans(smudgy: &mut Smudgy) -> Task<Message> {
+    if smudgy.account.snapshot().signed_in {
+        smudgy.clans_fetched_at = Some(Instant::now());
+        fetch_clans_task(&smudgy.account.handles())
+    } else {
+        Task::none()
+    }
+}
+
+/// [`fetch_clans`] unless a list went out within [`CLANS_REFRESH_INTERVAL`].
+fn refresh_clans(smudgy: &mut Smudgy) -> Task<Message> {
+    let fresh = smudgy
+        .clans_fetched_at
+        .is_some_and(|at| at.elapsed() < CLANS_REFRESH_INTERVAL);
+    if fresh {
+        Task::none()
+    } else {
+        fetch_clans(smudgy)
+    }
+}
+
+fn fetch_clans_task(handles: &crate::cloud_account::CloudHandles) -> Task<Message> {
+    let client = handles.client.clone();
+    let generation = handles.credentials.generation();
+    Task::perform(async move { client.clans().await }, move |result| {
+        Message::ClansFetched(generation, result)
+    })
+}
+
+/// Adopts a complete list of the account's clans: their hosts replace the
+/// last-known set, and clans are homed onto matching server entries. An
+/// unchanged list changes nothing.
+fn adopt_clans(smudgy: &mut Smudgy, clans: &[ClanSummary]) -> Task<Message> {
+    let hosts: HashMap<Uuid, Vec<String>> = clans
+        .iter()
+        .map(|clan| (clan.id, clan.hosts.clone()))
+        .collect();
+    if smudgy.clan_hosts.as_ref() == Some(&hosts) {
+        return Task::none();
+    }
+    smudgy.clan_hosts = Some(hosts);
+    reconcile_scopes(smudgy)
+}
+
+/// Drops deleted server entries from the scope store and homes clans onto the
+/// current entries, committing when anything changed.
+fn reconcile_scopes(smudgy: &mut Smudgy) -> Task<Message> {
+    let clan_hosts = smudgy.clan_hosts.clone().unwrap_or_default();
+    if smudgy.map_scopes.reconcile_with_servers(&clan_hosts) {
+        commit_scope_change(smudgy)
+    } else {
+        Task::none()
     }
 }
 
@@ -7569,6 +7707,9 @@ fn resolve_bind_input(
     let session = smudgy.sessions.get(session_id)?;
     let mapper = session.mapper.as_ref()?;
     let target = bind_target_for_area(mapper, area_id)?;
+    if !binds_on_use(smudgy.clan_hosts.as_ref(), target) {
+        return None;
+    }
     let unassigned =
         target_scope(&smudgy.map_scopes, target, &session.server_name) == ScopeState::Unassigned;
     Some((target, unassigned))
@@ -7651,7 +7792,11 @@ fn associate_created_area(
     }) else {
         return Task::none();
     };
-    if target_scope(&smudgy.map_scopes, target, &server_name) == ScopeState::Here {
+    let scope = target_scope(&smudgy.map_scopes, target, &server_name);
+    // A clan placed on other servers stays there: a script making a map in it
+    // on another entry (a builder's port, say) doesn't add that entry.
+    let clan_placed = matches!(target, BindTarget::Clan(_)) && scope == ScopeState::Elsewhere;
+    if scope == ScopeState::Here || clan_placed {
         return Task::none();
     }
     set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
@@ -7704,7 +7849,52 @@ fn commit_scope_change(smudgy: &mut Smudgy) -> Task<Message> {
             ))
         })
         .collect();
-    Task::batch(mirror)
+    Task::batch([Task::batch(mirror), push_clan_local(smudgy)])
+}
+
+/// What the Clans pages show from this computer: the active session's host
+/// (a new clan's default "Plays on"), the server entries, and the scope store.
+fn clan_local_context(smudgy: &Smudgy) -> clan_panel::LocalContext {
+    let servers = smudgy_core::models::server::list_servers().unwrap_or_default();
+    let session_host = active_server_name(smudgy).and_then(|name| {
+        servers
+            .iter()
+            .find(|server| server.name == name)
+            .map(|server| server.config.host.trim().to_ascii_lowercase())
+            .filter(|host| is_plays_on_host(host))
+    });
+    clan_panel::LocalContext {
+        session_host,
+        servers: servers.into_iter().map(|server| server.name).collect(),
+        scopes: smudgy.map_scopes.clone(),
+    }
+}
+
+/// Whether `host` is a hostname or IPv4 address the cloud service takes as a
+/// clan's "Plays on" host: dot-separated labels of ASCII letters, digits, `-`
+/// and `_`.
+fn is_plays_on_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// Hands every settings window a fresh [`clan_local_context`].
+fn push_clan_local(smudgy: &Smudgy) -> Task<Message> {
+    if smudgy.settings_windows.is_empty() {
+        return Task::none();
+    }
+    let local = clan_local_context(smudgy);
+    Task::batch(smudgy.settings_windows.keys().copied().map(|id| {
+        Task::done(Message::SettingsWindowMessage(
+            id,
+            settings_window::Message::ClanLocal(local.clone()),
+        ))
+    }))
 }
 
 /// Wakes every live mapper's sync engine so credential changes (login,
@@ -9446,5 +9636,41 @@ mod tests {
         // The timestamped prefs win; the legacy list is ignored when present.
         assert_eq!(prefs.len(), 1);
         assert!(prefs.contains_key(&area(9)));
+    }
+
+    #[test]
+    fn only_a_host_the_service_takes_is_offered_as_plays_on() {
+        assert!(is_plays_on_host("mud.arctic.org"));
+        assert!(is_plays_on_host("10.0.0.5"));
+        assert!(is_plays_on_host("my_mud-1.example"));
+        for refused in [
+            "",
+            "::1",
+            "fe80::1",
+            "mud.arctic.org.",
+            "mud.\u{e4}rctic.org",
+            "a..b",
+        ] {
+            assert!(!is_plays_on_host(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_clan_binds_by_use_only_once_listed_without_hosts() {
+        let clan = Uuid::from_u128(7);
+        let target = BindTarget::Clan(clan);
+        assert!(!binds_on_use(None, target), "not listed yet");
+        let hosted = HashMap::from([(clan, vec!["mud.arctic.org".to_string()])]);
+        assert!(!binds_on_use(Some(&hosted), target));
+        let hostless = HashMap::from([(clan, Vec::new())]);
+        assert!(binds_on_use(Some(&hostless), target));
+        assert!(
+            binds_on_use(Some(&HashMap::new()), target),
+            "a clan an outside share reached has no hosts"
+        );
+        assert!(binds_on_use(
+            None,
+            BindTarget::Atlas(AtlasId(Uuid::from_u128(1)))
+        ));
     }
 }

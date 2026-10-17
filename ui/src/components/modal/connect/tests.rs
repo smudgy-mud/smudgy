@@ -421,7 +421,8 @@ fn test_server_created_chains_into_add_profile() {
         }),
     );
 
-    assert!(event.is_none());
+    // The daemon hears of the new entry, so clans can be homed onto it.
+    assert_eq!(event, Some(Event::ServersChanged));
     assert!(state.server_action.is_none());
     assert_eq!(state.selected_server, Some(new_server.name.clone()));
     assert_eq!(

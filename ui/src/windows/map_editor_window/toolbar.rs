@@ -280,8 +280,8 @@ fn map_menu(
         entries.push((label, Message::MoveAreaRequested(area_id)));
     }
     // A loose cloud map carries its own server checklist; a filed one is
-    // scoped by its folder.
-    if cloud && !filed {
+    // scoped by its folder, and a clan's map by its clan.
+    if cloud && !filed && window.area_clan(area_id).is_none() {
         entries.push((
             crate::i18n::t!("area-list-servers-action"),
             Message::ServersChecklistRequested(ScopeTarget::Area(area_id)),

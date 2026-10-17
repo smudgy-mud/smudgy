@@ -305,6 +305,11 @@ pub struct ClanSummary {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// "Plays on": the hosts the clan's game answers on, each a lowercased
+    /// `host` or `host:port`. Members' clients match them against their
+    /// server entries.
+    #[serde(default)]
+    pub hosts: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub member_count: u32,
     /// Whether the caller is one of its owners.
@@ -471,8 +476,12 @@ impl CloudApiClient {
     /// [`CloudError::NameInUse`](crate::CloudError::NameInUse) if a user holds
     /// that nickname (ignoring ASCII case); other failures via
     /// [`CloudError::from_status`](crate::CloudError::from_status).
-    pub async fn create_clan(&self, name: &str) -> CloudResult<ClanSummary> {
-        let body = json!({ "name": name });
+    pub async fn create_clan(&self, name: &str, hosts: &[String]) -> CloudResult<ClanSummary> {
+        let body = if hosts.is_empty() {
+            json!({ "name": name })
+        } else {
+            json!({ "name": name, "hosts": hosts })
+        };
         self.post("/clans", Some(&body), Auth::Required).await
     }
 

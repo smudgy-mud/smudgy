@@ -285,6 +285,8 @@ pub enum Event {
     RestoreLastSession {
         server: String,
     },
+    /// A server entry was created, edited or deleted.
+    ServersChanged,
     /// Re-run a prompted apply with every omitted session answered.
     ApplyLayoutWithAnswers {
         server: String,
@@ -3140,7 +3142,11 @@ impl SmudgyWindow {
                 if let Some(m) = self.modal.as_mut() {
                     let (task, event) = m.update(msg);
                     if let Some(evt) = event {
-                        return self.update(Message::ModalEvent(evt), sessions);
+                        // The modal's own follow-up (a profile load after a
+                        // server is created, say) still runs.
+                        let mut update = self.update(Message::ModalEvent(evt), sessions);
+                        update.task = Task::batch([task.map(Message::ModalMessage), update.task]);
+                        return update;
                     }
                     // A stage retreat (Back to browsing) can free the modal
                     // surface for a parked keep-or-close prompt.
@@ -3175,6 +3181,9 @@ impl SmudgyWindow {
                         Update::with_event(Event::RestoreLastSession {
                             server: server_name,
                         })
+                    }
+                    modal::ConnectEvent::ServersChanged => {
+                        Update::with_event(Event::ServersChanged)
                     }
                 },
                 modal::Event::Layouts(layouts_event) => {

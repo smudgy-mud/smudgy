@@ -93,7 +93,12 @@ async fn fixture() -> Fixture {
     let bo = member(&server, "bo");
     let cy = member(&server, "cy");
     let zed = member(&server, "zed");
-    let clan = mira.api.create_clan("Lantern Company").await.unwrap().id;
+    let clan = mira
+        .api
+        .create_clan("Lantern Company", &[])
+        .await
+        .unwrap()
+        .id;
     for joining in [&ann, &bo, &cy] {
         server.join_clan(clan, &joining.user);
     }
@@ -392,7 +397,7 @@ async fn recipients_are_the_clans_members_and_groups() {
             .grant_clan_secret(&c.secret, to(&c.zed), &[])
             .await
     ));
-    let other = c.zed.api.create_clan("Elsewhere").await.unwrap().id;
+    let other = c.zed.api.create_clan("Elsewhere", &[]).await.unwrap().id;
     let foreign = c
         .zed
         .api

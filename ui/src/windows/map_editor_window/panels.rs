@@ -12,14 +12,13 @@ use iced::widget::{Column, button, column, container, row, rule, space, text};
 use iced::{Length, Padding, Task};
 use smudgy_cloud::cloud_api::{FriendView, GrantTreeNode, ShareDirection, ShareGrantRow};
 use smudgy_cloud::{AreaId, AtlasId, CloudError, MapStorage, RoomNumber, SourceId, Uuid};
-use smudgy_core::models::map_scopes::ScopeDelta;
 
 use crate::components::cloud_errors::display_error;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
 
-use super::{Event, MapEditorWindow, Message, modals};
+use super::{Event, MapEditorWindow, Message, ScopeTarget, modals};
 
 // ===========================================================================
 // Which panel
@@ -254,10 +253,10 @@ pub enum PanelMessage {
     RenameChanged(String),
     RenameSubmitted,
     RenameCancelled,
-    /// The atlas panel's Servers checklist: show the atlas on a server entry
-    /// or not.
+    /// The atlas panel's Servers checklist: show the atlas (or, for a clan's
+    /// folder, its clan) on a server entry or not.
     ServerToggled {
-        atlas_id: AtlasId,
+        target: ScopeTarget,
         entry: String,
         show: bool,
     },
@@ -358,15 +357,11 @@ impl MapEditorWindow {
             }
             PanelMessage::RenameCancelled => self.panel.atlas_rename = None,
             PanelMessage::ServerToggled {
-                atlas_id,
+                target,
                 entry,
                 show,
             } => {
-                let delta = ScopeDelta::SetAtlasEntry {
-                    atlas_id,
-                    entry,
-                    show,
-                };
+                let delta = target.toggle(entry, show);
                 self.map_scopes.apply(&delta);
                 return Update::with_event(Event::ScopeAssociationsChanged(vec![delta]));
             }

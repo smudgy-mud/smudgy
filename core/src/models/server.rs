@@ -571,6 +571,25 @@ pub fn update_server_if_unchanged(
     update_server(&expected.name, new_config).map(ServerCas::Applied)
 }
 
+/// Whether the server entry `name` still has its directory, whatever the
+/// state of its `server.json`. Deleting an entry removes its directory, so a
+/// valid name without one names a deleted entry.
+///
+/// # Errors
+/// Returns an error if the smudgy home directory cannot be resolved, or the
+/// entry's directory can't be inspected for any reason but its absence.
+pub fn server_exists(name: &str) -> Result<bool> {
+    if validate_server_name(name).is_err() {
+        return Ok(false);
+    }
+    let path = get_smudgy_home()?.join(name);
+    match fs::metadata(&path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context(format!("Failed to inspect {}", path.display())),
+    }
+}
+
 /// Deletes a server and all its associated data.
 ///
 /// Credentials that live outside the server directory (profile passwords and package secrets)

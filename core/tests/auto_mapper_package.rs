@@ -11,7 +11,6 @@
 //! available to a fresh mapper on the next run.
 
 use std::cell::Cell;
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1738,7 +1737,10 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
             },
         )
         .expect("seed room should enqueue");
-    mapper.set_scope_exclusions(HashSet::new(), std::iter::once(elsewhere).collect());
+    mapper.set_scope_exclusions(smudgy_cloud::mapper::ScopeExclusions {
+        areas: std::iter::once(elsewhere).collect(),
+        ..Default::default()
+    });
     assert!(
         mapper
             .get_current_atlas()
