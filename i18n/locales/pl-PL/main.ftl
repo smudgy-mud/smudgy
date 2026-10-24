@@ -1,9 +1,115 @@
+### TERMINOLOGY USED
+###
+### map          → mapa
+### area         → mapa (never obszar) — in keys and English it means a map.
+### folder       → folder (not katalog, which is kept for file-system dirs)
+### atlas        → folder (same as folder)
+### room         → pokój (not pomieszczenie)
+### exit         → wyjście
+### link (between rooms) → połączenie
+### label (on the map)   → etykieta
+### shape        → kształt
+### package      → pakiet
+### bundle       → paczka (never pakiet, which means package)
+### session      → sesja
+### trigger / alias / hotkey → wyzwalacz / alias / skrót klawiszowy
+### settings     → ustawienia — the values a user configures.
+### parameters   → parametry — only the declarations in a package manifest (manifest-param-*).
+### secret (map feature) → sekret, lowercase, like any common noun.
+### secret (package setting value) → wartość tajna / tajny. Never sekret, which would be confused with map secrets.
+### share (button)       → Udostępnij
+### share (noun)         → udostępnianie, udostępnienie; grant → nadać, nadanie (uprawnień).
+### transfer offer (to a friend) → oferta; ownership offer → propozycja.
+### delete / remove → Usuń for both (normal in Polish UI); Usuń z … when it only takes something out of a set.
+### uninstall    → Odinstaluj
+### revoke       → Odbierz (access), Unieważnij (API keys, sessions), Cofnij (invitations)
+### keep (button)    → Zachowaj (Zapisz means Save)
+### discard      → Odrzuć
+### clear        → Wyczyść (Opróżnij means "empty", as a bin)
+### sign in / out → Zaloguj się / Wyloguj się
+### scrollback   → bufor przewijania (not historia, which is command history)
+### layout       → układ; pane → panel; toolbar → pasek narzędzi
+### prompt (game) → monit
+### pin a version → przypnij; yank a version → wycofaj
+### sandbox      → sandbox
+### isolate      → izolat
+### handle       → uchwyt
+### debugging    → debugowanie
+### control characters/bytes → znaki sterujące / bajty sterujące
+### by default   → domyślnie; default (adj.) → domyślny
+### top level    → poziom główny
+### one-way / two-way → jednokierunkowe / dwukierunkowe
+### dashed / dotted → przerywana / kropkowana
+###
+### PUNCTUATION
+###
+### Quotation marks: „…” (U+201E … U+201D) — never „…" with a straight
+### closing quote, and never "…".
+### Use „” for quoted names and for UI labels named mid-sentence
+### (naciśnij „Szukaj”, w sekcji „Odkrywaj”).
+### A variable name after its noun goes in „” too: klan „{ $clan }”,
+### folder „{ $folder }”, grupa „{ $group }”.
+### Ellipsis: … (U+2026), never three periods.
+### Ranges take an en dash with no spaces: 3–24 znaki.
+### A dash in a sentence is an em dash with spaces: — (not -).
+### Lowercase after a colon: Błąd: nie wybrano serwera.
+### Abbreviations: s, min without a period; godz., np., nr with one.
+### Smudgy is capitalised in prose and grammatically masculine
+### (Smudgy jest nieaktualny, Smudgy sam dodaje); lowercase only inside
+### identifiers (smudgy://, smudgy:core, smudgy.package.json).
+###
+### PLURALS
+###
+### Polish has four CLDR categories, and they don't follow the last digit:
+###   [one]   only 1 (21 is [many]: 21 pokoi)
+###   [few]   2–4, 22–24, 32–34… but not 12–14
+###   [many]  0, 5–21, 25–31…
+###   *[other] fractions only, which take the genitive singular: 1,5 pokoju.
+###
+### 1. When the numeral is printed, all four branches are needed. A bare
+###    { $count } before a noun with no selector ("{ $count } pokoi") is
+###    always a bug: it breaks on 2–4.
+### 2. Masculine-personal nouns take the genitive in [few] as well:
+###    2 członków, 3 graczy.
+### 3. After a negation the noun is genitive in every branch:
+###    nie udało się uwzględnić 1 karty / 2 kart / 5 kart.
+### 4. Prefer { $count } to a hardcoded 1 in [one]. It renders the same,
+###    since [one] fires only on 1, but keeps the branches uniform.
+###
+### Where a string is a badge or a stat rather than a sentence, prefer
+### label-first (nieudane: { $count }) over a selector — the number then
+### sits outside the agreement chain. See mapper-sync-failed,
+### mapper-syncing, inspector-tag-adds-to, package-publish-step-typings.
+###
+### REGISTER
+###
+### Address the user as Ty, capitalised throughout (Ty, Twój, Cię, Ci).
+### Checkbox and toggle labels take the imperative: Pokaż, Ukryj, Włącz.
+### Permission lists and permission help take the infinitive: Tworzyć
+### aliasy, Zmieniać nazwę klanu. "Nie może:" lists keep the genitive of
+### negation: tworzyć aliasów, odczytywać Twoich map.
+### Confirmations use the short infinitive question: Usunąć „{ $name }”?
+### Help text under an option says what will happen, in the future tense:
+### Właściciele klanu staną się współwłaścicielami tej mapy.
+### Avoid the generic masculine for the user or another person: use (a)
+### or a neutral form — Udostępnił(a): { $name }; Twoje konto zostało
+### usunięte i nastąpiło wylogowanie.
+### Prefer natural Polish to calques: masz (not posiadasz), na razie (not
+### póki co), używaj raczej (not preferuj).
+###
+### Section comments (# …) stay in English, like the keys.
+
+
+
+
+
+
 # Locale names
 locale-system = Język systemowy
 locale-english = Angielski (Stany Zjednoczone)
 locale-polish = Polski
 locale-ukrainian = Ukraiński
-locale-traditional-chinese = Chiński Tradycyjny (Tajwan)
+locale-traditional-chinese = Chiński tradycyjny (Tajwan)
 
 # Shared actions and states
 action-apply = Zastosuj
@@ -11,7 +117,7 @@ action-add = Dodaj
 action-back = Wstecz
 action-cancel = Anuluj
 action-close = Zamknij
-action-clear = Opróżnij
+action-clear = Wyczyść
 action-confirm = Potwierdź
 action-connect = Połącz
 action-continue = Kontynuuj
@@ -27,8 +133,8 @@ action-remove = Usuń
 action-reset = Zresetuj
 action-save = Zapisz
 action-send = Wyślij
-action-sign-in = Zaloguj
-action-sign-out = Wyloguj
+action-sign-in = Zaloguj się
+action-sign-out = Wyloguj się
 action-update = Aktualizuj
 state-disabled = Wyłączone
 state-enabled = Włączone
@@ -72,8 +178,8 @@ account-email-code = Wyślij mi kod e-mailem
 account-recheck = Sprawdź ponownie
 account-sign-out-everywhere = wyloguj wszędzie (na wszystkich urządzeniach)
 account-choose-nickname = Wybierz swój pseudonim
-account-nickname-description = To Twoja publiczna nazwa użytkownika. Twój email pozostaje prywatny.
-account-nickname-placeholder = pseudonim (3-24 znaków: litery, cyfry, - lub _)
+account-nickname-description = To Twoja publiczna nazwa użytkownika. Twój adres e-mail pozostaje prywatny.
+account-nickname-placeholder = pseudonim (3–24 znaki: litery, cyfry, „-” lub „_”)
 account-claim-handle = Zarezerwuj nazwę
 account-nickname-change-warning = Zmiana pseudonimu zmienia sposób, w jaki znajdują Cię inni użytkownicy.
 account-change-nickname = Zmień pseudonim
@@ -94,13 +200,13 @@ account-error-email-for-resend = Najpierw podaj adres e-mail w formularzu, abyś
 account-busy-sending = Wysyłanie…
 account-notice-code-resent = Jeśli do tego adresu przypisane jest konto, nowy kod jest już w drodze (zastąpi on wcześniejszy kod).
 account-busy-saving-nickname = Zapisywanie pseudonimu…
-account-notice-nickname-changed = Jesteś { $handle }.
+account-notice-nickname-changed = Twój pseudonim to teraz { $handle }.
 account-notice-signed-out = Wylogowano.
 account-delete = Usuń konto…
-account-delete-title = Usunąć Twoje konto?
+account-delete-title = Usunąć konto?
 account-delete-goes = Na zawsze usunięte zostaną:
 account-delete-goes-maps = • Twoje mapy i foldery
-account-delete-goes-secrets = • Sekrety, których jesteś właścicielem, i Twoje Prywatne notatki na każdej mapie
+account-delete-goes-secrets = • Sekrety, których jesteś właścicielem, i Twoje prywatne notatki na każdej mapie
 account-delete-goes-social = • Twoje udostępnienia i znajomości
 account-delete-goes-clans = • Twoje członkostwa w klanach
 account-delete-member-secrets = Sekrety w klanie, których jesteś ostatnim właścicielem, zostają — tylko do odczytu dla osób, które mogą je czytać.
@@ -108,14 +214,14 @@ account-delete-stays = Opublikowane przez Ciebie pakiety zostają, pod swoimi na
 account-delete-type-nickname = Wpisz { $nickname }, aby potwierdzić.
 account-delete-confirm = Usuń moje konto
 account-busy-deleting = Usuwanie konta…
-account-delete-done = Twoje konto zostało usunięte, a Ty wylogowany(-a).
-account-delete-signed-out = Wylogowano. Twoje konto jest usuwane; smudgy dokończy to samo.
-account-delete-last-owner = Jesteś ostatnim właścicielem: { $clans }. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie.
-account-delete-last-owner-unnamed = Jesteś ostatnim właścicielem klanu. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie.
+account-delete-done = Twoje konto zostało usunięte i nastąpiło wylogowanie.
+account-delete-signed-out = Wylogowano. Twoje konto jest usuwane; Smudgy dokończy to automatycznie.
+account-delete-last-owner = Jesteś ostatnim właścicielem tych klanów: { $clans }. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie usunąć swoje konto.
+account-delete-last-owner-unnamed = Jesteś ostatnim właścicielem klanu. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie usunąć swoje konto.
 account-delete-not-deleted = Konto nie zostało usunięte: { $error }
-account-delete-unfinished = Usuwanie konta nie zostało dokończone: { $error } Spróbuj ponownie; kolejna próba je dokończy.
+account-delete-unfinished = Usuwanie konta nie zostało dokończone: { $error } Spróbuj ponownie.
 account-error-nickname-empty = Podaj pseudonim.
-account-error-nickname-format = Pseudonim musi składać się z 3-24 znaków: liter, cyfr, „-" lub „_".
+account-error-nickname-format = Pseudonim musi składać się z 3–24 znaków: liter, cyfr, „-” lub „_”.
 
 # Preferences
 preferences-title = Ustawienia
@@ -153,13 +259,13 @@ accent-raspberry = Malina
 accent-slate = Łupek
 accent-graphite = Grafit
 preferences-theme = Motyw
-preferences-theme-extended-colors = Dopasuj kody TrueColor i 256-kolorowe do odcieni motywu.
+preferences-theme-extended-colors = Dopasuj kody TrueColor i 256-kolorowe do odcieni motywu
 preferences-theme-extended-colors-help = Gdy ta opcja jest wyłączona, kody 256-kolorowe i TrueColor są precyzyjnie renderowane, co może utrudniać odczyt ciemniejszego tekstu w motywach, jeśli nie masz czarnego tła.
-preferences-scrollback = Historia sesji
+preferences-scrollback = Bufor przewijania
 preferences-scrollback-help = Liczba wierszy zachowywanych na sesję. Naciśnij Enter, aby zastosować.
 preferences-link-tooltip-delay = Opóźnienie podpowiedzi odnośnika (ms)
 preferences-link-tooltip-delay-help = Czas, przez który wskaźnik musi pozostać nad odnośnikiem, zanim pojawi się podpowiedź. 0 wyświetla ją natychmiast; maksimum to 60000. Naciśnij Enter, aby zastosować.
-preferences-hide-pane-headers = Ukryj nagłówki paneli, gdy menu główne jest ukryte
+preferences-hide-pane-headers = Ukryj nagłówki paneli, gdy pasek narzędzi jest ukryty
 preferences-hide-pane-headers-help = Paski tytułu sesji i paneli są widoczne tylko wtedy, gdy pasek narzędzi okna jest rozwinięty, chyba że skrypty uniemożliwiają ich ukrycie.
 preferences-input = Wprowadzanie
 preferences-command-separator = Separator poleceń
@@ -177,17 +283,17 @@ preferences-logging-raw = Zapisuj też surowe logi (zawierają kody kolorów ANS
 preferences-logging-raw-help = Zapisywanie surowych logów zacznie się przy następnym połączeniu.
 preferences-advanced = Zaawansowane
 preferences-advanced-scripting = Włącz zaawansowane funkcje skryptowe
-preferences-advanced-scripting-help = Odblokowuje opcję „Usuń sandbox" (uruchamianie zainstalowanego pakietu z pełnym dostępem)
+preferences-advanced-scripting-help = Odblokowuje opcję „Usuń sandbox” (uruchamianie zainstalowanego pakietu z pełnym dostępem)
 preferences-integrations = Integracje
 preferences-discord-rich-presence = Pokazuj grę, w którą grasz, na Discordzie
-preferences-discord-rich-presence-help = Wyświetla „Gra Smudgy” oraz nazwę serwera po połączeniu w aplikacji Discord na tym komputerze. Ustawienia prywatności Discorda decydują, kto widzi Twój status.
+preferences-discord-rich-presence-help = Podczas połączenia wyświetla w aplikacji Discord na tym komputerze „Gra w Smudgy” i nazwę serwera. O tym, kto widzi Twój status, decydują ustawienia prywatności Discorda.
 preferences-updates = Aktualizacje
 preferences-auto-updates = Automatycznie sprawdzaj dostępność aktualizacji
 preferences-mask-password-input = Ukryj wpisywany tekst, gdy serwer prosi o hasło
-preferences-reconnect-on-send-error = Łącz ponownie automatycznie, gdy nie uda się wysłać polecenia
-preferences-reconnect-on-send-error-help = Gdy połączenie zostało zerwane, a Ty wyślesz polecenie, Smudgy łączy się ponownie i oddaje polecenie do pola wprowadzania, zaznaczone — naciśnij Enter, aby wysłać je po połączeniu, albo po prostu pisz dalej. Sesje otwarte offline lub rozłączone przez Ciebie pozostają offline.
+preferences-reconnect-on-send-error = Automatycznie połącz ponownie, jeśli nie uda się wysłać polecenia
+preferences-reconnect-on-send-error-help = Gdy połączenie zostało zerwane, a Ty wyślesz polecenie, Smudgy połączy się ponownie, przywróci polecenie do pola wprowadzania i je zaznaczy — naciśnij Enter, aby wysłać je po połączeniu, albo po prostu pisz dalej. Sesje otwarte offline lub rozłączone przez Ciebie pozostają offline.
 preferences-history-case-sensitive-match = Dopasowywanie historii z rozróżnianiem wielkości liter
-preferences-history-case-sensitive-match-help = Góra/Dół przechodzi tylko po wpisach historii zaczynających się od tekstu, który pozostał niezaznaczony. Domyślnie wyłączone - dopasowanie następuje niezależne od wielkości liter; włącz, aby wymagać dopasowania wielkości liter.
+preferences-history-case-sensitive-match-help = Góra/Dół przechodzi tylko po wpisach historii zaczynających się od tekstu, który pozostał niezaznaczony. Domyślnie wyłączone — dopasowanie nie uwzględnia wielkości liter; włącz, aby ją uwzględniać.
 preferences-max-history = Rozmiar historii poleceń
 preferences-max-history-help = Ile ostatnich poleceń zapamiętuje historia Góra/Dół. 0 oznacza zachowanie wszystkiego.
 preferences-invalid-value = nieprawidłowa wartość
@@ -202,7 +308,7 @@ theme-background = Tło
 theme-brightness = Jasność
 theme-contrast = Kontrast
 theme-saturation = Nasycenie
-theme-adjust-help = Tło wpływa tylko na powierzchnie; Kontrast oddala tekst od tła.
+theme-adjust-help = „Tło” wpływa tylko na powierzchnie; „Kontrast” oddala tekst od tła.
 theme-reset-adjustments = Zresetuj dostosowania
 theme-preview = Zażółć gęślą jaźń
 
@@ -232,7 +338,7 @@ friends-verify-email = Zweryfikuj adres e-mail, aby odnaleźć znajomych i dziel
 friends-go-account = Przejdź do konta
 
 # Client validation labels
-validation-invalid-value = niewłaściwa wartość
+validation-invalid-value = nieprawidłowa wartość
 
 # Server text encoding
 encoding-label = Kodowanie tekstu serwera
@@ -244,7 +350,7 @@ connection-connected = Połączono.
 connection-disconnected = Rozłączono.
 connection-lost = Utracono połączenie
 connection-failed = Połączenie nie powiodło się
-connection-decode-warning = Część tekstu serwera nie była prawidłowym kodowaniem { $encoding } i została zastąpiona.
+connection-decode-warning = Części tekstu serwera nie udało się odczytać w kodowaniu { $encoding }, więc została zastąpiona.
 connection-encode-warning = Polecenie nie zostało wysłane, ponieważ niektórych znaków nie można przedstawić w kodowaniu { $encoding }.
 session-action-connect = Połącz
 session-action-reconnect = Połącz ponownie
@@ -282,13 +388,13 @@ server-mccp4-compression = Zezwól na kompresję (MCCP4)
 server-tls = Bezpieczne połączenie (TLS)
 server-tls-verify = Weryfikuj certyfikat
 server-tls-insecure-help = Odznacz tylko w przypadku serwerów z certyfikatami z podpisem własnym (niezabezpieczone).
-server-confirm-delete = Czy na pewno chcesz usunąć serwer „{ $name }"? Tej operacji nie można cofnąć.
+server-confirm-delete = Czy na pewno chcesz usunąć serwer „{ $name }”? Tej operacji nie można cofnąć.
 server-confirm-delete-action = Tak, usuń ten serwer
 server-error-port = Nieprawidłowy numer portu. Numer portu musi mieścić się w zakresie od 1 do 65535.
 server-error-destination-scheme = Adres docelowy musi być nazwą hosta albo adresem wss://.
 server-error-destination-empty = Adres docelowy nie może być pusty.
 server-error-name-empty = Nazwa serwera nie może być pusta.
-server-error-name-format = Nazwa serwera może zawierać tylko litery, cyfry, podkreślenia i myślniki.
+server-error-name-format = Nazwa serwera może zawierać tylko litery, cyfry, podkreślenia i łączniki.
 server-error-config = Błąd konfiguracji: { $error }
 server-error-create = Nie udało się utworzyć serwera: { $error }
 server-error-update = Nie udało się zaktualizować serwera: { $error }
@@ -297,12 +403,12 @@ server-error-state-changed = Serwer uległ zmianie przed zakończeniem zapisu. W
 server-error-delete-state-changed = Serwer uległ zmianie przed zakończeniem usuwania. Załaduj go ponownie i spróbuj jeszcze raz.
 server-error-cache-changed = Serwer zmienił się przed wyczyszczeniem pamięci podręcznej obrazów. Załaduj go ponownie i spróbuj jeszcze raz.
 server-error-cache-clear = Nie udało się wyczyścić pamięci podręcznej obrazów: { $error }
-server-error-action-delete = Nieoczekiwany błąd: Nie można wysłać podczas potwierdzania usunięcia.
-server-error-action-missing = Nieoczekiwany błąd: Brak trwającej operacji.
+server-error-action-delete = Nieoczekiwany błąd: nie można wysłać podczas potwierdzania usunięcia.
+server-error-action-missing = Nieoczekiwany błąd: brak trwającej operacji.
 server-edit-short = Edytuj
 server-details-missing = Nie znaleziono szczegółów serwera.
 
-# Zaobserwowane metadane serwera (MSSP) na ekranie połączenia
+# Observed server metadata (MSSP) on the connect screen
 observed-players = { $players ->
     [one] 1 gracz
    *[other] { $players } graczy
@@ -320,20 +426,20 @@ observed-link-contact = Kontakt
 ago-just-now = przed chwilą
 ago-minutes = { $minutes } min temu
 ago-hours = { $hours } godz. temu
-ago-days = ago-days = { $days ->
+ago-days = { $days ->
     [one] { $days } dzień temu
    *[other] { $days } dni temu
 }
 
-# Propozycja przejścia na TLS w sesji
+# In-session offer to switch to TLS
 tls-offer-body = Ten serwer oferuje szyfrowane połączenie na porcie { $port }.
 tls-offer-accept = Przełącz i połącz ponownie
-tls-offer-decline = Nie dla tego serwera
+tls-offer-decline = Nie proponuj dla tego serwera
 
 profiles-title = Profile
 profiles-saved-help = Zapisane loginy dla tego serwera.
 profiles-load-error = Nie udało się załadować profili dla tego serwera.
-profiles-error-load = Błąd podczas ładowania profili dla „{ $server }": { $error }
+profiles-error-load = Błąd podczas ładowania profili dla „{ $server }”: { $error }
 profiles-new = + Nowy profil
 profiles-empty = Brak zapisanych profili
 profiles-restore-last = Przywróć ostatnią sesję ({ $profiles })
@@ -345,7 +451,7 @@ profile-add = Dodaj profil
 profile-create = Utwórz profil
 profile-edit = Edytuj profil
 profile-delete = Usuń profil
-profile-confirm-delete = Czy na pewno chcesz usunąć profil „{ $name }"?
+profile-confirm-delete = Czy na pewno chcesz usunąć profil „{ $name }”?
 profile-confirm-delete-action = Tak, usuń ten profil
 profile-connect = Połącz
 profile-connect-default = Połącz z profilem domyślnym
@@ -359,15 +465,15 @@ profile-password-change = Zmień
 profile-password-clear = Wyczyść
 profile-password-label = Hasło dla $PASSWORD
 profile-password-placeholder = Hasło
-profile-error-no-server = Błąd: Nie wybrano serwera.
+profile-error-no-server = Błąd: nie wybrano serwera.
 profile-error-password-required = Podaj hasło dla $PASSWORD lub usuń $PASSWORD z tekstu automatycznego logowania.
 profile-error-name-empty = Nazwa profilu nie może być pusta.
-profile-error-name-format = Nazwa profilu może zawierać tylko litery, cyfry, podkreślenia i myślniki.
+profile-error-name-format = Nazwa profilu może zawierać tylko litery, cyfry, podkreślenia i łączniki.
 profile-error-config = Błąd konfiguracji: { $error }
 profile-on-connect-example = Gandalf{ "\u000A" }$PASSWORD
-profile-error-action-delete = Nieoczekiwany błąd: Nie można wysłać podczas potwierdzania usunięcia.
-profile-error-action-missing = Nieoczekiwany błąd: Brak trwającej operacji.
-profile-error-delete-no-server = Błąd: Nie wybrano serwera do potwierdzenia usunięcia.
+profile-error-action-delete = Nieoczekiwany błąd: nie można wysłać podczas potwierdzania usunięcia.
+profile-error-action-missing = Nieoczekiwany błąd: brak trwającej operacji.
+profile-error-delete-no-server = Błąd: nie wybrano serwera do potwierdzenia usunięcia.
 profile-error-password-clear = Nie udało się wyczyścić zapisanego hasła: { $error }
 profile-error-create = Nie udało się utworzyć profilu: { $error }
 profile-error-update = Nie udało się zaktualizować profilu: { $error }
@@ -384,7 +490,7 @@ window-main-development = Smudgy — WERSJA DEWELOPERSKA
 window-main-release-candidate = Smudgy — KANDYDAT DO WYDANIA { $version }
 window-main-public-test-build = Smudgy — PUBLICZNA WERSJA TESTOWA { $version } — zbudowana { $build }
 window-main-nightly = Smudgy — WERSJA NOCNA { $version } — zbudowana { $build }
-window-automations = automatyzacje Smudgy — { $server }
+window-automations = Smudgy — Automatyzacje — { $server }
 toolbar-connect = Połącz
 toolbar-automations = Automatyzacje
 toolbar-map-editor = Edytor map
@@ -400,24 +506,29 @@ layout-menu-loading = Wczytywanie…
 layout-menu-saved-empty = Brak zapisanych układów.
 layout-menu-save-as = Zapisz układ jako…
 layout-menu-manage = Zarządzaj zapisanymi układami…
-layout-menu-reset = Resetuj układ paneli…
+layout-menu-reset = Zresetuj układ paneli…
 layout-menu-main = Główny
 layout-hidden-heading = Wszystko jest ukryte
 layout-hidden-subtext = Twoje sesje nadal działają.
 layout-hidden-show-all = Pokaż wszystkie panele
-layout-hidden-choose = Wybierz z menu Układ
+layout-hidden-choose = Wybierz z menu „Układ”
 layouts-apply-hint = Kliknij układ, aby go zastosować.
 layouts-empty = Brak zapisanych układów dla { $server }.
 layouts-overwrite = Nadpisz
 layouts-rename = Zmień nazwę
-layouts-save-as = Zapisz bieżący jako...
-layouts-reset = Resetuj układ paneli
+layouts-save-as = Zapisz bieżący jako…
+layouts-reset = Zresetuj układ paneli
 layouts-name-placeholder = Nazwa układu
-layouts-confirm-overwrite = Nadpisać układ "{ $name }" bieżącym rozmieszczeniem?
-layouts-confirm-delete = Usunąć układ "{ $name }"?
-layouts-confirm-reset = Zwolnić zapisaną geometrię paneli tej sesji i rozmieścić je na nowo według bieżących definicji skryptów?
-layouts-saved = Zapisano układ "{ $name }".
-layouts-saved-partial = Zapisano układ "{ $name }" — nie udało się uwzględnić { $count } zachowanych kart-zaślepek.
+layouts-confirm-overwrite = Nadpisać układ „{ $name }” bieżącym rozmieszczeniem?
+layouts-confirm-delete = Usunąć układ „{ $name }”?
+layouts-confirm-reset = Zresetować zapisane rozmieszczenie paneli tej sesji i rozmieścić je na nowo według bieżących definicji skryptów?
+layouts-saved = Zapisano układ „{ $name }”.
+layouts-saved-partial = Zapisano układ „{ $name }” — nie udało się uwzględnić { $count ->
+        [one] { $count } zachowanej karty-zaślepki
+        [few] { $count } zachowanych kart-zaślepek
+        [many] { $count } zachowanych kart-zaślepek
+       *[other] { $count } zachowanej karty-zaślepki
+    }.
 layouts-save-failed = Nie udało się zapisać układu: { $error }
 layouts-keep-or-close-intro = Ten układ nie obejmuje tych sesji. Wybierz, co ma się stać z każdą z nich:
 layouts-keep = Zachowaj
@@ -429,11 +540,11 @@ shell-no-sessions = Brak aktywnych sesji
 shell-connect-help = Wybierz serwer i profil, aby się połączyć.
 audio-output-unavailable = Fizyczne wyjście dźwięku jest niedostępne ({ $cause }). Terminal nadal działa; domyślne wyjście Web Audio i sinkId "none" działają bezgłośnie.
 audio-settings-title = Dźwięk
-audio-panel-keyboard-help = Tab/Shift+Tab przełącza kontrolki; strzałki zmieniają o 5%; Home/End ustawia skrajne wartości; Spacja wycisza.
+audio-panel-keyboard-help = Tab/Shift+Tab przełącza kontrolki; strzałki zmieniają głośność o 5%; Home/End ustawia minimum i maksimum; Spacja wycisza lub włącza dźwięk.
 audio-master-label = Głośność główna
 audio-session-label = Sesja {$id} · Serwer {$server} · Profil {$profile}
 audio-ack-preference = zapisane ustawienie, niezastosowane
-audio-ack-failed = awaria wyjścia; nie zastosowano nowego stanu
+audio-ack-failed = wyjście odrzuciło zmianę; nie zastosowano nowego stanu
 audio-ack-package-unconfirmed = zapisane ustawienie; aktywny zakres pakietu niepotwierdzony
 audio-control-row = { $label }: { $volume }%
 audio-control-row-muted = { $label }: wyciszono
@@ -445,7 +556,7 @@ audio-notice-target-closed = Urządzenie audio zostało zamknięte; niczego nie 
 audio-notice-applied-save-failed = Dźwięk zmieniono w tym uruchomieniu, ale nie udało się zapisać: { $error }
 audio-notice-failed = Zmiana dźwięku nie powiodła się: { $error }
 audio-notice-output-dead = Wyjście dźwięku zostało zatrzymane. Uruchom ponownie Smudgy, aby przywrócić dźwięk.
-audio-notice-preference-saved = Ustawienie zapisano, ale nie zastosowano w tym uruchomieniu; uruchom ponownie.
+audio-notice-preference-saved = Ustawienie zapisano, ale zacznie działać dopiero po ponownym uruchomieniu Smudgy.
 audio-notice-preference-save-failed = Nie zapisano ustawienia dźwięku: { $error }
 audio-announcement-applied-save-failed = Dźwięk zmieniono w tym uruchomieniu, ale nie udało się zapisać.
 audio-announcement-failed = Zmiana dźwięku nie powiodła się.
@@ -461,7 +572,7 @@ shell-visit-download = Odwiedź stronę pobierania
 shell-remind-later = Przypomnij później
 shell-skip-version = Pomiń tę wersję
 
-# Powiadomienia o aktualizacjach pakietów (dolna pigułka głównego okna)
+# Package-update toasts (the main window's bottom pill)
 toast-package-updates-ready = Aktualizacje pakietów gotowe ({ $count })
 toast-package-reload-scripts = Przeładuj skrypty
 toast-package-ignore = Ignoruj
@@ -473,18 +584,18 @@ toast-package-attention = Aktualizacje pakietów wymagające uwagi: { $count }
 toast-package-open-automations = Przejrzyj w oknie automatyzacji
 toast-package-update-failed = Wystąpił błąd podczas pobierania aktualizacji { $name }. Aby spróbować ponownie, zamknij i otwórz ponownie tę sesję.
 
-# Okno przeglądu aktualizacji pakietu
+# The package-update review modal
 package-update-modal-title = Aktualizacja pakietu
 package-update-versions = { $current } → { $latest }
 package-update-version-new = Nowa wersja { $latest }
 package-update-asks = Ta aktualizacja wymaga dodatkowych uprawnień:
-package-update-needs-smudgy = Ta aktualizacja wymaga smudgy { $version } lub nowszej wersji. Zaktualizuj smudgy.
-package-update-grant = Udziel zgody i zaktualizuj
+package-update-needs-smudgy = Ta aktualizacja wymaga Smudgy { $version } lub nowszej wersji. Najpierw zaktualizuj Smudgy.
+package-update-grant = Przyznaj uprawnienia i zaktualizuj
 package-update-pin = Przypnij bieżącą wersję
 package-update-not-now = Nie teraz
 
 # Package-update terminal notices (echoed into the owning session)
-notice-package-deleted-uninstalled = [package] { $name } został usunięty przez wydawcę i został odinstalowany
+notice-package-deleted-uninstalled = [package] wydawca usunął { $name }, więc pakiet został odinstalowany
 notice-package-update-ready = [package] aktualizacja { $name } { $from } → { $to } jest gotowa
 notice-package-staged-ready = [package] { $name } { $to } jest gotowy
 notice-package-requirements-review = [package] aktualizacja { $name } wymaga sprawdzenia, ponieważ zmieniły się wymagane pakiety
@@ -497,7 +608,7 @@ cloud-error-room-not-found = Nie znaleziono pokoju { $room } na mapie { $area }.
 cloud-error-exit-not-found = Nie znaleziono wyjścia: { $id }
 cloud-error-label-not-found = Nie znaleziono etykiety: { $id }
 cloud-error-shape-not-found = Nie znaleziono kształtu: { $id }
-cloud-error-property-not-found = Nie znaleziono właściwości „{ $property }" w { $entity_type } { $entity_id }.
+cloud-error-property-not-found = Nie znaleziono właściwości „{ $property }” w { $entity_type } { $entity_id }.
 cloud-error-invalid-input = Nieprawidłowe dane wejściowe: { $detail }
 cloud-error-database = Błąd bazy danych: { $detail }
 cloud-error-network = Błąd sieci: { $detail }
@@ -522,15 +633,15 @@ cloud-error-revision-conflict = Ten element zmienił się na serwerze. Odśwież
 cloud-error-projection-changed = Twój dostęp do tego elementu uległ zmianie. Odśwież i spróbuj ponownie.
 cloud-error-operation-reused = Tej operacji nie udało się bezpiecznie ukończyć. Odśwież i spróbuj ponownie.
 cloud-error-structural-conflict = Ta zmiana jest sprzeczna z obecną strukturą mapy: { $detail }
-cloud-error-merge-areas-no-sources = Wybierz co najmniej jeden obszar źródłowy do scalenia.
-cloud-error-merge-areas-same-area = Każdy obszar źródłowy musi wystąpić tylko raz i różnić się od obszaru docelowego.
-cloud-error-merge-areas-no-rooms = Wybierz co najmniej jedno pomieszczenie z każdego częściowo scalonego źródła lub pomiń wybór pomieszczeń, aby scalić cały obszar.
-cloud-error-merge-areas-room-not-found = Wybranego pomieszczenia nie ma w obszarze źródłowym. Sprawdź numery pomieszczeń przed scaleniem.
-cloud-error-merge-areas-mixed-tiers = Wszystkie obszary objęte scaleniem, w tym obszary z prowadzącymi do nich połączeniami, muszą używać tego samego miejsca przechowywania: lokalnego lub sesji.
-cloud-error-merge-areas-unsupported-storage = To miejsce przechowywania nie obsługuje scalania obszarów. Użyj obsługiwanego przechowywania lokalnego lub w sesji.
-cloud-error-merge-areas-busy = W jednym z obszarów są oczekujące zmiany lub trwa inna operacja. Zakończ lub rozwiąż te operacje przed scaleniem.
-cloud-error-merge-areas-source-changed = Jeden z obszarów zmienił się podczas przygotowywania scalenia. Sprawdź aktualną mapę i spróbuj ponownie.
-cloud-error-merge-areas-room-numbers-exhausted = W obszarze docelowym nie ma wystarczającej liczby dostępnych numerów pomieszczeń do tego scalenia. Wybierz inny obszar docelowy.
+cloud-error-merge-areas-no-sources = Wybierz co najmniej jedną mapę źródłową do scalenia.
+cloud-error-merge-areas-same-area = Każda mapa źródłowa może wystąpić tylko raz i musi być inna niż mapa docelowa.
+cloud-error-merge-areas-no-rooms = Wybierz co najmniej jeden pokój z każdej mapy scalanej częściowo albo nie wybieraj pokoi, aby scalić całą mapę.
+cloud-error-merge-areas-room-not-found = Wybranego pokoju nie ma na mapie źródłowej. Sprawdź numery pokoi przed scaleniem.
+cloud-error-merge-areas-mixed-tiers = Wszystkie mapy objęte scaleniem, w tym mapy z prowadzącymi do nich połączeniami, muszą używać tego samego miejsca przechowywania: lokalnego lub sesji.
+cloud-error-merge-areas-unsupported-storage = To miejsce przechowywania nie obsługuje scalania map. Użyj obsługiwanego przechowywania lokalnego lub w sesji.
+cloud-error-merge-areas-busy = Na jednej z map są oczekujące zmiany lub trwa inna operacja. Zakończ lub rozwiąż te operacje przed scaleniem.
+cloud-error-merge-areas-source-changed = Jedna z map zmieniła się podczas przygotowywania scalenia. Sprawdź aktualną mapę i spróbuj ponownie.
+cloud-error-merge-areas-room-numbers-exhausted = Na mapie docelowej brakuje wolnych numerów pokoi do tego scalenia. Wybierz inną mapę docelową.
 cloud-error-merge-areas-invalid-translation = Przesunięcie lub wynikowa pozycja wykracza poza obsługiwany zakres. Użyj skończonych współrzędnych i poziomów w zakresie 32-bitowej liczby całkowitej.
 cloud-error-merge-secret-room-data = Sekret przechowuje dane pokoju { $room }. Najpierw je przenieś lub usuń.
 cloud-error-secret-area-level = Sekretami zarządza się w edytorze mapy.
@@ -541,10 +652,10 @@ cloud-error-secret-cannot-edit = Nie możesz zmieniać zawartości tego sekretu.
 cloud-error-secret-cannot-remove = Nie możesz niczego usuwać z tego sekretu.
 cloud-error-secret-linked-map-rooms = Sekret klanu na mapie dołączonej do klanu przez link przechowuje tylko własne pokoje. Nie może mieć danych w pokojach mapy, prowadzić do nich ani wymieniać z mapą pokoi.
 cloud-error-secret-link-between-secrets = Połączenie nie może łączyć dwóch sekretów.
-cloud-error-secret-link-into-other-map = Połączenie z Sekretem innej mapy prowadzi do jednego z jego pomieszczeń, a żadne połączenie nie prowadzi do prywatnych dodatków innej mapy.
+cloud-error-secret-link-into-other-map = Połączenie z sekretem innej mapy prowadzi do jednego z jego pokoi, a żadne połączenie nie prowadzi do prywatnych dodatków innej mapy.
 cloud-error-secret-map-exit-retarget = Wyjście mapy nie może prowadzić do pokoju sekretu. Utwórz połączenie w sekrecie.
 cloud-error-move-busy = Mapa wciąż się zapisuje. Spróbuj ponownie za chwilę.
-cloud-error-move-drops-places = Mapa sesji nie pomieści Sekretów ani prywatnych dodatków tej mapy, więc nie można jej tam przenieść bez ich utraty. Zamiast tego ją skopiuj; oryginał je zachowa.
+cloud-error-move-drops-places = Mapa sesji nie pomieści sekretów ani prywatnych dodatków tej mapy, więc nie można jej tam przenieść bez ich utraty. Zamiast tego ją skopiuj; oryginał je zachowa.
 cloud-error-move-splits-links = Połączenie łączy te pokoje z pokojami, które zostają. Przenieś je razem albo najpierw usuń połączenie.
 cloud-error-room-number-exists = Numer pokoju jest tam już zajęty. Nic nie przeniesiono.
 cloud-error-invalid-connection = To połączenie jest nieprawidłowe: { $detail }
@@ -566,20 +677,20 @@ social-pending = (oczekuje)
 social-accept = Akceptuj
 social-decline = Odrzuć
 social-ownership-transfers = Przeniesienie własności
-social-incoming-transfer = { $from } chce Ci przekazać „{ $subject }"
-social-outgoing-transfer = Zaoferowano „{ $subject }" użytkownikowi { $to }
-social-outgoing-transfer-clan = Zaoferowano „{ $subject }" klanowi { $clan }
+social-incoming-transfer = { $from } chce Ci przekazać „{ $subject }”
+social-outgoing-transfer = Zaoferowano „{ $subject }” użytkownikowi { $to }
+social-outgoing-transfer-clan = Zaoferowano „{ $subject }” klanowi „{ $clan }”
 social-no-friends = Brak znajomych.
 social-blocks = Blokady
 social-block = Zablokuj
 social-blocking = Blokowanie…
 social-confirm-block = Potwierdź blokadę
-social-block-warning = Blokowanie jest cichą funkcją i blokowana osoba nie zostanie o tym powiadomiona. Blokowanie usuwa wszelką znajomość i kończy możliwość udostępniania funkcji pomiędzy wami.
+social-block-warning = Zablokowana osoba nie dostanie powiadomienia. Blokada usuwa znajomość i kończy wszelkie udostępnianie między wami, w obie strony.
 social-no-blocked-users = Brak zablokowanych użytkowników.
 social-unblock = Odblokuj
 social-block-note = Zablokowani użytkownicy nie widzą tego wpisu; odblokowanie nigdy nie przywraca udostępnień.
-social-friend-since = od { $date }
-social-unfriend-warning = Na pewno usunąć ze znajomych? To kończy całe udostępnianie map między wami, w obie strony.
+social-friend-since = znajomi od { $date }
+social-unfriend-warning = Czy na pewno usunąć ze znajomych? Zakończy to całe udostępnianie map między wami, w obie strony.
 social-keep-friend = Zachowaj
 social-unfriend = Usuń ze znajomych
 social-no-nickname = (brak pseudonimu)
@@ -591,7 +702,7 @@ cloud-error-clan-dissolving = Ten klan jest rozwiązywany: żadna mapa nie może
 cloud-error-atlas-not-empty = Najpierw przenieś lub usuń mapy z tego folderu.
 cloud-error-already-member = Ta osoba już jest członkiem.
 cloud-error-name-in-use = Ta nazwa jest już zajęta.
-cloud-error-transfer-already-pending = Na to czeka już jedna oferta; naraz może być tylko jedna.
+cloud-error-transfer-already-pending = Na ten element czeka już oferta; jednocześnie może być tylko jedna.
 clans-title = Klany
 clans-verify-email = Zweryfikuj adres e-mail, aby dołączać do klanów.
 clans-name-placeholder = nazwa klanu
@@ -629,10 +740,10 @@ clans-leave-clan = Opuść klan…
 clans-leave-confirm = Opuścić „{ $name }”? Stracisz dostęp do jego map.
 clans-leave = Opuść
 
-# Zestawy uprawnień
+# Permission presets
 presets-kind-map = Mapy
 presets-kind-folder-curation = Porządek w folderach
-presets-kind-clan-secrets = Sekrety własności klanu
+presets-kind-clan-secrets = Sekrety należące do klanu
 presets-kind-secret = Sekret
 presets-kind-package = Pakiety
 presets-kind-clan-administration = Administracja klanu
@@ -662,7 +773,7 @@ presets-action-clan-remove-member = Usuwanie członków
 presets-action-group-create = Tworzenie grup
 presets-action-group-rename = Zmiana nazw grup
 presets-action-group-delete = Usuwanie grup
-presets-action-group-assign = Wybór członków grup
+presets-action-group-assign = Przypisywanie członków do grup
 presets-action-group-inspect = Podgląd członków grup
 presets-action-access-inspect = Podgląd, kto ma dostęp
 presets-action-access-manage = Nadawanie dostępu
@@ -670,9 +781,9 @@ presets-action-folder-create = Tworzenie folderów
 presets-action-folder-read = Widok folderu
 presets-action-folder-rename = Zmiana nazw folderów
 presets-action-folder-accept-filing = Przenoszenie map do folderu
-presets-action-folder-accept-transfer = Przenoś mapy do tego folderu
+presets-action-folder-accept-transfer = Przenoszenie własnych map do folderu
 presets-action-map-create = Tworzenie map
-presets-action-map-create-member-owned = Tworzenie map własności członków
+presets-action-map-create-member-owned = Tworzenie map należących do członków
 presets-action-map-read = Odczyt
 presets-action-map-add = Dodawanie treści
 presets-action-map-edit = Edycja treści
@@ -682,8 +793,8 @@ presets-action-map-refile = Przenoszenie map między folderami
 presets-action-map-delete = Usuwanie map
 presets-action-map-copy = Kopiowanie map
 presets-action-map-share-external = Udostępnianie poza klanem
-presets-action-secrets-create-member-owned = Tworzenie sekretów własności członków
-presets-action-secrets-create-clan-owned = Tworzenie sekretów własności klanu
+presets-action-secrets-create-member-owned = Tworzenie sekretów należących do członków
+presets-action-secrets-create-clan-owned = Tworzenie sekretów należących do klanu
 presets-action-secrets-read = Odczyt sekretów
 presets-action-secrets-add = Dodawanie do sekretów
 presets-action-secrets-edit = Edycja sekretów
@@ -696,7 +807,7 @@ presets-action-package-edit-draft = Edycja wersji roboczej
 presets-action-package-edit-metadata = Edycja opisu
 presets-action-package-publish = Publikowanie wersji
 presets-action-package-retire = Wycofywanie wersji
-presets-action-package-availability = Ustawianie jako publiczny lub prywatny
+presets-action-package-availability = Zmiana widoczności pakietu
 presets-action-package-delete = Usuwanie pakietu
 presets-action-secret-read = Odczyt
 presets-action-secret-add = Dodawanie
@@ -723,11 +834,11 @@ clans-members-hidden = Ten klan pokazuje listę członków tylko wybranym osobom
 clans-invited = Zaproszeni
 clans-pending-badge = Oczekuje
 clans-revoke = Cofnij
-clans-invite-title = Zaproś do klanu { $clan }
+clans-invite-title = Zaproś do klanu „{ $clan }”
 clans-invite-groups = Proponowane grupy
 clans-member-groups-title = Grupy · { $name }
 clans-remove-member = Usuń członka
-clans-self-assign-reason = Tylko właściciel klanu może dodać cię do grupy utworzonej przez kogoś innego.
+clans-self-assign-reason = Tylko właściciel klanu może dodać Cię do grupy utworzonej przez kogoś innego.
 clans-new-group = Nowa grupa
 clans-new-group-note = Dołączasz do grup, które tworzysz, i wybierasz, kto jeszcze w nich jest.
 clans-edit-group = Edytuj grupę
@@ -746,10 +857,10 @@ clans-add-member-none = Nie ma kogo dodać.
 clans-add-permission = Dodaj uprawnienie
 clans-administration-button = Administracja klanu…
 clans-remove-permission-confirm = Usunąć to uprawnienie? Grupa od razu straci to, co ono daje.
-clans-note-clan = Tylko zarządzanie klanem i grupami. Dostęp do map, folderów, Sekretów i pakietów ustawia się na tych zasobach.
+clans-note-clan = Tylko zarządzanie klanem i grupami. Dostęp do map, folderów, sekretów i pakietów ustawia się osobno dla każdego z nich.
 clans-note-folders = Obejmuje mapy dodane tam później.
 clans-note-may-grant = Może nadawać: { $preset }
-clans-note-delegated = Nadane przez osobę, której właściciele klanu pozwolili dawać dostęp.
+clans-note-delegated = Nadane przez osobę, której właściciele klanu pozwolili nadawać dostęp.
 clans-scope-more = { $count ->
     [one] jeszcze { $count }
     [few] jeszcze { $count }
@@ -757,22 +868,22 @@ clans-scope-more = { $count ->
    *[other] jeszcze { $count }
 }
 clans-scope-names-and-more = { $names } i jeszcze { $count }
-clans-unknown-group = Pewna grupa
+clans-unknown-group = Nieznana grupa
 clans-access-maps = Mapy
 clans-access-packages = Pakiety
 clans-access-secrets = Sekrety
 clans-access-no-maps = Brak map i folderów, do których masz tu dostęp.
 clans-access-no-packages = Brak pakietów, do których masz tu dostęp.
-clans-access-no-secrets = Brak sekretów, które czytasz w tym klanie.
+clans-access-no-secrets = Brak sekretów, które możesz czytać w tym klanie.
 clans-access-pick = Wybierz coś po lewej, aby zobaczyć, kto ma do tego dostęp.
 clans-kind-folder = Folder
 clans-kind-map = Mapa
 clans-kind-package = Pakiet
 clans-open-map = Otwórz mapę
 clans-open-package = Otwórz pakiet
-clans-open-share = Okno udostępniania…
-clans-outside-shares = Poza klanem { $clan }
-clans-outside-shares-note = Znajomi, którzy czytają tę mapę, tylko do podglądu. Udostępnienie kończy się, gdy udostępniający opuści klan lub straci prawo do udostępniania.
+clans-open-share = Udostępnianie…
+clans-outside-shares = Poza klanem „{ $clan }”
+clans-outside-shares-note = Znajomi, którzy widzą tę mapę, mają dostęp tylko do podglądu. Udostępnienie wygasa, gdy osoba udostępniająca opuści klan lub straci prawo do udostępniania.
 clans-outside-shares-none = Nieudostępniona poza klanem.
 clans-outside-shared-by = Udostępnił(a): { $name }
 clans-in-folder = W folderze { $folder }
@@ -785,7 +896,7 @@ clans-through-folder = Z folderu { $folder }
 clans-through-a-folder = Z jednego z folderów
 clans-member-owned = Własność członków
 clans-clan-owned = Własność klanu
-clans-secret-clan-owned-note = Grupy, którym dano sekrety własności klanu na jego mapie lub w folderze, też go czytają; zobacz Mapy.
+clans-secret-clan-owned-note = Sekret należący do klanu mogą czytać także grupy, którym nadano dostęp do sekretów na jego mapie lub w jego folderze; zob. „Mapy”.
 clans-details = Dane klanu
 clans-name-label = Nazwa
 clans-description-label = Opis
@@ -794,8 +905,8 @@ clans-plays-on-label = Gra na
 clans-plays-on-help = Podanie hostów, na których gra klan, może nieco ułatwić sprawę członkom grającym w kilka MUD-ów. Gdy klan ma hosty, jego wspólne mapy domyślnie nie pojawiają się członkom klanu, gdy łączą się z MUD-em spoza tej listy.
 clans-plays-on-none = Brak hostów.
 clans-plays-on-placeholder = mud.example.org
-clans-plays-on-add-host = Twoja bieżąca sesja jest połączona z { $host }, którego nie ma na liście. Kliknij tutaj, aby dodać go do klanu { $clan }.
-clans-shown-here-label = Wybierz, które z twoich MUD-ów używają map tego klanu:
+clans-plays-on-add-host = Twoja bieżąca sesja jest połączona z { $host }, którego nie ma na liście. Kliknij tutaj, aby dodać go do klanu „{ $clan }”.
+clans-shown-here-label = Wybierz, które z Twoich MUD-ów używają map tego klanu:
 clans-use-everywhere = Używaj wszędzie
 clans-new-plays-on = Gra na: { $host }
 clans-permission-none = Brak
@@ -805,14 +916,14 @@ clans-editor-title-admin = Przypisz grupę · Administracja klanu
 clans-editor-title-edit = Edytuj uprawnienie
 clans-editor-group = Grupa
 clans-editor-member = Członek
-clans-editor-member-note = Pojedynczemu członkowi można dać uprawnienia administracji klanu i pakietów; mapy i sekrety przypisuje się grupom.
+clans-editor-member-note = Pojedynczemu członkowi można nadać uprawnienia do administrowania klanem i pakietami; dostęp do map i sekretów nadaje się grupom.
 clans-editor-existing = Ta grupa ma już tu dostęp; zmieniasz go.
 clans-editor-scope = Dotyczy
 clans-editor-targets-empty = Nie ma tu jeszcze nic do wyboru.
 clans-editor-permissions = Uprawnienia
-clans-editor-separate = Nigdy w zestawie
+clans-editor-separate = Nie wchodzą w skład żadnego zestawu
 clans-editor-may-grant = Może nadawać
-clans-editor-may-grant-help = Może dawać najwyżej taki dostęp do map, w tych samych miejscach.
+clans-editor-may-grant-help = Może nadawać dostęp do map nie szerszy niż ten i tylko w tych samych miejscach.
 clans-editor-all-groups = Wszystkie grupy
 clans-editor-group-scope = Zakres zarządzania grupami
 clans-editor-group-scope-help = Zmiana grupy i wybór jej członków to osobne uprawnienia.
@@ -827,10 +938,10 @@ clan-maps-incoming-badge = oczekujące: { $count }
 clan-maps-show-here = Pokaż na { $server }
 clan-maps-shown-on = Widoczne na: { $servers }
 clan-maps-plays-on = Gra na: { $hosts }
-clan-maps-folders-follow-clan = Każdy folder klanu { $clan } jest widoczny na tych samych serwerach.
+clan-maps-folders-follow-clan = Każdy folder klanu „{ $clan }” jest widoczny na tych samych serwerach.
 clan-maps-new-folder = Nowy folder
 clan-maps-incoming = Oczekujące mapy…
-clan-maps-new-folder-title = Nowy folder w klanie { $clan }
+clan-maps-new-folder-title = Nowy folder w klanie „{ $clan }”
 clan-maps-create = Utwórz
 clan-maps-delete-folder-question = Usunąć „{ $name }”?
 clan-maps-delete-folder-detail = Najpierw przenieś jego mapy do innego folderu.
@@ -843,29 +954,29 @@ clan-maps-incoming-title = Oczekujące mapy · { $clan }
 clan-maps-incoming-empty = Żadna mapa nie czeka.
 clan-maps-given-by = przekazuje { $owner }
 clan-maps-given-folder = Folder „{ $name }”
-clan-maps-given-help = Mapa przekazana klanowi staje się własnością klanu; mapa, która zostaje u przekazującego, staje się własnością członków i tylko on decyduje, kto ją widzi. Jej Sekrety pozostają przy członku, który ją przekazał.
+clan-maps-given-help = Mapa przekazana klanowi staje się własnością klanu; mapa, która zostaje u przekazującego, staje się własnością członków i tylko on decyduje, kto ją widzi. Jej sekrety pozostają przy członku, który ją przekazał.
 clan-maps-could-not-accept = Nie udało się przyjąć. Oferta mogła zostać wycofana.
 clan-maps-folder-placeholder = Folder
 clan-maps-accept = Przyjmij
 clan-maps-decline = Odrzuć
 clan-maps-gone = Mapy „{ $name }” już nie ma.
-clan-maps-given-stays = od { $owner } · zostaje jego
+clan-maps-given-stays = od { $owner } · zostaje u właściciela
 clan-maps-offered-help = Członkowie proponują klanowi mapy, które do nich należą. Po przyjęciu mapa należy do klanu i obejmuje ją dostęp z folderu.
 clan-maps-offered-by = proponuje { $owner }
 clan-maps-a-member = członek
 clan-share-put-in-clan = Umieść w klanie…
 clan-share-give-to-clan = Przekaż klanowi
-clan-share-give-to-clan-help = Właściciele klanu są współwłaścicielami tej mapy
+clan-share-give-to-clan-help = Właściciele klanu staną się współwłaścicielami tej mapy
 clan-share-stays-mine = Zostaje moja
-clan-share-stays-mine-help = Przenieś tę mapę do klanu, zachowując jej własność.
-clan-share-give-folder-to-clan-help = Właściciele klanu są współwłaścicielami tych map
-clan-share-folder-stays-mine-help = Przenieś te mapy do klanu, zachowując ich własność.
+clan-share-stays-mine-help = Mapa trafi do klanu, ale pozostanie Twoja.
+clan-share-give-folder-to-clan-help = Właściciele klanu staną się współwłaścicielami tych map
+clan-share-folder-stays-mine-help = Mapy trafią do klanu, ale pozostaną Twoje.
 clan-share-title = Udostępnij „{ $name }”
-clan-share-owned-by-clan-in = Własność { $clan } · w folderze { $folder }
-clan-share-owned-by-clan = Własność { $clan }
+clan-share-owned-by-clan-in = Własność klanu „{ $clan }” · w folderze „{ $folder }”
+clan-share-owned-by-clan = Własność klanu „{ $clan }”
 clan-share-owned-by = Właściciele: { $owners }
 clan-share-member-owned = Własność członków
-clan-share-member-owned-reach = Dostęp z folderu i właściciele klanu nie obejmują tej mapy. Obejmuje ją tylko to, co jej właściciele udostępnią tu grupom i członkom.
+clan-share-member-owned-reach = Tej mapy nie obejmuje ani dostęp z folderu, ani uprawnienia właścicieli klanu. Obowiązuje tylko to, co jej właściciele udostępnią tu grupom i członkom.
 clan-share-frozen = Nikt nie może zmienić, kto widzi tę mapę: konto jej ostatniego właściciela zostało usunięte. Dotychczasowe udostępnienia zostają.
 clan-share-you-can = Możesz: { $actions }
 clan-share-you-can-read = Możesz oglądać tę mapę.
@@ -874,20 +985,20 @@ clan-share-clan-owners = Właściciele klanu
 clan-share-nobody-yet = Nikt nie ma jeszcze dostępu przez grupę ani członka.
 clan-share-from-several-maps = razem z innymi mapami
 clan-share-from-folder = z folderu { $folder }
-clan-share-from-clan = z całego klanu { $clan }
+clan-share-from-clan = z całego klanu „{ $clan }”
 clan-share-change-for-folder = Zmień dla folderu…
 clan-share-remove = Usuń
 clan-share-remove-question = Usunąć ten dostęp do mapy?
 clan-share-includes-future-members = Obejmuje przyszłych członków
-clan-share-chosen-automatically = Wszyscy, których obejmuje, automatycznie
+clan-share-chosen-automatically = Wszyscy, których obejmuje — automatycznie
 clan-share-chosen-by-owners = Jej członków wybierają tylko właściciele klanu
 clan-share-chosen-by-owners-and-leads = Jej członków wybierają właściciele klanu i liderzy grupy
 clan-share-add-recipient = + Grupa / członek
 clan-share-pick-recipient = Grupa lub członek
 clan-share-existing = Ma już dostęp do tej mapy; zmieniasz go.
 clan-share-groups-only = Widać tylko grupy: nie możesz zobaczyć listy członków.
-clan-share-outside = Poza klanem { $clan }
-clan-share-outside-help = Znajomi spoza klanu widzą tylko tę mapę: tylko podgląd, nigdy jej Sekretów.
+clan-share-outside = Poza klanem „{ $clan }”
+clan-share-outside-help = Znajomi spoza klanu widzą tylko tę mapę — wyłącznie do podglądu i nigdy razem z jej sekretami.
 clan-share-shared-by = udostępnia { $name }
 clan-share-shared-by-you = udostępniasz Ty
 clan-share-pick-friend = Znajomy
@@ -900,16 +1011,16 @@ clan-share-give-up-confirm = Zrezygnować z własności „{ $name }”? Zachowa
 clan-share-only-owner = Jesteś jej jedynym właścicielem. Najpierw zaproponuj własność komuś innemu.
 clan-share-needs-another-owner = Najpierw potrzebny jest inny właściciel.
 clan-share-offer-help = Każdy akceptuje osobno; właścicielami stają się, gdy zaakceptuje ostatni. Zaakceptować mogą tylko członkowie, którzy widzą mapę.
-clan-share-offer-replace = Niech to będą jej jedyni właściciele
+clan-share-offer-replace = Ustaw ich jako jedynych właścicieli
 clan-share-send-offer = Wyślij propozycję
 clan-share-offer-sent = Propozycja wysłana.
 clan-share-no-candidates = Nie ma komu tego zaproponować.
 clan-share-accepted = { $name } (zaakceptowano)
 clan-share-waiting-for = { $name } (oczekuje)
-clan-share-offer-to-clan = Zaproponowano klanowi { $clan }
+clan-share-offer-to-clan = Zaproponowano klanowi „{ $clan }”
 clan-share-cancel-offer = Anuluj propozycję
 clan-share-make-clan-owned = Przekaż klanowi…
-clan-share-make-clan-owned-confirm = Zaproponować „{ $name }” klanowi { $clan }? Po przyjęciu mapa należy do klanu: jej właściciele przestają nią władać, a obejmuje ją dostęp z folderu. To, co tu udostępniono, zostaje.
+clan-share-make-clan-owned-confirm = Zaproponować „{ $name }” klanowi „{ $clan }”? Po przyjęciu mapa należy do klanu: jej dotychczasowi właściciele przestają nimi być, a obejmuje ją dostęp z folderu. To, co tu udostępniono, zostaje.
 clan-share-make-clan-owned-action = Przekaż klanowi
 clan-share-someone-accepts = Ktoś, kto obsługuje oczekujące mapy klanu, przyjmie ją do folderu.
 clan-share-into-folder = Do folderu
@@ -917,45 +1028,50 @@ clan-share-offered-to-clan = Zaproponowano klanowi. Stanie się własnością kl
 clan-share-ownership-refused = Nie udało się zmienić właściciela. Mógł się w międzyczasie zmienić; spróbuj ponownie.
 clan-share-make-member-owned = Przekaż członkom…
 clan-share-make-member-owned-help = Zaproponuj ją członkom: gdy wszyscy zaakceptują, będzie należeć do nich i obejmie ją tylko to, co oni udostępnią.
-clan-share-lose-folder-access = Ci stracą dostęp, który dawał im folder i klan: { $names }.
+clan-share-lose-folder-access = Dostęp nadany przez folder i klan stracą: { $names }.
 clan-share-put-title = Umieść „{ $name }” w klanie
-clan-share-friend-shares-end = Jej udostępnienia znajomym wygasają: { $names }.
-clan-share-put-secrets = Jej Sekrety pozostają Twoje, jako Twoje Sekrety w klanie.
+clan-share-friend-shares-end = Udostępnienia tej mapy znajomym wygasną: { $names }.
+clan-share-put-secrets = Jej sekrety pozostaną Twoje — jako Twoje sekrety w klanie.
 clan-share-put-action = Umieść w klanie
-clan-share-put-done = Jest teraz w klanie { $clan }.
+clan-share-put-done = Jest teraz w klanie „{ $clan }”.
 clan-share-new-map-clan-owned = Własność klanu
 clan-share-new-map-member-owned-choice = Własność członków
-clan-share-new-map-member-owned-help = Należy do Ciebie i Ty wybierasz, kto ją widzi. Dostęp z folderu i właściciele klanu jej nie obejmują.
+clan-share-new-map-member-owned-help = Należy do Ciebie i Ty wybierasz, kto ją widzi. Nie obejmuje jej ani dostęp z folderu, ani uprawnienia właścicieli klanu.
 clan-share-new-map-member-owned = Będzie własnością członków: należy do Ciebie i Ty wybierasz, kto ją widzi.
 clan-map-offers = Propozycje własności map
-clan-map-offer = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie { $clan }.
-clan-map-offer-replace = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie { $clan } w miejsce obecnych właścicieli.
-clan-map-offer-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie { $clan }.
-clan-map-offer-replace-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie { $clan } w miejsce obecnych właścicieli.
+clan-map-offer = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie „{ $clan }”.
+clan-map-offer-replace = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie „{ $clan }” w miejsce obecnych właścicieli.
+clan-map-offer-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie „{ $clan }”.
+clan-map-offer-replace-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie „{ $clan }” w miejsce obecnych właścicieli.
 clans-leave-copy-maps = Najpierw skopiuj mapy, które mam w tym klanie, do moich map
 
 # Map editor dialogs and sharing
 mapper-transfer-owner-friend-only = Przekazać można tylko coś, co należy do Ciebie, i tylko obecnemu znajomemu.
-mapper-transfer-offer-sent = Oferta wysłana. „{ $subject }" zostanie przekazany, gdy odbiorca zaakceptuje je w swoim panelu Znajomi.
-mapper-transfer-give = Przekaż „{ $subject }" znajomemu.
+mapper-transfer-offer-sent = Oferta wysłana. Przekazanie „{ $subject }” nastąpi, gdy odbiorca zaakceptuje ofertę w panelu „Znajomi”.
+mapper-transfer-give = Przekaż „{ $subject }” znajomemu.
 mapper-transfer-warning = Po zaakceptowaniu odbiorca staje się właścicielem. Zachowasz prawa administratora, ale własność mapy zostanie przeniesiona.
 mapper-route-preview-accept = Zaakceptuj trasę
-mapper-copy-boundary-one = { $count } połączenie graniczne opuszcza zaznaczone pokoje.
-mapper-copy-boundary-many = { $count } połączeń granicznych opuszcza zaznaczone pokoje.
+mapper-copy-boundary-one = { $count } połączenie graniczne wychodzi poza zaznaczenie.
+mapper-copy-boundary-many = { $count ->
+        [one] { $count } połączenie graniczne wychodzi poza zaznaczenie.
+        [few] { $count } połączenia graniczne wychodzą poza zaznaczenie.
+        [many] { $count } połączeń granicznych wychodzi poza zaznaczenie.
+       *[other] { $count } połączenia granicznego wychodzi poza zaznaczenie.
+    }
 mapper-copy-boundary-help = Domyślnie są pomijane. Po uwzględnieniu każde z nich staje się wiszącym połączeniem jednokierunkowym bez zapisanych punktów trasy.
 mapper-copy-include-boundary = Uwzględnij połączenia opuszczające zaznaczenie
 mapper-copy-selection-title = { $action } zaznaczenie
 action-cut = Wytnij
 action-copy = Kopiuj
-mapper-transfer-leaves-folder = Jeśli to, co chcesz wysłać znajduje się w folderze, zostanie wysłane z folderu po zaakceptowaniu oferty.
+mapper-transfer-leaves-folder = Jeśli to, co przekazujesz, znajduje się w folderze, po zaakceptowaniu oferty opuści ten folder.
 mapper-transfer-to = Przekaż do
-mapper-transfer-give-or-clan = Przekaż „{ $subject }" znajomemu lub jednemu ze swoich klanów.
+mapper-transfer-give-or-clan = Przekaż „{ $subject }” znajomemu lub jednemu ze swoich klanów.
 mapper-transfer-warning-clan = Wszystkie istniejące udostępnienia tej mapy zostaną usunięte po zakończeniu przenoszenia do klanu.
 mapper-transfer-clans = Twoje klany
-mapper-transfer-offer-sent-clan = Przeniesiono „{ $subject }” do { $clan }.
+mapper-transfer-offer-sent-clan = Przeniesiono „{ $subject }” do klanu „{ $clan }”.
 mapper-transfer-owner-clan-only = Musisz być właścicielem tej mapy lub folderu i mieć uprawnienie do przeniesienia ich do wybranego miejsca w klanie.
 mapper-loading-friends = Ładowanie znajomych…
-mapper-no-friends-transfer = Póki co, nie masz tu jeszcze znajomych.
+mapper-no-friends-transfer = Nie masz jeszcze znajomych.
 mapper-filter-placeholder = filtruj…
 mapper-sending = Wysyłanie…
 mapper-send-offer = Wyślij ofertę
@@ -963,7 +1079,12 @@ mapper-new-area = Nowa mapa
 mapper-name-new-area = Nazwij nową mapę
 mapper-area-name-placeholder = nazwa mapy
 mapper-delete-area = Usuń mapę
-mapper-delete-area-question = Usunąć „{ $name }" i jego { $rooms } pokoi?
+mapper-delete-area-question = Usunąć „{ $name }” i jej { $rooms ->
+        [one] { $rooms } pokój
+        [few] { $rooms } pokoje
+        [many] { $rooms } pokoi
+       *[other] { $rooms } pokoju
+    }?
 mapper-cannot-undo = Tej operacji nie można cofnąć.
 mapper-new-folder = Nowy folder
 mapper-name-new-folder = Nazwij nowy folder
@@ -973,7 +1094,7 @@ mapper-save-cloud = Chmura — pozwala udostępniać mapy
 mapper-save-local = Na tym urządzeniu
 mapper-save-local-signed-out = Zapisano na tym urządzeniu. Zaloguj się, aby tworzyć foldery w chmurze, które synchronizują się między urządzeniami i pozwalają na udostępnianie treści.
 mapper-delete-folder = Usuń folder
-mapper-delete-folder-question = Usunąć folder „{ $name }"?
+mapper-delete-folder-question = Usunąć folder „{ $name }”?
 mapper-folder-empty = Ten folder jest pusty.
 mapper-folder-maps-go =
     { $count ->
@@ -987,10 +1108,10 @@ mapper-folder-maps-move-along =
         [few] Jego { $count } mapy zostaną przeniesione razem z nim.
        *[many] Jego { $count } map zostanie przeniesionych razem z nim.
     }
-mapper-move-area-to = Przenieś „{ $name }" do:
+mapper-move-area-to = Przenieś „{ $name }” do:
 mapper-move-to-folder = Przenieś do folderu
 mapper-save-to-folder = Zapisz w folderze
-mapper-save-area-in = Zapisz „{ $name }" w:
+mapper-save-area-in = Zapisz „{ $name }” w:
 mapper-folder-section = Folder
 mapper-folder-new-option = Nowy folder…
 mapper-folder-none-yet = Nie ma tu jeszcze folderu. Nazwij folder dla tej mapy.
@@ -999,7 +1120,7 @@ mapper-folder-create-and-move = Utwórz i przenieś
 mapper-folder-create-and-save = Utwórz i zapisz
 mapper-loose-maps-failed = Niektórych map spoza folderów nie udało się umieścić w folderze. Smudgy spróbuje ponownie następnym razem.
 mapper-relocation-duplicate-notice = { $error } — Utworzono kopię „{ $name }” w miejscu docelowym, ale nie udało się usunąć oryginału, który może zawierać nowsze zmiany. Zachowaj oryginał i uzgodnij zawartość obu kopii przed ponownym przeniesieniem.
-mapper-share-folder-title = Udostępnij folder „{ $name }"
+mapper-share-folder-title = Udostępnij folder „{ $name }”
 mapper-loading = Ładowanie…
 area-list-load-failed = Nie udało się wczytać
 area-list-load-progress = Wczytano { $loaded }/{ $total }
@@ -1008,25 +1129,25 @@ mapper-canvas-load-failed = Nie udało się wczytać tej mapy.
 mapper-status-sync-offline = Offline
 mapper-status-sync-retrying = Offline · ponowna próba o { $time }
 mapper-local-move-title = Przenieść udostępnione mapy z chmury?
-mapper-local-move-shared-warning = Przeniesienie tych map do pamięci lokalnej zakończy ich udostępnianie w chmurze. Osoby, którym je udostępniono, utracą dostęp, a ich Sekrety i Prywatne dodatki zapisane przy oryginałach w chmurze zostaną usunięte. Twoje mapy, Sekrety i Prywatne dodatki zostaną zachowane lokalnie. Tej operacji nie można cofnąć.
-mapper-copy-duplicate-intro = Tworzy drugą kopię „{ $name }".
-mapper-copy-shared-intro = Tworzy Twoją własną edytowalną kopię „{ $name }".
+mapper-local-move-shared-warning = Przeniesienie tych map do pamięci lokalnej zakończy ich udostępnianie w chmurze. Osoby, którym je udostępniono, utracą dostęp, a ich sekrety i prywatne dodatki zapisane przy oryginałach w chmurze zostaną usunięte. Twoje mapy, sekrety i prywatne dodatki zostaną zachowane lokalnie. Tej operacji nie można cofnąć.
+mapper-copy-duplicate-intro = Tworzy drugą kopię „{ $name }”.
+mapper-copy-shared-intro = Tworzy Twoją własną edytowalną kopię „{ $name }”.
 mapper-copy-name-placeholder = nazwa Twojej kopii
-mapper-copy-duplicate-inactive = Duplikat jest teraz nieaktywny. Musisz go aktywować, aby był widoczny dla skryptów.
+mapper-copy-duplicate-inactive = Duplikat jest początkowo nieaktywny. Musisz go aktywować, aby był widoczny dla skryptów.
 mapper-copy-atlas-offer = Czy chcesz skopiować cały folder?
 mapper-copy-whole-atlas = Skopiuj cały folder…
 mapper-copying = Kopiowanie…
 mapper-copy = Kopiuj
 mapper-duplicate-map = Duplikuj mapę
 mapper-copy-to-my-maps = Kopiuj do moich map
-mapper-transfer-title = Przekaż „{ $name }"
+mapper-transfer-title = Przekaż „{ $name }”
 mapper-show-on-servers = Pokaż na serwerach
-mapper-show-name-on = Pokaż „{ $name }" na:
+mapper-show-name-on = Pokaż „{ $name }” na:
 mapper-no-server-entries = Brak wpisów serwerów.
-mapper-unchecked-all-servers = Odznaczenie wszędzie oznacza "widoczne na każdym serwerze".
+mapper-unchecked-all-servers = Jeśli nie zaznaczysz żadnego serwera, mapa będzie widoczna na wszystkich.
 mapper-recipients = Odbiorcy
 mapper-filter-handle-placeholder = filtruj według nazwy
-mapper-no-friends-share = Póki co, nie masz tu jeszcze znajomych.
+mapper-no-friends-share = Nie masz jeszcze znajomych.
 mapper-no-friends-filter = Żaden znajomy nie pasuje do tej nazwy.
 mapper-they-can = Odbiorcy mogą
 mapper-can-edit-area = Może edytować
@@ -1040,8 +1161,8 @@ mapper-disclose-servers-help = Odbiorcy widzą te nazwy serwerów, dzięki czemu
 mapper-shared-with = Udostępniono użytkownikowi { $recipient }.
 mapper-share-error = Nie udało się udostępnić użytkownikowi { $recipient } — { $error }
 mapper-share-failed = Nie udało się udostępnić użytkownikowi { $recipient }.
-mapper-now-sees-map = { $recipient } widzi teraz mapę „{ $map }".
-mapper-secret-map-hint = Widzą go tylko osoby, które widzą mapę „{ $map }".
+mapper-now-sees-map = { $recipient } widzi teraz mapę „{ $map }”.
+mapper-secret-map-hint = Widzą go tylko osoby, które widzą mapę „{ $map }”.
 mapper-has-access = ma dostęp
 mapper-clan-members-hidden = Widoczne są tylko grupy: nie możesz zobaczyć listy członków.
 mapper-secret-can-add = Może dodawać
@@ -1079,7 +1200,7 @@ mapper-flag-admin = admin
 mapper-remove-reshare-warning = Usunięcie ponownego udostępniania odbiera też wszystko, co ta osoba ponownie udostępniła.
 mapper-saving = Zapisywanie…
 mapper-revoke-warning = Odbiera dostęp oraz wszystko, co ta osoba ponownie udostępniła.
-mapper-revoke-secret-warning = Odbiera dostęp do „{ $name }".
+mapper-revoke-secret-warning = Odbiera dostęp do „{ $name }”.
 mapper-revoke-atlas-warning = To uprawnienie obejmuje cały folder.
 mapper-revoking = Odbieranie…
 mapper-folder-share-help = Każdy, kogo wybierzesz, otrzyma dostęp do całego folderu.
@@ -1108,7 +1229,7 @@ exit-style-normal = Zwykły
 exit-style-dashed = Przerywany
 exit-style-dotted = Kropkowany
 exit-style-meandering = Kręty
-exit-style-stub = Zaczątkowy
+exit-style-stub = Urwany
 shape-type-rectangle = Prostokąt
 shape-type-rounded-rectangle = Prostokąt o zaokrąglonych kątach
 alignment-left = Do lewej
@@ -1131,10 +1252,10 @@ inspector-tag-on-rooms = { $count ->
     [many] w { $count } pokojach
    *[other] w { $count } pokojach
 }
-inspector-tag-too-long = Tag może mieć najwyżej { $limit } znaków.
+inspector-tag-too-long = Tag jest za długi (limit znaków: { $limit }).
 inspector-tag-hint-map = { $tag } to tag miejsca { $place }. Dodanie go do mapy pokaże go każdemu, kto czyta mapę.
 inspector-tag-hint-place = { $tag } to tag miejsca { $place }. Dodanie go do miejsca { $destination } pokaże go każdemu, kto czyta „{ $destination }”.
-inspector-tag-adds-to = Doda do { $count } z { $total } pokoi.
+inspector-tag-adds-to = Zostanie dodany do pokoi: { $count } z { $total }.
 inspector-tag-cant-carry = { $count ->
     [one] 1 pokój w { $place } nie może mieć tagów miejsca { $destination }.
     [few] { $count } pokoje w { $place } nie mogą mieć tagów miejsca { $destination }.
@@ -1148,8 +1269,8 @@ inspector-tag-added = { $count ->
    *[other] Dodano { $tag } do { $count } pokoi.
 }
 inspector-tag-added-some-had = { $count ->
-    [one] Dodano { $tag } do 1 pokoju (już miało go: { $already }).
-   *[other] Dodano { $tag } do { $count } pokoi (już miało go: { $already }).
+    [one] Dodano { $tag } do { $count } pokoju (już z tagiem: { $already }).
+   *[other] Dodano { $tag } do { $count } pokoi (już z tagiem: { $already }).
 }
 inspector-room-heading = Pokój #{ $number }
 inspector-place-room-heading = { $place } #{ $number }
@@ -1179,9 +1300,9 @@ inspector-connection-redistribute = Rozmieść ponownie
 inspector-connection-route = Trasa
 inspector-connection-orthogonal = Ortogonalna
 inspector-connection-reroute = Ponownie wyznacz trasę…
-inspector-connection-route-stale = Trasa może być nieaktualna po zmianach mapy; użyj opcji Ponownie wyznacz trasę.
-inspector-connection-route-collision = Trasa przecina pokój; użyj opcji Ponownie wyznacz trasę lub edytuj ją ręcznie.
-inspector-connection-route-invalid = Zapisana automatyczna trasa jest nieprawidłowa; użyj opcji Ponownie wyznacz trasę.
+inspector-connection-route-stale = Trasa może być nieaktualna po zmianach mapy; użyj opcji „Ponownie wyznacz trasę”.
+inspector-connection-route-collision = Trasa przecina pokój; użyj opcji „Ponownie wyznacz trasę” lub edytuj ją ręcznie.
+inspector-connection-route-invalid = Zapisana automatyczna trasa jest nieprawidłowa; użyj opcji „Ponownie wyznacz trasę”.
 inspector-connection-route-inactive = W tym trybie zapisana trasa jest nieaktywna.
 inspector-connection-clear-route = Wyczyść zapisaną trasę
 inspector-css-color-placeholder = kolor CSS
@@ -1217,7 +1338,7 @@ inspector-active-help = Aktywne mapy służą do ustalania Twojego położenia p
 inspector-copies = Kopie tej mapy
 inspector-this-map-suffix = { $name } (ta mapa)
 inspector-use-only-copy = Używaj tylko tej kopii
-inspector-multiple-copies-warning = Możesz mieć jednocześnie aktywnych wiele kopii. Podczas odwiedzania pokoi, których kopie znajdują się w wielu aktywnych mapach, maper może umieścić Cię w nieprzewidywalnym miejscu.
+inspector-multiple-copies-warning = Możesz mieć jednocześnie aktywnych wiele kopii. Podczas odwiedzania pokoi, których kopie znajdują się na wielu aktywnych mapach, maper może umieścić Cię w nieprzewidywalnym miejscu.
 inspector-no-area-selected = Nie wybrano mapy
 inspector-shared-map = udostępniona mapa
 inspector-copied-from = Skopiowano z { $source }
@@ -1270,7 +1391,7 @@ mapper-multi-transfer = Przekaż { $items }…
 mapper-multi-servers = Pokaż { $items } na serwerach…
 mapper-multi-delete = Usuń { $items }…
 mapper-multi-delete-none = Usuń…
-mapper-multi-delete-question = Usunąć { $items }? Nie da się tego cofnąć.
+mapper-multi-delete-question = Usunąć { $items }? Tej operacji nie można cofnąć.
 mapper-multi-delete-title = Usuń { $items }
 mapper-multi-delete-holding =
     { $count ->
@@ -1313,8 +1434,8 @@ mapper-undo = Cofnij
 mapper-redo = Ponów
 mapper-duplicate = Duplikuj
 mapper-transfer-action = Przekaż…
-mapper-syncing = synchronizowanie { $count }
-mapper-sync-failed = { $count } nieudanych
+mapper-syncing = synchronizacja: { $count }
+mapper-sync-failed = nieudane: { $count }
 mapper-sync = Synchronizuj
 mapper-sync-tip = Synchronizuj z chmurą
 mapper-status-saved = Zapisano
@@ -1344,9 +1465,10 @@ mapper-tags-none = Brak tagów.
 mapper-rooms-filter = Filtruj po tytule, miejscu, numerze lub tagu
 mapper-rooms-none = Brak pasujących pokoi.
 mapper-rooms-more = { $count ->
-    [one] Jeszcze 1 pokój. Zawęź listę filtrem.
+    [one] Jeszcze { $count } pokój. Zawęź listę filtrem.
     [few] Jeszcze { $count } pokoje. Zawęź listę filtrem.
-   *[other] Jeszcze { $count } pokoi. Zawęź listę filtrem.
+    [many] Jeszcze { $count } pokoi. Zawęź listę filtrem.
+   *[other] Jeszcze { $count } pokoju. Zawęź listę filtrem.
 }
 mapper-room-untitled = (bez tytułu)
 mapper-new-secret = Nowy sekret
@@ -1364,7 +1486,7 @@ mapper-private-help = Widzisz je tylko Ty.
 mapper-place-gone = „{ $name }” już nie istnieje.
 mapper-now-editing = Teraz edytujesz
 mapper-panel-kind-map = MAPA
-mapper-panel-kind-atlas = ATLAS
+mapper-panel-kind-atlas = FOLDER
 mapper-panel-data-fields = Pola danych
 mapper-panel-maps = Mapy
 mapper-panel-shares = Udostępnienia
@@ -1382,10 +1504,10 @@ mapper-secret-owner = Właściciel
 mapper-secret-owner-me = Ja
 mapper-secret-owner-members = Członkowie
 mapper-secret-owner-clan = Klan
-mapper-secret-owner-members-of = Członkowie klanu { $clan }
-mapper-secret-owner-clan-named = Klan { $clan }
+mapper-secret-owner-members-of = Członkowie klanu „{ $clan }”
+mapper-secret-owner-clan-named = Klan „{ $clan }”
 mapper-secret-owner-members-help = Należy do Ciebie; później możesz zaproponować jego własność innym członkom.
-mapper-secret-owner-clan-help = Należy do właścicieli klanu. Zaczynasz jako współtwórca; kto jeszcze go czyta, wynika z dostępu w klanie.
+mapper-secret-owner-clan-help = Należy do właścicieli klanu. Zaczynasz jako współtwórca; kto jeszcze może go czytać, zależy od ustawień dostępu w klanie.
 mapper-secret-owner-none = Nie możesz utworzyć sekretu na tej mapie.
 mapper-secret-member-owned = Własność członków · { $clan }
 mapper-secret-clan-owned = Własność klanu · { $clan }
@@ -1408,12 +1530,12 @@ mapper-ownership = Własność
 mapper-offer-ownership = Zaproponuj własność…
 mapper-offer-pick = Zaproponuj własność:
 mapper-offer-nobody = Nikt inny jeszcze nie czyta tego sekretu.
-mapper-offer-replace-toggle = Zastępują obecnych właścicieli
+mapper-offer-replace-toggle = Zastąp obecnych właścicieli
 mapper-offer-add-help = Staną się właścicielami obok obecnych.
 mapper-offer-replace-help = Staną się jedynymi właścicielami.
 mapper-offer-from-clan-help = Staną się właścicielami, a właściciele klanu przestaną nimi być.
 mapper-offer-joint-help = Każdy akceptuje osobno; własność zmienia się, gdy zaakceptuje ostatnia osoba.
-mapper-offer-recipient-limit = Oferta może wskazać najwyżej { $count } osób.
+mapper-offer-recipient-limit = Maksymalna liczba osób w propozycji: { $count }.
 mapper-offer-send = Wyślij propozycję
 mapper-offer-cancel = Wycofaj propozycję
 mapper-offer-accepted = { $name } (zaakceptowano)
@@ -1433,7 +1555,7 @@ mapper-owner-only-you = Jesteś jedynym właścicielem. Najpierw zaproponuj wła
 mapper-owner-last = Najpierw potrzebny jest inny właściciel.
 mapper-make-clan-owned = Przekaż klanowi…
 mapper-make-clan-owned-pick = Kto przyjmie go w imieniu klanu:
-mapper-make-clan-owned-confirm = Zaproponować „{ $secret }” klanowi? Gdy { $name } przyjmie propozycję, stanie się on własnością klanu: właściciele klanu będą mogli zrobić z nim wszystko, a jego obecni właściciele, łącznie z Tobą, przestaną nimi być.
+mapper-make-clan-owned-confirm = Zaproponować „{ $secret }” klanowi? Gdy { $name } przyjmie propozycję, sekret stanie się własnością klanu: właściciele klanu będą mogli zrobić z nim wszystko, a jego obecni właściciele, łącznie z Tobą, przestaną nimi być.
 mapper-make-clan-owned-confirm-self = Przekazać „{ $secret }” na własność klanu? Właściciele klanu, w tym Ty, będą mogli zrobić z nim wszystko, a pozostali obecni właściciele przestaną nimi być. To, co udostępniono członkom i grupom, pozostaje.
 mapper-make-clan-owned-action = Przekaż klanowi
 mapper-ownership-refused = Nie udało się zmienić właściciela „{ $secret }”. Mógł się w międzyczasie zmienić; spróbuj ponownie.
@@ -1446,7 +1568,7 @@ mapper-place-several = Kilka
 mapper-move-title = Przenieś do „{ $place }”
 mapper-move-action = Przenieś
 mapper-moving = Przenoszenie…
-mapper-move-loses-data = „{ $place }” traci swoje dane o tych pokojach.
+mapper-move-loses-data = „{ $place }” straci swoje dane o tych pokojach.
 mapper-move-strands-exits = Wyjścia z innych map do tych pokoi będą prowadzić donikąd.
 mapper-move-reveals = Zobaczy je każdy, kto widzi tę mapę.
 mapper-move-splits = #{ $room } łączy się z #{ $other }, który zostaje w „{ $place }”.
@@ -1503,22 +1625,22 @@ segments-direct = Bezpośrednia
 corners-sharp = Ostre narożniki
 corners-rounded = Zaokrąglone narożniki
 dash-solid = Ciągła
-dash-dashed = Kreskowana
+dash-dashed = Przerywana
 dash-dotted = Kropkowana
 inspector-in = W
 mapper-shared-by-friend = Udostępnione przez znajomego
 mapper-a-friend = znajomy
 mapper-shared-by-owner-pair = Udostępnione przez { $sharer } · właściciel: { $owner }
 mapper-shared-by-person = Udostępnione przez { $person }
-mapper-window-title = Smudgy edytor map
-mapper-window-area-title = Smudgy edytor map — { $area }
+mapper-window-title = Smudgy — edytor map
+mapper-window-area-title = Smudgy — edytor map — { $area }
 mapper-copy-report = Skopiowano mapy: { $copied }; pominięto: { $skipped } (nie można skopiować).
 mapper-copy-report-pending = Skopiowano dotąd map: { $copied }; kolejne ({ $pending }) są w drodze i wkrótce pojawią się w folderze. Pominięto: { $skipped } (nie można skopiować).
 mapper-copy-rooms-denied = Właściciel tej mapy nie zezwolił na kopiowanie pokoi.
 mapper-create-first-room = Utwórz pierwszy pokój
 mapper-create-first-room-help = Następnie wybierz jego położenie na siatce.
-mapper-save-keep-mine = Zachowaj moją
-mapper-save-keep-theirs = Zachowaj ich
+mapper-save-keep-mine = Zachowaj moją wersję
+mapper-save-keep-theirs = Zachowaj ich wersję
 action-retry = Ponów próbę
 mapper-local-maps-signin = Mapy lokalne są zapisywane na tym urządzeniu. Zaloguj się, aby korzystać z map w chmurze, które synchronizują się między urządzeniami i które można udostępniać.
 mapper-sign-in-create = Zaloguj się lub utwórz konto
@@ -1545,7 +1667,7 @@ area-list-inactive-tip = Nieużywana do ustalania Twojego położenia podczas gr
 area-list-copy-badge = kopia
 area-list-copy-family-tip = Jedna z kilku kopii tej samej mapy — otwórz ją, aby wybrać aktywną kopię
 area-list-owned-by = właściciel: { $owner }
-area-list-reshared = Udostępnione ponownie: { $sharer } udostępnił mapę, której właścicielem jest { $owner }
+area-list-reshared = Udostępnione ponownie: { $sharer } udostępnił(a) mapę, której właścicielem jest { $owner }
 area-list-admin-badge = admin
 area-list-edit-badge = edycja
 area-list-move-action = Przenieś…
@@ -1610,7 +1732,7 @@ store-waiting = Oczekiwanie na pierwszą migawkę sesji…
 store-published-state = Opublikowany stan
 store-empty = Nic jeszcze nie opublikowano. Stan pojawi się tutaj w chwili, gdy skrypt lub pakiet go ustawi.
 store-usage = wpisy: { $entries } · { $bytes }
-store-more-hidden = … { $count } więcej niewyświetlonych
+store-more-hidden = … ukryte: { $count }
 store-catalogue = Stan, zdarzenia i komunikaty
 store-catalogue-empty = Nie napotkano jeszcze żadnych uchwytów interop. Pojawią się tutaj zadeklarowane uchwyty, emitowane zdarzenia i wysłane komunikaty.
 store-provenance-declared = zadeklarowany
@@ -1618,7 +1740,7 @@ store-provenance-declared-unseen = zadeklarowany · nie napotkany w tej sesji
 store-provenance-runtime = utworzony w czasie działania
 store-provenance-undeclared = zaobserwowany · niezadeklarowany
 store-shape = kształt: { $shape }
-store-declared-shape = zadeklarowany: { $shape }
+store-declared-shape = zadeklarowany kształt: { $shape }
 store-truncated = obcięto
 time-just-now = przed chwilą
 time-seconds-ago = { $count } s temu
@@ -1639,11 +1761,11 @@ automations-packages-plural = Pakiety
 automations-create-new = Utwórz nowy { $kind }
 automations-scripts = Skrypty
 automations-local = Lokalne
-automations-show-more = Pokaż { $count } więcej…
+automations-show-more = Pokaż jeszcze { $count }…
 
 # Automation editors
 editor-top-level = (poziom główny)
-editor-failed-read = Nie udało się odczytać „{ $path }": { $error }
+editor-failed-read = Nie udało się odczytać „{ $path }”: { $error }
 editor-failed-save-folders = Nie udało się zapisać folderów: { $error }
 editor-name-empty = Nazwa nie może być pusta
 editor-name-in-use = Nazwa jest już używana
@@ -1661,7 +1783,7 @@ editor-failed-modules-dir = Nie udało się odnaleźć katalogu modułów: { $er
 editor-failed-create-module = Nie udało się utworzyć modułu: { $error }
 editor-module-created = Utworzono moduł { $name }.
 editor-create-module = Utwórz moduł
-automation-inspector-unavailable = Inspektor jeszcze niedostępny — uruchamia się, gdy sesja się połączy. Połącz tę sesję ponownie, a następnie ponownie kliknij Inspekcja.
+automation-inspector-unavailable = Inspektor jest jeszcze niedostępny — uruchamia się, gdy sesja się połączy. Połącz tę sesję ponownie, a następnie ponownie kliknij „Inspekcja”.
 editor-delete = Usuń
 editor-unsaved = Niezapisane zmiany
 editor-discard = Odrzuć
@@ -1692,8 +1814,8 @@ editor-would-fire = ✓ uruchamia się
 editor-enter-command = · wpisz polecenie do przetestowania
 editor-folder-summary = Folder · liczba elementów: { $count }
 editor-path = Ścieżka
-editor-folder-disabled-help = Wyłączony — skrypty w tym folderze nie będą uruchamiane. Użyj „/", aby zagnieżdżać foldery.
-editor-folder-help = Użyj „/", aby zagnieżdżać foldery. Przenieś skrypt do folderu za pomocą pola Folder w edytorze (lub palety poleceń).
+editor-folder-disabled-help = Wyłączony — skrypty w tym folderze nie będą uruchamiane. Użyj „/”, aby zagnieżdżać foldery.
+editor-folder-help = Użyj „/”, aby zagnieżdżać foldery. Przenieś skrypt do folderu za pomocą pola „Folder” w edytorze (lub palety poleceń).
 editor-folder-path-conflict = Folder już używa tej ścieżki albo ścieżka znajduje się wewnątrz przenoszonego folderu: { $path }
 editor-folder-missing = Ten folder już nie istnieje: { $path }
 editor-contents = Zawartość
@@ -1709,7 +1831,10 @@ activation-disable-everywhere = Wyłącz wszędzie
 activation-current-profile = Bieżący
 activation-every-profile = Każdy profil
 activation-no-profile = Brak profili
-activation-profile-count = { $enabled } z { $total } profili
+activation-profile-count = { $total ->
+        [one] { $enabled } z { $total } profilu
+       *[other] { $enabled } z { $total } profili
+    }
 activation-profile-list-unavailable = Lista profili jest niedostępna
 activation-profile-inventory-error = Smudgy nie może odczytać wszystkich profili. Napraw pliki profili i wczytaj je ponownie, zanim zmienisz poszczególne profile.
 activation-folder-state-error = Smudgy nie może odczytać ustawień aktywacji folderów. Napraw plik packages.json i wczytaj go ponownie, zanim zmienisz te ustawienia.
@@ -1734,13 +1859,13 @@ package-parameter-profile = Ustawienia dla każdego profilu
 package-parameter-profile-label = Profil
 package-parameter-profile-status = Problemy
 package-parameter-missing = Brak: { $params }
-package-parameter-scope-updated = Zaktualizowano zakres parametrów.
+package-parameter-scope-updated = Zaktualizowano zakres ustawień.
 package-copy-settings = Skopiuj ustawienia do…
-package-copy-settings-title = Kopiuj ustawienia do innego profilu
-package-copy-settings-help = Kopiuje ustawienia { $profile } do wybranego przez Ciebie profilu, zastępując jego aktualne wartości.
+package-copy-settings-title = Skopiuj ustawienia do innego profilu
+package-copy-settings-help = Kopiuje ustawienia profilu { $profile } do wybranego przez Ciebie profilu, zastępując jego aktualne wartości.
 package-copy-settings-destination = Docelowy profil
 package-copy-settings-choose = Wybierz profil
-package-settings-copied = Ustawienia skopiowane do { $profile }.
+package-settings-copied = Skopiowano ustawienia do profilu { $profile }.
 package-settings-copy-failed = Kopiowanie ustawień nie powiodło się: { $error }
 automation-discard-and-switch = Odrzuć zmiany i przełącz
 automation-discard-and-close = Odrzuć zmiany i zamknij
@@ -1798,9 +1923,9 @@ package-installed-state-unavailable = Smudgy nie może odczytać stanu zainstalo
 package-settings-read-unavailable = Smudgy nie może odczytać ustawień tego pakietu. Żadne wartości nie zostały zmienione: { $error }
 package-settings-read-unavailable-generic = Smudgy nie może odczytać ustawień tego pakietu. Wczytaj ponownie i spróbuj jeszcze raz.
 package-settings-row-missing = Smudgy nie może znaleźć rekordu ustawień tego pakietu.
-package-param-prompt-scope-changed = Ten pakiet używa teraz osobnych ustawień dla każdego profilu. Zamknij to okno i skonfiguruj każdy aktywny profil w Ustawieniach.
+package-param-prompt-scope-changed = Ten pakiet używa teraz osobnych ustawień dla każdego profilu. Zamknij to okno i skonfiguruj każdy aktywny profil na karcie „Ustawienia”.
 
-# ---- Edytory dopasowań aliasów i wyzwalaczy ----
+# ---- Alias and trigger matcher editors ----
 editor-match-input-as = Dopasuj dane wejściowe jako
 editor-kind-command = Polecenie + argumenty
 editor-kind-pattern = Prosty wzorzec
@@ -1820,7 +1945,7 @@ editor-add-exception-another = Dodaj kolejny wyjątek
 editor-add-exception = Dodaj wyjątek
 editor-add-exception-tip = Jeśli pasuje, wyzwalacz nie zostanie uruchomiony
 editor-match-raw = Dopasuj surowe bajty
-editor-match-raw-tip = Surowe wyrażenie regularne dopasowywane przed tekstem, z zachowaniem kodów kolorów i bajtów sterujących
+editor-match-raw-tip = Surowe wyrażenie regularne dopasowywane do wiersza przed jego przetworzeniem, wraz z kodami kolorów i bajtami sterującymi
 editor-match-color = Dopasuj kolor
 editor-color-foreground = Pierwszy plan
 editor-color-background = Tło
@@ -1836,14 +1961,14 @@ editor-color-preview = Podgląd
 editor-color-from = Od
 editor-color-to = Do
 editor-color-truecolor-note = Wprowadź jeden dokładny kolor jako kod szesnastkowy lub wartości RGB.
-editor-color-range-note = Odcień (H) biegnie od „Od” do „Do” w kierunku rosnących stopni i może przechodzić przez 0°; równe wartości wybierają jeden odcień. Nasycenie (S) i jasność (V) mają domknięte granice w dowolnej kolejności. Zakresy obejmują tylko kolory oparte na RGB: truecolor i xterm 16–255, bez ANSI ani xterm 0–15.
+editor-color-range-note = Odcień (H) biegnie od „Od” do „Do” w kierunku rosnących stopni i może przechodzić przez 0°; równe wartości wybierają jeden odcień. Dla nasycenia (S) i jasności (V) granice należą do zakresu i można je podać w dowolnej kolejności. Zakresy obejmują tylko kolory oparte na RGB: truecolor i xterm 16–255, bez ANSI ani xterm 0–15.
 editor-color-hex = Hex
 editor-color-red = R
 editor-color-green = G
 editor-color-blue = B
 editor-color-invalid-hex = Wprowadź sześciocyfrowy kod koloru w formacie szesnastkowym, na przykład #1a2b3c.
 editor-color-invalid-rgb = W każdym polu RGB wprowadź liczbę całkowitą od 0 do 255.
-editor-color-needs-constraint = W przypadku dopasowania bez tekstu wybierz kolor pierwszego planu lub tła albo wymagaj atrybutu tekstu.
+editor-color-needs-constraint = W przypadku dopasowania bez tekstu wybierz kolor pierwszego planu lub tła albo zaznacz wymagany atrybut tekstu.
 editor-color-attributes = Wymagane atrybuty
 editor-color-bold = Pogrubienie
 editor-color-faint = Przygaszenie
@@ -1896,7 +2021,7 @@ editor-syntax-pattern = Prosty wzorzec
 editor-syntax-regex = Wyrażenie regularne
 editor-command-name-empty = Brak nazwy polecenia
 editor-command-name-spaces = Ponieważ ten alias jest poleceniem, jego nazwę należy skrócić do jednego słowa
-editor-raw-one-argument = „{ editor-parse-raw }” przyjmuje jeden argument. Usuń pozostałe lub wybierz inną analizę.
+editor-raw-one-argument = „{ editor-parse-raw }” przyjmuje tylko jeden argument. Usuń pozostałe lub wybierz inny sposób analizy.
 editor-command-completion-note = Nazwy poleceń można uzupełniać klawiszem Tab w polu wejściowym.
 editor-example-arg-name = name
 editor-example-trigger-pattern = {"{"}person{"}"} says '{"{"}message{"}"}'
@@ -1924,7 +2049,10 @@ editor-hide-order = Ukryj opcje priorytetu
 editor-kind-inside = { $kind } · wewnątrz { $outer }
 editor-inside = Wewnątrz
 editor-inside-reach-line = tylko ten wiersz
-editor-inside-reach-lines = w ciągu { $count } wierszy
+editor-inside-reach-lines = { $count ->
+        [one] w ciągu { $count } wiersza
+       *[other] w ciągu { $count } wierszy
+    }
 editor-inside-reach-unlimited = bez limitu wierszy
 editor-inside-reach-prompt = do monitu
 editor-inside-reach-once = raz
@@ -1945,7 +2073,12 @@ editor-overlap-restart = Zacznij od nowa
 editor-overlap-each = Obserwuj każde osobno
 editor-verdict-inside-suffix = wewnątrz { $outer }
 editor-folder-from-outer = Folder · { $folder } (z { $outer })
-editor-delete-outer-question = Usunąć ten wyzwalacz i { $count } wyzwalaczy wewnątrz niego?
+editor-delete-outer-question = Usunąć ten wyzwalacz i { $count ->
+        [one] { $count } wyzwalacz
+        [few] { $count } wyzwalacze
+        [many] { $count } wyzwalaczy
+       *[other] { $count } wyzwalacza
+    } wewnątrz niego?
 editor-move-inside-out = Przenieś je na zewnątrz
 editor-delete-inside-too = Usuń je również
 palette-move-inside = Przenieś { $subject } do wnętrza { $outer }
@@ -1953,7 +2086,7 @@ palette-move-outside = Przenieś { $subject } poza { $outer }
 
 editor-matched-values = Dopasowane wartości
 
-# Wypróbuj i wyniki testu
+# Try-it and test results
 editor-try-alias-cta = Wypróbuj z tekstem, który możesz wpisać
 editor-try-trigger-cta = Wypróbuj z wierszem wysłanym przez grę
 editor-try-it = Wypróbuj
@@ -1969,16 +2102,16 @@ editor-verdict-no-matchers = ✗ brak wierszy do dopasowania
 editor-verdict-invalid-regex = ✗ nieprawidłowe wyrażenie regularne: { $error }
 editor-verdict-compile-error = ✗ { $error }
 
-# Kiedy jest uruchamiany
+# When it runs
 editor-when-it-runs = Kiedy jest uruchamiany
 editor-priority = Priorytet
-editor-priority-note-aliases = Aliasy z wyższymi numerami są uruchamiane najpierw.
-editor-priority-note-triggers = Wyzwalacze z wyższymi numerami są uruchamiane najpierw.
+editor-priority-note-aliases = Aliasy z wyższymi numerami są uruchamiane jako pierwsze.
+editor-priority-note-triggers = Wyzwalacze z wyższymi numerami są uruchamiane jako pierwsze.
 editor-continue-aliases = Uruchom także inne pasujące aliasy
 editor-continue-triggers = Uruchom także inne pasujące wyzwalacze
 editor-allow-self-match = Pozwól, aby tekst wysłany przez ten alias pasował do niego samego
 
-# Co odczytuje (udostępniony stan)
+# What it reads (exposed state)
 editor-reveal-state = Odczytuj stan z GMCP lub pakietu
 editor-hide-state = Ukryj opcje stanu
 editor-what-it-reads = Co odczytuje
@@ -1997,7 +2130,7 @@ editor-state-unexpose-tooltip = Przestań udostępniać { $path }
 editor-state-insert-tooltip = Wstaw { $reference }
 editor-state-not-exposed = { $reference } nie jest udostępnione dla tego elementu ({ $kind })
 editor-state-name-taken = Inna udostępniona wartość już używa nazwy { $name }
-editor-state-name-shadows-smudgy = { $name } ze smudgy nie będzie dostępne w tym skrypcie.
+editor-state-name-shadows-smudgy = { $name } ze Smudgy nie będzie dostępne w tym skrypcie.
 editor-state-name-shadows-javascript = { $name } z JavaScript nie będzie dostępne w tym skrypcie.
 editor-state-name-shadows-deno = { $name } z Deno nie będzie dostępne w tym skrypcie.
 editor-state-name-shadows-capture = { $name } jest też dopasowaną wartością; samo ${ $name } oznacza dopasowanie
@@ -2007,7 +2140,7 @@ editor-state-bad-path = { $path } nie jest poprawną ścieżką
 editor-state-empty = Magazyn jest obecnie pusty.
 editor-state-invalid = Nie można użyć udostępnionej wartości: { $error }
 
-# Moduł akcji
+# Action module
 editor-tab-send-text = Wyślij tekst
 editor-tab-run-js = Uruchom JavaScript
 editor-gen-alias-hello = say Hello, { $hole }!
@@ -2017,41 +2150,41 @@ editor-gen-alias-emote-none = emote smiles and waves.
 editor-gen-trigger = say I heard about { $hole }.
 editor-gen-trigger-none = say Understood.
 
-# Etykiety marginesów
+# Field hints
 editor-gutter-before-pattern = Przed wzorcem może występować dowolny tekst
 editor-gutter-after-pattern = Po wzorcu może występować dowolny tekst
 editor-gutter-before-regex = Brak ^ — przed wyrażeniem może występować dowolny tekst
 editor-gutter-after-regex = Brak $ — po wyrażeniu może występować dowolny tekst
 
-# Opisy nagłówków i łącza stopki
+# Header descriptions and footer links
 editor-deck-alias = Aliasy pozwalają tworzyć własne polecenia.
 editor-deck-trigger = Wyzwalacze reagują na tekst wysyłany przez grę.
 editor-delete-this-alias = Usuń ten alias
 editor-delete-this-trigger = Usuń ten wyzwalacz
-widget-hotkey-click-to-record = kliknij, aby zarejestrować
-widget-hotkey-listening = nasłuchiwanie...
+widget-hotkey-click-to-record = Kliknij, aby nagrać skrót
+widget-hotkey-listening = oczekiwanie na klawisze…
 
 # Package manifest editor
 manifest-kind-text = Tekst
-manifest-kind-boolean = Wartość boolean
+manifest-kind-boolean = Wartość logiczna
 manifest-kind-number = Liczba
 manifest-kind-dropdown = Lista rozwijana
 manifest-kind-list = Lista
 manifest-kind-table = Tabela
 manifest-version-required = Wersja jest wymagana (np. 1.0.0).
-manifest-min-version-invalid = Wartość nowej wersji Smudgy „{ $version }" nie jest prawidłowa (podaj właściwą wartość np. 0.4.0).
+manifest-min-version-invalid = Wartość pola „Wymaga Smudgy” („{ $version }”) nie jest wersją (np. 0.4.0).
 manifest-param-needs-key = Parametr #{ $number } wymaga klucza.
-manifest-param-error = Parametr „{ $key }": { $reason }
-manifest-duplicate-param-key = Zduplikowany klucz parametru „{ $key }".
+manifest-param-error = Parametr „{ $key }”: { $reason }
+manifest-duplicate-param-key = Zduplikowany klucz parametru „{ $key }”.
 manifest-dropdown-needs-option = Lista rozwijana wymaga co najmniej jednej opcji.
 manifest-list-needs-element = Lista wymaga typu elementu.
 manifest-list-element = element listy
-manifest-column = kolumna „{ $key }"
-manifest-duplicate-column = Zduplikowany klucz kolumny „{ $key }".
+manifest-column = kolumna „{ $key }”
+manifest-duplicate-column = Zduplikowany klucz kolumny „{ $key }”.
 manifest-table-needs-column = Tabela wymaga co najmniej jednej kolumny z kluczem.
-manifest-no-nested-container = { $item } nie może samo być listą ani tabelą.
+manifest-no-nested-container = { $item } nie może być kolejną listą ani tabelą.
 manifest-item-dropdown-needs-option = { $item } jest listą rozwijaną i wymaga co najmniej jednej opcji.
-manifest-duplicate-option = Zduplikowana wartość opcji „{ $value }".
+manifest-duplicate-option = Zduplikowana wartość opcji „{ $value }”.
 manifest-default-from-options = Wartość domyślna musi być jedną z opcji.
 manifest-default-boolean-error = Wartość domyślna musi być true lub false.
 manifest-default-number-error = Wartość domyślna musi być liczbą.
@@ -2063,13 +2196,13 @@ manifest-edit = Edytuj manifest
 manifest-edit-help = Interfejs użytkownika do edycji smudgy.package.json
 manifest-version = Wersja
 manifest-version-placeholder = np. 1.0.0
-manifest-version-warning = Póki co jest to nieprawidłowa wersja semver — wymagana przed publikacją (np. 1.2.3).
+manifest-version-warning = To jeszcze nie jest prawidłowa wersja semver, a jest wymagana do publikacji (np. 1.2.3).
 manifest-description = Opis
 manifest-runtime-compatibility = Zgodność ze środowiskiem uruchomieniowym
 manifest-target-native = Aplikacja desktopowa
 manifest-target-web = Przeglądarka
 manifest-target-both = Obie wersje
-manifest-description-placeholder = Co robi ten pakiet (wyświetlane w sekcji Odkrywaj)
+manifest-description-placeholder = Co robi ten pakiet (wyświetlane w sekcji „Odkrywaj”)
 manifest-entry = Punkt wejścia
 manifest-entry-placeholder = index.ts
 manifest-unsaved = Niezapisane zmiany
@@ -2098,7 +2231,12 @@ manifest-none-period = Brak.
 manifest-required = wymagany
 manifest-secret = tajny
 manifest-default-value = domyślnie { $value }
-manifest-kind-dropdown-summary = lista rozwijana ({ $count } opcji)
+manifest-kind-dropdown-summary = { $count ->
+        [one] lista rozwijana ({ $count } opcja)
+        [few] lista rozwijana ({ $count } opcje)
+        [many] lista rozwijana ({ $count } opcji)
+       *[other] lista rozwijana ({ $count } opcji)
+    }
 manifest-kind-list-summary = lista typu { $kind }
 manifest-kind-table-summary = tabela [{ $columns }]
 manifest-fully-sandboxed = W pełni izolowany — brak specjalnych możliwości.
@@ -2129,17 +2267,17 @@ manifest-tab-capabilities = Możliwości
 manifest-tab-network = Sieć
 manifest-tab-files = Pliki
 manifest-tab-system = System
-manifest-sandbox-deny-note = Instalacja w sandboxie nie ma dostępu do niczego, co nie zostało tu wymienione.
-manifest-dependency-lock-note = Publikacja blokuje dokładną wersję każdej zależności w chwili publikacji. Użytkownicy otrzymają nowsze wersje zależności dopiero po wydaniu przez Ciebie nowej wersji tego pakietu, która je zaktualizuje.
-manifest-readable-path-warning = Ścieżka do odczytu spoza $DATA powoduje ostrzeżenie. Preferuj $DATA, chyba że odczyt zewnętrznych plików jest niezbędny.
+manifest-sandbox-deny-note = Pakiet zainstalowany w sandboxie nie ma dostępu do niczego, czego tu nie wymieniono.
+manifest-dependency-lock-note = Publikacja przypina dokładną wersję każdej zależności z chwili publikacji. Użytkownicy otrzymają nowsze wersje zależności dopiero po wydaniu przez Ciebie nowej wersji tego pakietu, która je zaktualizuje.
+manifest-readable-path-warning = Ścieżka do odczytu spoza $DATA powoduje ostrzeżenie. Używaj raczej $DATA, chyba że odczyt zewnętrznych plików jest niezbędny.
 manifest-dependencies-help = Inne pakiety Smudgy, które ten pakiet importuje: smudgy:@name@^1.2 (działa też smudgy://owner/name@^1.2). Obecnie obsługiwane są tylko pakiety Smudgy. Zarządzanie wersjami pakietów jsr i npm jest realizowane przez ich moduły ładujące, a pakiet może je importować, gdy ma dostęp do rejestru.
 manifest-add-dependency-placeholder = Dodaj jeden ze swoich zainstalowanych lub lokalnych pakietów…
 manifest-dependency = zależność
 manifest-any-version-placeholder = dowolna wersja
 manifest-min-version-help = Minimalna wersja Smudgy, na której działa ten pakiet. Może to zapobiec automatycznej aktualizacji starszych klientów do niezgodnej wersji pakietu. Pozostaw puste, aby zezwolić na dowolną wersję Smudgy.
 manifest-min-version-format-error = To nie jest wersja. Użyj formatu semver, np. 0.3.5, lub pozostaw puste.
-manifest-min-version-newer = Nowsza niż to Smudgy ({ $running }) — instalacja i ładowanie są odrzucane poniżej { $required } (Twoja lokalna kopia deweloperska pozostaje wyłączona z tej reguły).
-manifest-hosts-help = Hosty, na które ten pakiet jest kierowany w sekcji Odkrywaj, stosowane przy publikacji. Pozostaw puste, aby był niezależny od hosta.
+manifest-min-version-newer = Nowsza niż Twoja wersja Smudgy ({ $running }): wersje starsze niż { $required } nie zainstalują ani nie wczytają tego pakietu (Twoja lokalna kopia deweloperska nie podlega tej regule).
+manifest-hosts-help = Hosty, dla których ten pakiet będzie wyświetlany w sekcji „Odkrywaj”; stosowane przy publikacji. Pozostaw puste, jeśli pakiet nie jest związany z żadnym hostem.
 manifest-host = host
 manifest-required-packages = Wymagane pakiety
 manifest-required-packages-help = Pakiety instalowane automatycznie razem z tym pakietem, każdy działający we własnym sandboxie. Użyj smudgy:@name[@^1.2].
@@ -2149,17 +2287,17 @@ manifest-allow-import-help = Gdy wyłączone, moduły tego pakietu mogą importo
 manifest-allowed-hosts = Dozwolone hosty
 manifest-host-format-help = nazwa hosta, nazwa hosta:port, * (dowolny host/port) lub *:port (dowolny host na tym porcie).
 manifest-local-ipc = Lokalne IPC
-manifest-local-ipc-help = Lokalne usługi, z którymi ten pakiet może się łączyć. Każdy wiersz to jeden punkt końcowy, zadeklarowany dla obu rodzin platform: ścieżka gniazda Unix i/lub nazwa potoku Windows (smudgy samo dodaje \\.\pipe\). Przyznawane jest tylko pole odpowiadające platformie użytkownika.
+manifest-local-ipc-help = Lokalne usługi, z którymi ten pakiet może się łączyć. Każdy wiersz to jeden punkt końcowy, zadeklarowany dla obu rodzin platform: ścieżka gniazda Unix i/lub nazwa potoku Windows (Smudgy sam dodaje \\.\pipe\). Przyznawane jest tylko pole odpowiadające platformie użytkownika.
 manifest-ipc-unix-label = Ścieżka gniazda Unix
 manifest-ipc-pipe-label = Nazwa potoku Windows
 manifest-ipc-unix-placeholder = /var/run/example.sock
 manifest-ipc-pipe-placeholder = example-service
 manifest-ipc-endpoint = lokalny punkt końcowy IPC
 manifest-ipc-warning = Lokalny punkt końcowy IPC może uzyskać dostęp do uprzywilejowanych usług systemowych (na przykład gniazda Dockera) z pełnymi uprawnieniami użytkownika.
-manifest-ipc-unix-invalid = Wiersz Lokalnego IPC nr { $number }: ścieżka gniazda Unix musi być bezwzględna (zaczynać się od /).
-manifest-ipc-pipe-invalid = Wiersz Lokalnego IPC nr { $number }: nazwa potoku Windows nie może zawierać /, \ ani : — smudgy samo dodaje \\.\pipe\.
-manifest-net-local-transport-error = Dozwolony host „{ $entry }” wskazuje lokalne gniazdo. Dozwolone hosty to wyłącznie hosty internetowe; lokalne punkty końcowe deklaruje się w sekcji Lokalne IPC.
-manifest-pipe-namespace-path-error = Ścieżka „{ $entry }” wskazuje przestrzeń nazw potoków Windows. Otwarcie potoku oznacza połączenie z nim; zadeklaruj ten punkt końcowy w sekcji Lokalne IPC.
+manifest-ipc-unix-invalid = Wiersz nr { $number } w sekcji „Lokalne IPC”: ścieżka gniazda Unix musi być bezwzględna (zaczynać się od /).
+manifest-ipc-pipe-invalid = Wiersz nr { $number } w sekcji „Lokalne IPC”: nazwa potoku Windows nie może zawierać /, \ ani : — Smudgy sam dodaje \\.\pipe\.
+manifest-net-local-transport-error = Dozwolony host „{ $entry }” wskazuje lokalne gniazdo. Dozwolone hosty to wyłącznie hosty internetowe; lokalne punkty końcowe deklaruje się w sekcji „Lokalne IPC”.
+manifest-pipe-namespace-path-error = Ścieżka „{ $entry }” wskazuje przestrzeń nazw potoków Windows. Otwarcie potoku oznacza połączenie z nim; zadeklaruj ten punkt końcowy w sekcji „Lokalne IPC”.
 manifest-import-none = Brak modułów spoza ekosystemu Smudgy
 manifest-import-registries = Może pobierać i uruchamiać moduły z publicznych rejestrów (npm, jsr)
 manifest-import-any = Może pobierać i uruchamiać moduły z dowolnego źródła
@@ -2186,7 +2324,7 @@ manifest-cap-group-workers = Workery
 manifest-cap-create-aliases = definiowanie aliasów wejściowych
 manifest-cap-create-triggers = reagowanie na dane wyjściowe gry
 manifest-cap-send = wysyłanie poleceń tak, jakby zostały wpisane (przechodzą przez Twoje aliasy)
-manifest-cap-send-raw = wysyłać tekst i surowe bajty bezpośrednio do gry, z pominięciem aliasów. Smudgy nie wyświetla surowych bajtów w oknie wyjścia
+manifest-cap-send-raw = wysyłanie tekstu i surowych bajtów bezpośrednio do gry, z pominięciem aliasów. Smudgy nie wyświetla surowych bajtów w oknie wyjścia
 manifest-cap-echo = wyświetlanie tekstu na Twoim ekranie
 manifest-cap-sessions = dostęp do innych Twoich połączonych sesji
 manifest-cap-display = ukrywanie, wyróżnianie, wstawianie lub zamienianie tekstu
@@ -2197,11 +2335,11 @@ manifest-cap-widgets = tworzenie i zmiana widgetów na ekranie
 manifest-cap-widget-shaders = kompilowanie shaderów GPU i używanie shaderowych efektów tekstowych
 manifest-cap-interop-write = rozgłaszanie zdarzeń i publikowanie współdzielonego stanu, na który mogą reagować inne pakiety
 manifest-cap-interop-read = nasłuchiwanie zdarzeń i odczyt współdzielonego stanu
-manifest-cap-interop-broadcast = używaj BroadcastChannel z pakietami w sesjach na tym serwerze
+manifest-cap-interop-broadcast = używanie BroadcastChannel z pakietami w sesjach na tym serwerze
 manifest-cap-panes = tworzenie podzielonych paneli i interakcja z nimi
 manifest-cap-gmcp = wysyłanie komunikatów GMCP do gry i zarządzanie modułami GMCP
 manifest-cap-workers = uruchamianie wątków obliczeniowych w tle (bez dostępu do sieci, plików ani smudgy)
-param-value-not-choice = „{ $value }" nie jest jedną z dostępnych opcji.
+param-value-not-choice = „{ $value }” nie jest jedną z dostępnych opcji.
 param-value-number-error = Musi być liczbą.
 param-value-default = domyślnie: { $value }
 param-value-number = liczba
@@ -2234,11 +2372,11 @@ automation-code-format-document = Formatuj dokument
 automation-code-show-completions = Pokaż sugestie
 
 # Package management
-package-sign-in-shared = Zaloguj się w oknie głównym w Ustawienia → Konto, aby zobaczyć pakiety, które posiadasz, oraz te udostępnione przez znajomych.
+package-sign-in-shared = Zaloguj się w oknie głównym w „Ustawienia → Konto”, aby zobaczyć pakiety, których jesteś właścicielem, oraz te udostępnione przez znajomych.
 package-no-selection = Nie wybrano pakietu.
 package-dependency-managed = Działa wewnątrz: { $packages }.
 package-direct-and-required = Potrzebują go też: { $packages }.
-package-disabled-review = Wyłączony. Włącz go w Ustawieniach, gdy mu zaufasz.
+package-disabled-review = Wyłączony. Włącz go na karcie „Ustawienia”, gdy mu zaufasz.
 package-metric-author = Autor
 package-metric-loaded = Załadowana
 package-metric-latest-blocked = Najnowsza (zablokowana)
@@ -2300,7 +2438,7 @@ package-remove = Usuń
 package-uninstall = Odinstaluj
 package-remove-together-question = Usunąć je razem?
 package-remove-standalone-question = Usunąć instalację samodzielną?
-package-uninstall-question = Odinstalować? Ustawienia pozostaną; sekrety zostaną usunięte.
+package-uninstall-question = Odinstalować pakiet? Ustawienia pozostaną, a wartości tajne zostaną usunięte.
 package-keep-orphans = Zachowaj je
 package-remove-standalone-ellipsis = Usuń instalację samodzielną…
 package-uninstall-name = Odinstaluj { $name }…
@@ -2368,7 +2506,7 @@ package-unknown-user = nieznany
 package-shared = ✓ Udostępniono
 package-share = Udostępnij
 package-new = Nowy pakiet
-package-new-subtitle = Stwórz pakiet smudgy:// do udostępniania
+package-new-subtitle = Utwórz pakiet smudgy:// do udostępniania
 package-name = Nazwa
 package-name-placeholder = np. mySpellTriggers
 package-new-help = Pakiet to mały program. Może zawierać aliasy, wyzwalacze, skróty klawiszowe, moduły oraz zasoby, z których mogą korzystać inne pakiety.
@@ -2383,7 +2521,7 @@ package-scope-host = Tylko dla { $host }
 package-scope-universal = Tylko pakiety uniwersalne
 package-scope-all = Wszystkie pakiety
 package-working = Przetwarzanie…
-package-no-results = Brak wyników — wpisz zapytanie i naciśnij Szukaj.
+package-no-results = Brak wyników — wpisz zapytanie i naciśnij „Szukaj”.
 package-manage = Zarządzaj
 package-view = Wyświetl
 package-install = Zainstaluj
@@ -2402,17 +2540,17 @@ package-owner-clan = Klan
 package-owner-me = Ja
 package-owner = Właściciel: { $owner }
 package-publish-as = Opublikuj jako
-package-publish-as-clan-help = { $clan } będzie jego właścicielem: każdy członek klanu może go zainstalować, a klan decyduje, kto publikuje nowe wersje. Właściciela pakietu nie da się później zmienić.
+package-publish-as-clan-help = Klan „{ $clan }” będzie jego właścicielem: każdy członek klanu może go zainstalować, a klan decyduje, kto publikuje nowe wersje. Właściciela pakietu nie da się później zmienić.
 package-clan-private-help = Mogą go zainstalować tylko członkowie klanu.
 package-clan-cannot-create = { $clan }: nie możesz tworzyć pakietów w tym klanie. Opublikuj go jako własny albo poproś właścicieli klanu.
 package-clan-cannot-publish = { $clan }: nie możesz publikować nowych wersji tego pakietu.
 package-clan-refused = { $clan }: nie możesz tego zrobić z tym pakietem.
-package-claimed-for-me = Przerwana publikacja tego pakietu wybrała Ciebie jako właściciela. Opublikuj go jako własny, aby ją dokończyć.
-package-claimed-for-clan = Przerwana publikacja tego pakietu wybrała { $clan } jako właściciela. Opublikuj go w tym klanie, aby ją dokończyć.
+package-claimed-for-me = Podczas przerwanej publikacji jako właściciela tego pakietu wskazano Ciebie. Opublikuj go jako własny, aby ją dokończyć.
+package-claimed-for-clan = Podczas przerwanej publikacji jako właściciela tego pakietu wskazano klan „{ $clan }”. Opublikuj go w tym klanie, aby ją dokończyć.
 package-back = ‹ Wstecz
 package-comments = Komentarze
 package-comment-placeholder = Dodaj komentarz…
-package-post = Opublikuj
+package-post = Dodaj
 package-no-comments = Brak komentarzy.
 package-someone = ktoś
 package-configure = Skonfiguruj { $name } v{ $version }
@@ -2437,7 +2575,7 @@ package-install-newer-smudgy = Nie można zainstalować — wymaga nowszej wersj
 package-message-period = { $message }.
 package-install-disabled = Zainstaluj bez włączania
 package-install-enabled = Zainstaluj i włącz
-package-also-installs = Instaluje to również:
+package-also-installs = Zostaną też zainstalowane:
 package-already-installed-version = { $name } v{ $version } — już zainstalowany
 package-upgrade-version = { $name } → v{ $version } (aktualizacja)
 package-name-version = { $name } v{ $version }
@@ -2464,9 +2602,9 @@ package-restore-sandbox = Przywróć sandbox
 package-runs-sandbox = Działa w sandboxie
 package-runs-sandbox-with-escape-grants = Działa w sandboxie — z uprawnieniami, które pozwalają go opuścić
 package-it-can-only = Może jedynie:
-package-not-consented = Brak zgody — dostęp zablokowany do czasu potwierdzenia uprawnień (zainstaluj ponownie z sekcji Odkrywaj).
+package-not-consented = Brak zgody — dostęp zablokowany do czasu potwierdzenia uprawnień (zainstaluj ponownie z sekcji „Odkrywaj”).
 package-remove-sandbox-question = Usunąć sandbox z tego pakietu?
-package-remove-sandbox-warning = Bez sandboxu ten pakiet działa z PEŁNYM dostępem do Twojego komputera, w Twoim głównym izolacie, współdzieląc stan z Twoimi własnymi skryptami. Może zrobić wszystko to, co Ty. Usuwaj sandbox tylko w przypadku pakietów, które napisałbyś samodzielnie.
+package-remove-sandbox-warning = Bez sandboxu ten pakiet działa z PEŁNYM dostępem do Twojego komputera, w Twoim głównym izolacie, współdzieląc stan z Twoimi własnymi skryptami. Może zrobić wszystko to, co Ty. Usuwaj sandbox tylko w przypadku pakietów, które piszesz samodzielnie.
 package-remove-sandbox = Usuń sandbox
 package-remove-sandbox-advanced = Usuń sandbox (zaawansowane)
 package-remove-sandbox-help = Uruchom go w swoim głównym izolacie z pełnym dostępem do Twojego komputera. Umożliwia to również debugowanie w inspektorze.
@@ -2474,7 +2612,7 @@ package-remove-sandbox-ellipsis = Usuń sandbox…
 package-update-held-newer = Aktualizacja wstrzymana — { $name } wymaga nowszej wersji Smudgy
 package-version-held-reason = Wersja v{ $version } jest wstrzymana — { $reason }.
 package-ok = OK
-package-update-blocked-permissions = { $name } wymaga większych uprawnień
+package-update-blocked-permissions = { $name } wymaga dodatkowych uprawnień
 package-update-current-held = Poprzednio wybrano wersję v{ $current }. Aby załadować wersję v{ $next }, pakiet potrzebuje dodatkowo uprawnień do:
 package-update-held-load = Aby załadować wersję v{ $version }, pakiet potrzebuje uprawnień do:
 package-keep-current-version = Zachowaj bieżącą wersję
@@ -2498,20 +2636,20 @@ permission-read-env = odczytywać zmienną środowiskową
 permission-can-create-aliases = Tworzyć aliasy
 permission-can-create-triggers = Tworzyć wyzwalacze
 permission-can-send-both = Wysyłać polecenia przez aliasy lub wysyłać tekst i surowe bajty bezpośrednio do gry. Smudgy nie wyświetla surowych bajtów w oknie wyjścia. Gra nadal może wysłać odpowiedź.
-permission-can-send-aliases = Wysyłać polecenia do gry tak, jakbyś je wpisał, potencjalnie wyzwalając aliasy
+permission-can-send-aliases = Wysyłać polecenia do gry tak, jakby zostały wpisane przez Ciebie; mogą przy tym uruchamiać Twoje aliasy
 permission-can-send-direct = Wysyłać tekst i surowe bajty bezpośrednio do gry, z pominięciem aliasów. Smudgy nie wyświetla surowych bajtów w oknie wyjścia. Gra nadal może wysłać odpowiedź.
 permission-can-echo = Wyświetlać tekst na ekranie
 permission-can-sessions = Wchodzić w interakcję z innymi otwartymi sesjami, w tym przestawiać układ okien tego serwera
 permission-can-display = Ukrywać, zmieniać styl, wstawiać lub zamieniać tekst gry oraz widzieć bieżący wiersz
 permission-can-map-read = Odczytywać Twoje mapy
 permission-can-map-write = Zmieniać Twoje mapy
-permission-can-secrets-read = Odczytywać Sekrety i prywatne dodatki Twoich map
-permission-can-secrets-write = Zmieniać Sekrety i prywatne dodatki Twoich map
-permission-can-secrets-manage = Tworzyć, zmieniać nazwy i usuwać Sekrety Twoich map
+permission-can-secrets-read = Odczytywać sekrety i prywatne dodatki Twoich map
+permission-can-secrets-write = Zmieniać sekrety i prywatne dodatki Twoich map
+permission-can-secrets-manage = Tworzyć, zmieniać nazwy i usuwać sekrety Twoich map
 permission-can-widgets = Tworzyć i zmieniać widgety na ekranie
 permission-can-widget-shaders = Kompilować shadery GPU i używać shaderowych efektów tekstowych
 permission-can-panes = Tworzyć panele wyjścia sesji, kierować do nich wiersze gry oraz zapisywać i stosować nazwane układy okien
-permission-can-interop-write = Rozgłaszać zdarzenia pakietu i publikować współdzielony stan, na który inne pakiety mogą reagować 
+permission-can-interop-write = Rozgłaszać zdarzenia pakietu i publikować współdzielony stan, na który inne pakiety mogą reagować
 permission-can-interop-read = Nasłuchiwać zdarzeń i odczytywać współdzielony stan
 permission-can-interop-broadcast = Używać BroadcastChannel z pakietami w sesjach na tym serwerze
 permission-can-workers = Uruchamiać wątki obliczeniowe w tle (bez dostępu do sieci, plików ani smudgy)
@@ -2521,7 +2659,7 @@ permission-cannot-aliases = tworzyć aliasów
 permission-cannot-triggers = tworzyć wyzwalaczy reagujących na dane wyjściowe gry
 permission-cannot-echo = wyświetlać tekstu na ekranie
 permission-cannot-sessions = sięgać do Twoich innych sesji
-permission-cannot-display = wchodzić w interakcję z terminalem gry (ukrywać, stylizować, wstawiać ani zamieniać tekstu; ani widzieć bieżącego wiersza)
+permission-cannot-display = wchodzić w interakcję z terminalem gry (ukrywać, stylizować, wstawiać ani zamieniać tekstu) ani widzieć bieżącego wiersza
 permission-cannot-map-read = odczytywać Twoich map
 permission-cannot-map-write = zmieniać Twoich map
 permission-cannot-widgets = tworzyć widgetów na ekranie
@@ -2546,7 +2684,7 @@ package-private-shared-subtitle = Twoje pakiety, pakiety udostępnione przez zna
 package-clan-packages = Pakiety klanów
 package-your-packages = Twoje pakiety
 package-local = Lokalne
-package-no-owned-cloud = Nie posiadasz jeszcze żadnych pakietów w chmurze.
+package-no-owned-cloud = Nie masz jeszcze własnych pakietów w chmurze.
 package-shared-with-you = Udostępnione Tobie
 package-no-shared = Nie udostępniono Ci jeszcze żadnych pakietów.
 package-owner-version = { $owner } · v{ $version }
@@ -2574,7 +2712,7 @@ package-uninstalled-toast = Odinstalowano { $name }.
 package-uninstalled-with = Odinstalowano { $name } + { $dependencies }.
 package-none-selected = Nie wybrano pakietu.
 package-detail-not-loaded = Szczegóły pakietu nie zostały jeszcze załadowane.
-package-copying-local = Kopiowanie do pakietu lokalnego „{ $name }"…
+package-copying-local = Kopiowanie do pakietu lokalnego „{ $name }”…
 package-parse-manifest-failed = Nie udało się przeanalizować manifestu: { $error }
 package-fork-took-over = Edytujesz pakiet lokalny „{ $name }”. Ma on teraz pierwszeństwo tam, gdzie ten pakiet jest włączony. Zainstalowany pakiet pozostaje jako wersja zapasowa.
 package-fork-took-over-toast = Edytujesz teraz pakiet lokalny { $name }.
@@ -2582,7 +2720,7 @@ package-fork-mirrored = Edytujesz pakiet lokalny „{ $name }”. Ma on teraz pi
 package-fork-mirrored-toast = Utworzono wyłączone lokalne zastąpienie { $name }.
 package-fork-inactive = Edytujesz osobny pakiet lokalny „{ $name }”. Początkowo jest wyłączony we wszystkich profilach.
 package-fork-inactive-toast = Utworzono lokalną kopię { $name } (wyłączona).
-package-fork-failed = Nie udało się edytować kopii: { $error }
+package-fork-failed = Nie udało się utworzyć kopii do edycji: { $error }
 package-required-unavailable = Wymagany pakiet { $name } jest niedostępny: { $error }
 package-requirer-unavailable = Smudgy nie może sprawdzić wymagań zainstalowanego pakietu { $name }: { $error }
 package-required-manifest-invalid = Pakiet { $name } ma nieprawidłowy manifest: { $error }
@@ -2602,22 +2740,22 @@ package-local-unsandboxed-toast = { $name } działa teraz bez sandboxu (pełny d
 package-local-sandboxed-toast = { $name } powrócił do sandboxu ze swojego manifestu.
 package-consent-record-failed = Nie udało się zapisać zgody: { $error }
 package-permissions-updated = Zaktualizowano uprawnienia dla { $name }
-package-not-found = Nie znaleziono pakietu „{ $name }".
-package-load-failed = Nie udało się załadować pakietu „{ $name }": { $error }
+package-not-found = Nie znaleziono pakietu „{ $name }”.
+package-load-failed = Nie udało się załadować pakietu „{ $name }”: { $error }
 package-file-read-failed = Nie udało się odczytać { $path }: { $error }
 package-file-save-failed = Zapis nie powiódł się: { $error }
 package-file-changed-outside = Plik { $path } zmienił się poza Smudgy. Otwórz go ponownie i sprawdź zmiany przed zapisaniem.
 package-file-saved = Zapisano { $path }.
 package-publishing-progress = Generowanie deklaracji i publikowanie { $name }…
-package-publish-step-typings = Generowanie deklaracji TypeScript dla { $count } modułów…
-package-publish-step-typings-done = Wygenerowano { $count } plików deklaracji ({ $warnings } ostrzeżeń).
-package-publish-step-dependencies = Zablokowano wersje { $count } zależności.
+package-publish-step-typings = Generowanie deklaracji TypeScript (moduły: { $count })…
+package-publish-step-typings-done = Wygenerowano pliki deklaracji: { $count } (ostrzeżenia: { $warnings }).
+package-publish-step-dependencies = Przypięto wersje zależności: { $count }.
 package-publish-step-namespace = Publikowanie { $address } v{ $version }…
-package-publish-step-compressing = Kompresowanie { $bodies } treści z { $modules } modułów…
+package-publish-step-compressing = Kompresowanie treści: { $bodies } (moduły: { $modules })…
 package-publish-step-compressed = skompresowano { $subpath } ({ $size } → { $frame })
-package-publish-step-bundled = Pakiet gotowy: { $frames } ramek, { $size }.
-package-publish-step-upload-started = Wysyłanie { $frames } ramek ({ $size })…
-package-publish-step-waiting = Wysyłanie trwa; brak odpowiedzi usługi po { $seconds } s…
+package-publish-step-bundled = Paczka gotowa: ramki: { $frames }, rozmiar: { $size }.
+package-publish-step-upload-started = Wysyłanie ramek: { $frames } ({ $size })…
+package-publish-step-waiting = Wysyłanie trwa; usługa nie odpowiada od { $seconds } s…
 package-publish-step-uploaded = Usługa przyjęła wszystkie ramki w { $seconds } s.
 package-publish-step-retrying = Usługa właśnie usuwa jedną z treści; ponowne wysyłanie…
 package-publish-step-finalizing = Zatwierdzanie wersji…
@@ -2632,21 +2770,21 @@ package-required-install-failed = Nie udało się zainstalować wymaganego pakie
 package-installed-enabled-toast = Zainstalowano i włączono { $name }.
 package-updated-toast = Zaktualizowano { $name }.
 package-installed-review-toast = Zainstalowano { $name }.
-package-field-required = Pole „{ $field }" jest wymagane.
-package-field-invalid = „{ $field }": { $reason }
-package-field-save-failed = Nie udało się zapisać „{ $field }": { $error }
+package-field-required = Pole „{ $field }” jest wymagane.
+package-field-invalid = „{ $field }”: { $reason }
+package-field-save-failed = Nie udało się zapisać „{ $field }”: { $error }
 package-settings-save-failed = Smudgy nie może zapisać ustawień pakietu: { $error }
 package-settings-state-changed = Ustawienia zmieniono w innym miejscu. Otwórz je ponownie przed zapisaniem.
 package-settings-saved = Zapisano ustawienia.
-package-clear-secret-failed = Nie udało się wyczyścić „{ $field }": { $error }
-package-secret-cleared = Wyczyszczono sekret.
-package-version-invalid-semver = „{ $version }" nie jest prawidłową wersją semantyczną (na przykład 1.2.3). Zmień wersję w sekcji Manifest powyżej.
+package-clear-secret-failed = Nie udało się wyczyścić „{ $field }”: { $error }
+package-secret-cleared = Wyczyszczono wartość tajną.
+package-version-invalid-semver = „{ $version }” nie jest prawidłową wersją semantyczną (na przykład 1.2.3). Zmień wersję w sekcji „Manifest” powyżej.
 package-version-build-metadata = Wersja nie może zawierać metadanych kompilacji (usuń przyrostek +…).
 
 # Remaining app-shell and editor surfaces
 badge-dependency = ZAL.
 badge-required = WYM.
-badge-dependency-required = DEP + REQ
+badge-dependency-required = ZAL. + WYM.
 editor-example-alias-name = np. kill
 editor-example-hotkey-name = np. north
 editor-example-trigger-name = np. low-health-alert
@@ -2658,7 +2796,7 @@ link-confirm-allow-host = Zawsze zezwalaj na linki do { $host }
 link-confirm-trust-server = Zawsze ufaj linkom z tego serwera
 map-another-map = inna mapa
 map-another-server = inny serwer
-map-rooms-match-elsewhere = Pokoje tutaj pasują do „{ $name }" (wyświetlana na { $servers })
+map-rooms-match-elsewhere = Pokoje tutaj pasują do „{ $name }” (wyświetlana na { $servers })
 map-show-here-too = Pokaż też tutaj
 window-none-open = Brak otwartych okien
 automation-save-aliases-failed = Nie udało się zapisać aliasów: { $error }
@@ -2667,21 +2805,36 @@ automation-save-triggers-failed = Nie udało się zapisać wyzwalaczy: { $error 
 automation-save-state-failed = Nie udało się zapisać stanu automatyzacji: { $error }
 automation-state-baseline-unavailable = Smudgy nie może zapisać zmian, ponieważ bieżący stan automatyzacji jest niedostępny. Wczytaj ponownie i spróbuj jeszcze raz.
 automation-save-state-conflict = Inny proces zmienił te automatyzacje. Wczytaj je ponownie przed zapisaniem zmian.
-automation-script-folder-invalid = Nie udało się załadować skryptu przypisanego do „{ $path }", który nie jest folderem.
+automation-script-folder-invalid = Nie udało się załadować skryptu przypisanego do „{ $path }”, który nie jest folderem.
 automation-script-folder-create-failed = Nie udało się utworzyć folderu skryptów.
 map-this-map = Ta mapa
 map-unknown = Nieznana mapa
 manifest-host-example = np. aardwolf.org
 
 # Session runtime feedback
-runtime-loading-session = Ładowanie sesji...
-runtime-reloading-scripts = Przeładowywanie skryptów...
+runtime-loading-session = Ładowanie sesji…
+runtime-reloading-scripts = Przeładowywanie skryptów…
 runtime-session-rule = { $profile } na { $server }
 runtime-loading-packages = Ładowanie pakietów…
-runtime-loaded-packages-clause = Załadowano { $count } pakietów (w { $milliseconds } ms)
-runtime-loaded-modules-clause = { $count } modułów skryptów (w { $milliseconds } ms)
-runtime-loaded-maps-clause = { $count } obszarów map (w { $milliseconds } ms)
-runtime-loaded-maps-shared = ({ $owned } własnych, { $shared } udostępnionych)
+runtime-loaded-packages-clause = { $count ->
+        [one] Załadowano { $count } pakiet (w { $milliseconds } ms)
+        [few] Załadowano { $count } pakiety (w { $milliseconds } ms)
+        [many] Załadowano { $count } pakietów (w { $milliseconds } ms)
+       *[other] Załadowano { $count } pakietu (w { $milliseconds } ms)
+    }
+runtime-loaded-modules-clause = { $count ->
+        [one] { $count } moduł skryptów (w { $milliseconds } ms)
+        [few] { $count } moduły skryptów (w { $milliseconds } ms)
+        [many] { $count } modułów skryptów (w { $milliseconds } ms)
+       *[other] { $count } modułu skryptów (w { $milliseconds } ms)
+    }
+runtime-loaded-maps-clause = { $count ->
+        [one] { $count } mapa (w { $milliseconds } ms)
+        [few] { $count } mapy (w { $milliseconds } ms)
+        [many] { $count } map (w { $milliseconds } ms)
+       *[other] { $count } mapy (w { $milliseconds } ms)
+    }
+runtime-loaded-maps-shared = (własne: { $owned }, udostępnione: { $shared })
 runtime-opened-offline = Otwarto w trybie offline · Połącz
 runtime-connecting-to = Łączenie z { $host }…
 runtime-connected-to = Połączono z { $host }
@@ -2696,18 +2849,18 @@ runtime-not-sent-abandoned = Rozłączono.
 runtime-not-sent-not-connected = Brak połączenia.
 runtime-not-sent-could-not = Nie można wysłać { $text }.
 runtime-not-sent-was-not = Nie wysłano { $text }.
-runtime-not-sent-script-dropped = Skrypt próbował wysłać { $text }, ale zostało to odrzucone.
+runtime-not-sent-script-dropped = Skrypt próbował wysłać { $text }, ale polecenie zostało odrzucone.
 runtime-not-sent-reconnecting = Ponowne łączenie…
 runtime-not-sent-try-again = Spróbuj ponownie
 runtime-not-sent-binary = dane binarne
-runtime-not-sent-empty = pusta linia
+runtime-not-sent-empty = pusty wiersz
 runtime-maps-auth-required = Mapy są niedostępne. Zaloguj się lub utwórz konto Smudgy, aby korzystać z tej funkcji.
 runtime-maps-load-failed = Nie udało się załadować map: { $error }
 runtime-error = Błąd środowiska uruchomieniowego: { $error }
-runtime-max-depth = Błąd: Przekroczono maksymalną głębokość wykonania
-runtime-process-line-error = Błąd przetwarzania wiersza { $error }
-runtime-process-partial-line-error = Błąd przetwarzania niepełnego wiersza { $error }
-runtime-process-command-error = Błąd przetwarzania polecenia { $error }
+runtime-max-depth = Błąd: przekroczono maksymalną głębokość wykonania
+runtime-process-line-error = Błąd przetwarzania wiersza: { $error }
+runtime-process-partial-line-error = Błąd przetwarzania niepełnego wiersza: { $error }
+runtime-process-command-error = Błąd przetwarzania polecenia: { $error }
 runtime-javascript-error = Błąd JavaScript: { $error }
 runtime-javascript-function-error = Błąd w funkcji JavaScript: { $error }
 runtime-call-javascript-function-error = Błąd podczas wywoływania funkcji JavaScript: { $error }
@@ -2718,42 +2871,52 @@ runtime-package-required-params-missing = { $name } nie został jeszcze skonfigu
 runtime-package-not-loaded-reason = [package] { $name } nie załadowano — { $reason }.
 runtime-package-not-loaded-error = [package] { $name } nie załadowano — { $error }
 runtime-packages-modules-load-failed = [packages] nie udało się załadować modułów — { $error }
-runtime-package-needs-permissions = [package] { $name } nie załadowano — dostępne wersje wymagają większych uprawnień niż przyznane. Otwórz Automatyzacje, aby przejrzeć i przyznać aktualizację.
-runtime-package-no-version = [package] { $name } nie załadowano — nie znaleziono żadnej jego wersji (mogła zostać usunięta lub cofnięta z publikacji albo chmura jest nieosiągalna). Otwórz Automatyzacje, aby go usunąć lub zainstalować ponownie.
+runtime-package-needs-permissions = [package] { $name } nie załadowano — dostępne wersje wymagają szerszych uprawnień niż przyznane. Otwórz okno „Automatyzacje”, aby przejrzeć aktualizację i przyznać uprawnienia.
+runtime-package-no-version = [package] { $name } nie załadowano — nie znaleziono żadnej jego wersji (mogła zostać usunięta lub wycofana z publikacji albo chmura jest nieosiągalna). Otwórz okno „Automatyzacje”, aby go usunąć lub zainstalować ponownie.
 runtime-package-sandbox-build-failed = [package] { $name } nie zdołał zbudować swojego sandboxu uprawnień — { $error }
 runtime-package-isolate-start-failed = [package] { $name } nie zdołał uruchomić swojego izolatu — { $error }
 runtime-package-load-failed = [package] { $name } nie zdołał się załadować — { $error }
 runtime-package-no-backend = [package] { $name } nie załadowano: brak zaplecza pakietów dla tej sesji
 runtime-package-updated = [package] { $name } zaktualizowano { $from } → { $to }
-runtime-package-duplicate-versions = [package] ostrzeżenie: { $name } załadowano w { $count } współistniejących wersjach ({ $versions }) — skutki uboczne mogą kolidować; rozważ rozwidlenie lub przypięcie
-package-version-floor-invalid = { $package } deklaruje nieużywalną wartość min_smudgy_version („{ $version }" nie jest wersją semver); pakiet wymaga poprawionego wydania
-package-version-floor-newer = { $package } wymaga Smudgy { $required } lub nowszej — to Smudgy jest w wersji { $running }; zaktualizuj Smudgy, aby go użyć
+runtime-package-duplicate-versions = [package] ostrzeżenie: { $name } załadowano w { $count } współistniejących wersjach ({ $versions }) — skutki uboczne mogą kolidować; rozważ utworzenie lokalnej kopii lub przypięcie wersji
+package-version-floor-invalid = { $package } deklaruje nieużywalną wartość min_smudgy_version („{ $version }” nie jest wersją semver); pakiet wymaga poprawionego wydania
+package-version-floor-newer = { $package } wymaga Smudgy { $required } lub nowszej wersji, a masz wersję { $running }; zaktualizuj Smudgy, aby go używać
 widget-text-editor-unavailable = Edytor tekstu niedostępny
 widget-map-unavailable = Mapa niedostępna
 widget-map-no-mapper = Mapa niedostępna (brak mapera)
 validation-name-empty = Nazwa nie może być pusta
-validation-name-too-long = Nazwa nie może być dłuższa niż { $max } znaków
-validation-name-character = Nazwa nie może zawierać znaku „{ $character }"
+validation-name-too-long = { $max ->
+        [one] Nazwa nie może być dłuższa niż { $max } znak
+        [few] Nazwa nie może być dłuższa niż { $max } znaki
+        [many] Nazwa nie może być dłuższa niż { $max } znaków
+       *[other] Nazwa nie może być dłuższa niż { $max } znaku
+    }
+validation-name-character = Nazwa nie może zawierać znaku „{ $character }”
 validation-name-control = Nazwa nie może zawierać znaków sterujących
 validation-name-whitespace = Nazwa nie może zawierać tabulatorów ani znaków końca wiersza
-validation-name-dot-edge = Nazwa nie może zaczynać się ani kończyć znakiem „."
-validation-name-reserved = „{ $name }" jest nazwą zastrzeżoną
+validation-name-dot-edge = Nazwa nie może zaczynać się ani kończyć znakiem „.”
+validation-name-reserved = „{ $name }” jest nazwą zastrzeżoną
 validation-folder-empty = Nazwa folderu nie może być pusta
 validation-folder-empty-segment = Ścieżka folderu nie może zawierać pustych segmentów
 validation-module-empty = Nazwa modułu nie może być pusta
-validation-module-leading-slash = Nazwa modułu nie może zaczynać się od „/"
+validation-module-leading-slash = Nazwa modułu nie może zaczynać się od „/”
 validation-module-empty-segment = Ścieżka modułu nie może zawierać pustych segmentów
-validation-module-traversal = Ścieżka modułu nie może zawierać segmentów „." ani „.."
+validation-module-traversal = Ścieżka modułu nie może zawierać segmentów „.” ani „..”
 validation-package-empty = Nazwa pakietu nie może być pusta
-validation-package-too-long = Nazwa pakietu nie może być dłuższa niż { $max } znaków
-validation-package-characters = Nazwy pakietów mogą zawierać tylko litery, cyfry, „-" i „_"
+validation-package-too-long = { $max ->
+        [one] Nazwa pakietu nie może być dłuższa niż { $max } znak
+        [few] Nazwa pakietu nie może być dłuższa niż { $max } znaki
+        [many] Nazwa pakietu nie może być dłuższa niż { $max } znaków
+       *[other] Nazwa pakietu nie może być dłuższa niż { $max } znaku
+    }
+validation-package-characters = Nazwy pakietów mogą zawierać tylko litery, cyfry, „-” i „_”
 
 # Ordinary package settings recovery and transfer
 package-settings-copy = Kopiuj
 package-settings-paste = Wklej…
 package-settings-history = Historia…
 package-settings-reset = Resetuj…
-package-settings-no-secrets = Sekrety pozostaną bez zmian.
+package-settings-no-secrets = Wartości tajne pozostaną bez zmian.
 package-settings-copied-clipboard = Skopiowano zapisane ustawienia.
 package-settings-unset = Nie ustawiono
 package-settings-history-empty = Brak wcześniejszych ustawień.
@@ -2761,7 +2924,7 @@ package-settings-no-changes = Te ustawienia są już używane.
 package-settings-skipped = Niedostępne lub niezgodne ustawienia zostaną pominięte: { $keys }
 package-settings-forget = Usuń historię…
 package-settings-forget-confirm = Bieżące ustawienia pozostaną dostępne, także po ponownej instalacji.
-package-settings-reset-confirm = Przywróć wartości domyślne. Poprzednie ustawienia pozostaną w Historii.
+package-settings-reset-confirm = Przywróć wartości domyślne. Poprzednie ustawienia pozostaną w „Historii”.
 package-settings-apply = Zastosuj
 package-settings-restored = Przywrócono poprzednie ustawienia.
 package-settings-restored-partial = Przywrócono ustawienia. Niezgodne wartości pozostają w historii: { $keys }
@@ -2769,8 +2932,8 @@ package-settings-unsaved-warning = Niezapisane zmiany zostaną zastąpione.
 package-settings-script-change = Skrypt
 
 package-settings-diff-title = Zmiany po przywróceniu
-package-settings-diff-more = …i jeszcze { $count } zmian
-package-settings-diff-skipped = Nie można zastosować { $count } ustawień
+package-settings-diff-more = …i więcej zmian: { $count }
+package-settings-diff-skipped = Ustawienia, których nie można zastosować: { $count }
 package-settings-value-empty = Puste
 package-settings-value-on = Włączone
 package-settings-value-off = Wyłączone
@@ -2790,7 +2953,7 @@ package-settings-paste-action = Wklej
 package-settings-restore-action = Przywróć
 package-settings-all-profiles = Wszystkie profile
 package-settings-required = * Wymagane
-package-settings-copied-with-secrets = Skopiowano zapisane ustawienia. Bez sekretów.
+package-settings-copied-with-secrets = Skopiowano zapisane ustawienia (bez wartości tajnych).
 
 # Link editor: a room's Exits (compass, one row per link) and a selected link
 compass-north = Pn
@@ -2837,7 +3000,7 @@ link-door-side = Drzwi po stronie: { $room }
 link-door-none = Brak
 link-door-open = Otwarte
 link-door-closed = Zamknięte
-link-door-locked = Zablokowane
+link-door-locked = Zamknięte na klucz
 link-hidden-exit = ukryte wyjście
 link-named = nazwane
 link-opens-with = otwiera
@@ -2847,12 +3010,12 @@ link-hidden = ukryte
 link-door = { $state ->
     [open] otwarte drzwi
     [closed] zamknięte drzwi
-   *[locked] zablokowane drzwi
+   *[locked] drzwi zamknięte na klucz
 }
 link-door-named = „{ $name }”, { $state ->
     [open] otwarte
     [closed] zamknięte
-   *[locked] zablokowane
+   *[locked] zamknięte na klucz
 }
 link-segments = Odcinki
 link-corners = Narożniki
@@ -2882,82 +3045,82 @@ mapper-link-not-changed = Nie udało się zmienić połączenia.
 # Scoped group permissions.
 
 permissions-tab-clan = Klan
-permissions-title = Uprawnienia grupy { $group }
+permissions-title = Uprawnienia grupy „{ $group }”
 permissions-manage = Zarządzaj uprawnieniami
 permissions-select-resource = Wybierz folder, mapę lub pakiet, aby zarządzać uprawnieniami tej grupy.
 permissions-other-maps = Mapy poza wymienionymi folderami
 permissions-owners-implicit = Właściciele klanu mają pełne uprawnienia w całym klanie, z wyjątkiem map i sekretów należących do członków.
 permissions-folder-inheritance = Uprawnienia obejmują ten folder oraz obecne i przyszłe mapy klanu w nim umieszczone. Mapy należące do członków zachowują własne zasady dostępu.
-permissions-direct-note = Uprawnienia z innych nadań obowiązują do czasu zmiany u źródła. Bezpośrednie uprawnienia mogą dodać dostęp, ale nie mogą odmówić dostępu odziedziczonego.
+permissions-direct-note = Uprawnienia nadane w inny sposób obowiązują, dopóki nie zostaną zmienione tam, gdzie je nadano. Bezpośrednie uprawnienia mogą dodać dostęp, ale nie mogą odebrać dostępu odziedziczonego.
 permissions-inherited = Dostęp także przez { $scope }: { $permissions }.
 permissions-edit-origin = Edytuj pierwotne nadanie
 permissions-delegation-title = Uprawnienia, które grupa może nadawać innym
 permissions-delegation-help = Wybierz uprawnienia, które członkowie mogą nadawać do tego zasobu. Nadania pozostają w tych granicach i wygasają wraz z delegacją. Zarządzanie dostępem samo w sobie nie pozwala czytać ani edytować treści.
 permissions-preset = Zestaw
 permissions-delegated = Nadane w ramach zarządzania dostępem: { $by }. Wygasa, jeśli zostanie ono odebrane.
-permission-help-clan-edit-profile = Zmieniaj nazwę i opis klanu.
-permission-help-clan-read-members = Przeglądaj listę członków klanu.
-permission-help-clan-invite = Zapraszaj do klanu.
-permission-help-clan-revoke-invitation = Anuluj oczekujące zaproszenia przed ich przyjęciem.
-permission-help-clan-remove-member = Usuwaj zwykłych członków i odbieraj im dostęp do klanu. Tylko właściciele klanu mogą zmieniać własność.
-permission-help-group-create = Twórz grupy. Twórca dołącza do nowej grupy i może nią zarządzać, dopóki należy do klanu.
-permission-help-group-rename = Zmieniaj nazwy i kolory grup bez zmiany uprawnień ani członkostwa.
-permission-help-group-delete = Usuwaj grupy niestandardowe i dostęp wynikający z ich nadań. Grup wbudowanych nie można usunąć.
-permission-help-group-assign = Dodawaj i usuwaj członków. Zyskują lub tracą uprawnienia grupy, w tym dostęp do udostępnionych jej Sekretów. Dodanie siebie do cudzej grupy wymaga własności klanu.
-permission-help-group-inspect-assignments = Pozwól członkom tej grupy sprawdzać, kto należy do każdej grupy.
-permission-help-atlas-create = Twórz foldery klanu. Dostęp wewnątrz każdego folderu trzeba nadać osobno; to uprawnienie nie daje dostępu do istniejących map.
-permission-help-package-create = Twórz pakiety klanu. Edycja i publikowanie wymagają uprawnień do nowego pakietu. Inne pakiety mają własne uprawnienia.
-permission-help-atlas-read = Wyświetlaj ten folder. Czytanie map wewnątrz wymaga osobnego uprawnienia.
-permission-help-atlas-rename = Zmieniaj nazwę folderu. Jego mapy i uprawnienia pozostają na miejscu.
-permission-help-atlas-delete = Usuwaj folder zgodnie z zasadami klanu. To uprawnienie mają tylko właściciele klanu.
-permission-help-atlas-accept-filing = Zezwalaj na przenoszenie map do tego folderu. Przeniesienie wymaga też uprawnienia do przenoszenia danej mapy z jej obecnego folderu.
-permission-help-atlas-accept-transfer = Przenoś własne mapy do tego folderu klanu. Wybierz, czy klan ma zostać ich właścicielem, czy zachowasz własność. Istniejące udostępnienia map zostaną zakończone.
-permission-help-area-create = Twórz mapy klanu w tym folderze. Twórca może edytować nową mapę; właściciele klanu zachowują pełną władzę właścicielską.
-permission-help-area-create-member-owned = Twórz tu mapy należące do członków. Dostęp kontrolują ich zapisani właściciele; uprawnienia folderu ani własność klanu ich nie ujawniają.
-permission-help-area-read = Czytaj zwykłą treść mapy. Nie ujawnia to Sekretów ani prywatnych dodatków innych osób. Czytanie Sekretu wymaga też dostępu do mapy. Na mapach należących do członków odczyt pozostaje włączony, dopóki nadane jest jakiekolwiek inne uprawnienie do mapy.
-permission-help-area-add = Dodawaj zwykłą treść mapy. Nadal wymagane jest prawo odczytu mapy. Nie pozwala to edytować istniejącej treści ani pisać w Sekretach.
-permission-help-area-edit = Zmieniaj istniejącą zwykłą treść mapy. Wymagany jest odczyt mapy. Edycja treści Sekretów ma osobne uprawnienia.
-permission-help-area-remove-content = Usuwaj zwykłą treść mapy. Usunięcie pokoju usuwa też dołączone dodatki Sekretów i prywatne. Nie pozwala to usuwać całej mapy.
-permission-help-area-rename = Zmieniaj nazwę mapy bez zmiany jej własności ani treści.
-permission-help-area-refile = Przenoś mapę do innego folderu klanu, który zezwala na przyjmowanie map. Uprawnienia docelowego folderu mogą zmienić dostęp do mapy.
-permission-help-area-delete = Usuwaj całą mapę wraz z Sekretami i prywatnymi dodatkami. To odrębne uprawnienie od usuwania zwykłej treści.
-permission-help-area-copy = Twórz niezależną kopię. Sekret jest kopiowany tylko z własnym uprawnieniem kopiowania; prywatne dodatki innych osób nigdy nie są kopiowane.
-permission-help-area-share-external = Udostępniaj znajomym spoza klanu mapę tylko do odczytu, bez edycji, kopiowania i Sekretów. Udostępnienie kończy się po odejściu osoby udostępniającej lub utracie tego uprawnienia.
-permission-help-secret-create-member-owned = Twórz Sekrety członków na czytelnej mapie. Ich właściciele wybierają odbiorców; sama własność klanu nie daje dostępu.
-permission-help-secret-create-clan-owned = Twórz Sekrety klanu na czytelnych mapach klanu. Twórca może czytać, dodawać i edytować nowy Sekret. Właściciele klanu zachowują pełną władzę.
-permission-help-secret-read = Czytaj Sekrety klanu na tych mapach. Wymagany jest też odczyt mapy. Nigdy nie ujawnia to Sekretów należących do członków.
-permission-help-secret-add = Dodawaj treść do Sekretów klanu. Mapa i Sekret muszą być czytelne. Zwykła treść mapy ma osobne uprawnienia.
-permission-help-secret-edit = Zmieniaj treść Sekretów klanu. Mapa i Sekret muszą być czytelne. Czytelnik mapy może edytować Sekret bez prawa edycji samej mapy.
-permission-help-secret-remove-content = Usuwaj treść Sekretów klanu. Mapa i Sekret muszą być czytelne. Nie pozwala to usuwać całego Sekretu ani zmieniać Sekretów członków.
-permission-help-secret-manage-access = Przeglądaj i odwołuj nadania Sekretów klanu oraz nadawaj posiadane uprawnienia. Nie daje to własności ani kontroli nad Sekretami członków.
-permission-help-secret-copy = Dołączaj Sekrety klanu przy kopiowaniu mapy. Mapa także wymaga uprawnienia kopiowania. Kopie są niezależne od późniejszych zmian dostępu.
-permission-help-grant-inspect = Przeglądaj nadania obejmujące ten zasób i zasoby w jego zakresie. Samo uprawnienie nie ujawnia Sekretów ani nie pozwala zmieniać dostępu.
-permission-help-grant-manage = Nadawaj dostęp w tym zakresie i granicach poniżej. Tylko właściciele klanu mogą nadać to uprawnienie. Nie daje ono własności.
-permission-help-package-read = Wyświetlaj pakiet w zasobach klanu. Członkowie klanu nadal mogą instalować opublikowane pakiety klanu po nazwie bez tego uprawnienia. Nie daje ono prawa publikacji ani edycji.
-permission-help-package-edit-draft = Przesyłaj i zmieniaj wersję roboczą pakietu. Publikowanie wymaga osobnego uprawnienia.
-permission-help-package-edit-metadata = Zmieniaj metadane pakietu. Publikowanie i zmiana dostępności wymagają osobnych uprawnień.
-permission-help-package-manage-availability = Zmieniaj publiczną dostępność pakietu. Pakiet publiczny mogą znaleźć i pobrać osoby spoza klanu.
-permission-help-package-publish = Publikuj nowe wersje. Osoby mające pakiet mogą otrzymać nowy kod podczas aktualizacji.
-permission-help-package-retire = Wycofuj wersje zgodnie z zasadami rejestru. Nie usuwa to całego pakietu.
-permission-help-package-delete = Usuwaj pakiet zgodnie z zasadami rejestru. Pobrane kopie mogą pozostać na urządzeniach innych osób.
-permission-help-read = Czytaj Sekret, gdy jego mapa jest czytelna. Nadanie Sekretu nigdy nie daje dostępu do samej mapy.
-permission-help-add = Dodawaj treść do Sekretu. Edycja i usuwanie istniejącej treści wymagają osobnych uprawnień.
-permission-help-edit = Zmieniaj istniejącą treść Sekretu. Zwykła treść mapy ma osobne uprawnienia.
-permission-help-remove = Usuwaj treść Sekretu. Nie pozwala to usuwać całego Sekretu.
-permission-help-manage-access = Przeglądaj i odwołuj nadania Sekretu oraz nadawaj posiadane uprawnienia. Tylko właściciele mogą wyznaczać zarządców dostępu lub zmieniać własność.
-permission-help-copy = Dołączaj Sekret do niezależnej kopii mapy. Mapa także wymaga uprawnienia kopiowania. Późniejsze odebranie dostępu nie usuwa już wykonanych kopii.
+permission-help-clan-edit-profile = Zmieniać nazwę i opis klanu.
+permission-help-clan-read-members = Przeglądać listę członków klanu.
+permission-help-clan-invite = Zapraszać do klanu.
+permission-help-clan-revoke-invitation = Anulować oczekujące zaproszenia przed ich przyjęciem.
+permission-help-clan-remove-member = Usuwać zwykłych członków i odbierać im dostęp do klanu. Tylko właściciele klanu mogą zmieniać własność.
+permission-help-group-create = Tworzyć grupy. Twórca dołącza do nowej grupy i może nią zarządzać, dopóki należy do klanu.
+permission-help-group-rename = Zmieniać nazwy i kolory grup bez zmiany uprawnień ani członkostwa.
+permission-help-group-delete = Usuwać grupy niestandardowe i dostęp wynikający z ich nadań. Grup wbudowanych nie można usunąć.
+permission-help-group-assign = Dodawać i usuwać członków. Zyskują lub tracą uprawnienia grupy, w tym dostęp do udostępnionych jej sekretów. Tylko właściciel klanu może dodać siebie do cudzej grupy.
+permission-help-group-inspect-assignments = Członkowie tej grupy mogą sprawdzać, kto należy do każdej grupy.
+permission-help-atlas-create = Tworzyć foldery klanu. Dostęp wewnątrz każdego folderu trzeba nadać osobno; to uprawnienie nie daje dostępu do istniejących map.
+permission-help-package-create = Tworzyć pakiety klanu. Edycja i publikowanie wymagają uprawnień do nowego pakietu. Inne pakiety mają własne uprawnienia.
+permission-help-atlas-read = Wyświetlać ten folder. Czytanie map wewnątrz wymaga osobnego uprawnienia.
+permission-help-atlas-rename = Zmieniać nazwę folderu. Jego mapy i uprawnienia pozostają na miejscu.
+permission-help-atlas-delete = Usuwać folder zgodnie z zasadami klanu. To uprawnienie mają tylko właściciele klanu.
+permission-help-atlas-accept-filing = Zezwalać na przenoszenie map do tego folderu. Przeniesienie wymaga też uprawnienia do przenoszenia danej mapy z jej obecnego folderu.
+permission-help-atlas-accept-transfer = Przenosić własne mapy do tego folderu klanu. Wybierz, czy klan ma zostać ich właścicielem, czy zachowasz własność. Istniejące udostępnienia map zostaną zakończone.
+permission-help-area-create = Tworzyć mapy klanu w tym folderze. Twórca może edytować nową mapę; właściciele klanu zachowują pełną władzę właścicielską.
+permission-help-area-create-member-owned = Tworzyć tu mapy należące do członków. Dostęp do nich określają ich właściciele; nie obejmują ich ani uprawnienia folderu, ani uprawnienia właścicieli klanu.
+permission-help-area-read = Czytać zwykłą treść mapy. Nie ujawnia to sekretów ani prywatnych dodatków innych osób. Czytanie sekretu wymaga też dostępu do mapy. Na mapach należących do członków odczyt pozostaje włączony, dopóki nadane jest jakiekolwiek inne uprawnienie do mapy.
+permission-help-area-add = Dodawać zwykłą treść mapy. Nadal wymagane jest prawo odczytu mapy. Nie pozwala to edytować istniejącej treści ani dodawać treści do sekretów.
+permission-help-area-edit = Zmieniać istniejącą zwykłą treść mapy. Wymagany jest odczyt mapy. Edycja treści sekretów ma osobne uprawnienia.
+permission-help-area-remove-content = Usuwać zwykłą treść mapy. Usunięcie pokoju usuwa też dołączone do niego dodatki sekretów i dodatki prywatne. Nie pozwala to usuwać całej mapy.
+permission-help-area-rename = Zmieniać nazwę mapy bez zmiany jej własności ani treści.
+permission-help-area-refile = Przenosić mapę do innego folderu klanu, który zezwala na przyjmowanie map. Uprawnienia docelowego folderu mogą zmienić dostęp do mapy.
+permission-help-area-delete = Usuwać całą mapę wraz z sekretami i prywatnymi dodatkami. To odrębne uprawnienie od usuwania zwykłej treści.
+permission-help-area-copy = Tworzyć niezależną kopię. Sekret jest kopiowany tylko z własnym uprawnieniem kopiowania; prywatne dodatki innych osób nigdy nie są kopiowane.
+permission-help-area-share-external = Udostępniać znajomym spoza klanu mapę tylko do odczytu, bez edycji, kopiowania i sekretów. Udostępnienie wygasa, gdy osoba udostępniająca opuści klan lub straci to uprawnienie.
+permission-help-secret-create-member-owned = Tworzyć sekrety członków na mapie, którą możesz czytać. Ich właściciele wybierają odbiorców; same uprawnienia właścicieli klanu nie dają do nich dostępu.
+permission-help-secret-create-clan-owned = Tworzyć sekrety klanu na mapach klanu, które możesz czytać. Twórca może czytać, dodawać i edytować nowy sekret. Właściciele klanu zachowują pełną władzę.
+permission-help-secret-read = Czytać sekrety klanu na tych mapach. Wymagany jest też odczyt mapy. Nigdy nie ujawnia to sekretów należących do członków.
+permission-help-secret-add = Dodawać treść do sekretów klanu. Wymagane jest prawo odczytu mapy i sekretu. Zwykła treść mapy ma osobne uprawnienia.
+permission-help-secret-edit = Zmieniać treść sekretów klanu. Wymagane jest prawo odczytu mapy i sekretu. Czytelnik mapy może edytować sekret bez prawa edycji samej mapy.
+permission-help-secret-remove-content = Usuwać treść sekretów klanu. Wymagane jest prawo odczytu mapy i sekretu. Nie pozwala to usuwać całego sekretu ani zmieniać sekretów członków.
+permission-help-secret-manage-access = Przeglądać i odbierać dostęp do sekretów klanu oraz nadawać innym własne uprawnienia. Nie daje to własności ani kontroli nad sekretami członków.
+permission-help-secret-copy = Dołączać sekrety klanu przy kopiowaniu mapy. Mapa także wymaga uprawnienia kopiowania. Kopie są niezależne od późniejszych zmian dostępu.
+permission-help-grant-inspect = Przeglądać nadania obejmujące ten zasób i zasoby w jego zakresie. Samo uprawnienie nie ujawnia sekretów ani nie pozwala zmieniać dostępu.
+permission-help-grant-manage = Nadawać dostęp w tym zakresie i granicach poniżej. Tylko właściciele klanu mogą nadać to uprawnienie. Nie daje ono własności.
+permission-help-package-read = Wyświetlać pakiet w zasobach klanu. Członkowie klanu nadal mogą instalować opublikowane pakiety klanu po nazwie bez tego uprawnienia. Nie daje ono prawa publikacji ani edycji.
+permission-help-package-edit-draft = Przesyłać i zmieniać wersję roboczą pakietu. Publikowanie wymaga osobnego uprawnienia.
+permission-help-package-edit-metadata = Zmieniać metadane pakietu. Publikowanie i zmiana dostępności wymagają osobnych uprawnień.
+permission-help-package-manage-availability = Zmieniać publiczną dostępność pakietu. Pakiet publiczny mogą znaleźć i pobrać osoby spoza klanu.
+permission-help-package-publish = Publikować nowe wersje. Osoby, które zainstalowały pakiet, mogą otrzymać nowy kod podczas aktualizacji.
+permission-help-package-retire = Wycofywać wersje zgodnie z zasadami rejestru. Nie usuwa to całego pakietu.
+permission-help-package-delete = Usuwać pakiet zgodnie z zasadami rejestru. Pobrane kopie mogą pozostać na urządzeniach innych osób.
+permission-help-read = Czytać sekret, gdy masz też prawo odczytu jego mapy. Dostęp do sekretu nigdy nie daje dostępu do samej mapy.
+permission-help-add = Dodawać treść do sekretu. Edycja i usuwanie istniejącej treści wymagają osobnych uprawnień.
+permission-help-edit = Zmieniać istniejącą treść sekretu. Zwykła treść mapy ma osobne uprawnienia.
+permission-help-remove = Usuwać treść sekretu. Nie pozwala to usuwać całego sekretu.
+permission-help-manage-access = Przeglądać i odbierać dostęp do sekretu oraz nadawać innym własne uprawnienia. Tylko właściciele mogą wyznaczać zarządców dostępu lub zmieniać własność.
+permission-help-copy = Dołączać sekret do niezależnej kopii mapy. Mapa także wymaga uprawnienia kopiowania. Późniejsze odebranie dostępu nie usuwa już wykonanych kopii.
 
-permissions-clan-note = Te uprawnienia dotyczą całego klanu. Wybierz Mapy lub Pakiety, aby ustawić dostęp do poszczególnych zasobów.
+permissions-clan-note = Te uprawnienia dotyczą całego klanu. Wybierz „Mapy” lub „Pakiety”, aby ustawić dostęp do poszczególnych zasobów.
 permissions-section-clan = Klan i członkostwo
 permissions-section-groups = Zarządzanie grupami
 permissions-section-creation = Tworzenie zasobów
 permissions-section-access = Zarządzanie dostępem
-permissions-section-secret-creation = Tworzenie Sekretów
+permissions-section-secret-creation = Tworzenie sekretów
 
 move-review-loading = Sprawdzanie zmian dostępu…
 move-review-selection = Pokoje: { $rooms } · Połączenia: { $links } · Etykiety: { $labels } · Kształty: { $shapes }
 move-review-destination-notice = Przeniesiona zawartość będzie podlegać uprawnieniom miejsca docelowego, w tym dostępowi, którego nie możesz sprawdzić.
-move-review-filing-notice = Przeniesienie tej mapy może zmienić dostęp innych członków do Sekretów, których nie możesz sprawdzić. Własność Sekretów i jawne ustawienia udostępniania pozostaną bez zmian.
+move-review-filing-notice = Przeniesienie tej mapy może zmienić dostęp innych członków do sekretów, których nie możesz sprawdzić. Własność sekretów i jawne ustawienia udostępniania pozostaną bez zmian.
 move-review-group = { $name }, w tym przyszli członkowie
 move-review-members = Członkowie klanu, w tym przyszli członkowie
 move-review-and = { " ORAZ " }
@@ -2976,14 +3139,14 @@ move-review-right-delete = Usuwanie
 move-review-right-manage-ownership = Zarządzanie własnością
 
 mapper-clipboard-one-source = Wybierz zawartość z jednego źródła naraz.
-mapper-cut-remove-required = Przenoszenie wymaga uprawnienia Usuwanie w źródle i Dodawanie w miejscu docelowym.
+mapper-cut-remove-required = Przenoszenie wymaga uprawnienia „Usuwanie” w źródle i „Dodawanie” w miejscu docelowym.
 mapper-cut-ready = Gotowe do przeniesienia. Oryginał pozostanie do pomyślnego wklejenia.
-mapper-cut-cross-map-unavailable = Przenoszenie między mapami nie jest jeszcze obsługiwane. Oryginał pozostaje bez zmian. Użyj Kopiuj, aby go powielić.
+mapper-cut-cross-map-unavailable = Przenoszenie między mapami nie jest jeszcze obsługiwane. Oryginał pozostaje bez zmian. Użyj „Kopiuj”, aby go powielić.
 mapper-cut-stale = Źródło zmieniło się od wycięcia. Zaznacz zawartość i wytnij ją ponownie.
-mapper-cut-same-source = Wybierz inne źródło przed wklejeniem lub użyj Wklej tutaj, aby zmienić położenie zaznaczenia.
-move-review-preserve-positions = Przenoszenie między źródłami zachowuje położenie obiektów i istniejące odwołania do pomieszczeń.
+mapper-cut-same-source = Wybierz inne źródło przed wklejeniem lub użyj „Wklej tutaj”, aby zmienić położenie zaznaczenia.
+move-review-preserve-positions = Przenoszenie między źródłami zachowuje położenie obiektów i istniejące odwołania do pokoi.
 
-mapper-copy-source-denied = Wymagane jest uprawnienie Kopiowanie dla źródła tej zawartości.
+mapper-copy-source-denied = Wymagane jest uprawnienie „Kopiowanie” dla źródła tej zawartości.
 
 cloud-error-access-review-required = Przed potwierdzeniem przeniesienia sprawdź, kto zyska lub utraci dostęp. Nic nie zostało przeniesione.
 cloud-error-stale-access-review = Dostęp zmienił się po sprawdzeniu. Rozpocznij przenoszenie ponownie, aby sprawdzić aktualny wynik. Nic nie zostało przeniesione.
@@ -2993,7 +3156,7 @@ mapper-additional-room-data = Dodatkowe dane pokoju
 
 move-property-to = Przenieś do…
 move-review-properties = Wybrane właściwości: { $count }
-move-review-property-no-undo = Ten ruch scala istniejące dane i nie można go cofnąć. Wybierz wartość do zachowania dla każdej sprzecznej właściwości.
+move-review-property-no-undo = To przeniesienie scala istniejące dane i nie można go cofnąć. Wybierz wartość do zachowania dla każdej sprzecznej właściwości.
 move-review-property-source = Przenoszona: { $value }
 move-review-property-destination = Docelowa: { $value }
 move-review-property-keep-source = Zachowaj przenoszoną
