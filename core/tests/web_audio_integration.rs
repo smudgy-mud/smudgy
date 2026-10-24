@@ -61,10 +61,14 @@ oscillator.stop(context.currentTime + 0.02);
 // test binary; their internal trusted/package isolates still run concurrently.
 static AUDIO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// One second at 48 kHz: long enough that the file player fixture's 70 ms
+/// pause lands mid-file even when a loaded runner stalls its timers.
+const AUDIO_FILE_FRAMES: u32 = 48_000;
+
 fn audio_file_fixture() -> Vec<u8> {
-    // A 200 ms, mono 0.25-amplitude signal. It exceeds the 2048-frame queue,
-    // so success requires decoder backpressure and refilling during playback.
-    let frames = 9_600_u32;
+    // A mono 0.25-amplitude signal. It exceeds the 2048-frame queue, so
+    // success requires decoder backpressure and refilling during playback.
+    let frames = AUDIO_FILE_FRAMES;
     let mut wav = Vec::new();
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + frames * 2).to_le_bytes());
@@ -93,12 +97,21 @@ const AUDIO_FILE_PLAYER_TS: &str = r#"
         audio.onerror = () => echo(`FILE_ERROR:${audio.error}`);
         const ended = new Promise(resolve => { audio.onended = resolve; });
         await audio.play();
+        const playing = performance.now();
         await new Promise(resolve => setTimeout(resolve, 70));
+        const pauseAfter = Math.round(performance.now() - playing);
         audio.pause();
         // Allow the suspend operation and already-submitted mixer blocks to drain.
         await new Promise(resolve => setTimeout(resolve, 50));
         Deno.writeTextFileSync(new URL('./phase.txt', import.meta.url), 'paused');
         await new Promise(resolve => setTimeout(resolve, 250));
+        // A suspended player cannot finish, so an ended one ran out of file
+        // before pause() took effect, and resuming would replay it from the start.
+        if (audio.ended) {
+            await audio.close();
+            echo(`FILE_PAUSE_LATE:${pauseAfter}`);
+            return;
+        }
         Deno.writeTextFileSync(new URL('./phase.txt', import.meta.url), 'resuming');
         await audio.play();
         await ended;
@@ -202,6 +215,14 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
                                 if let BufferUpdate::Append(line) = update {
                                     transcript.push(line.text.clone());
                                     assert!(!line.text.starts_with("FILE_ERROR:"), "{transcript:?}");
+                                    if let Some(pause_after) = line.text.strip_prefix("FILE_PAUSE_LATE:") {
+                                        panic!(
+                                            "runner too slow: the {} ms file ended before pause() took effect \
+                                             (the 70 ms pause timer fired after {pause_after} ms), so pause and \
+                                             resume were not exercised: {transcript:?}",
+                                            AUDIO_FILE_FRAMES / 48
+                                        );
+                                    }
                                     if line.text == "FILE_MIXER_OK" { return; }
                                 }
                             }
@@ -219,8 +240,10 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
          {transcript:?}"
     );
     eprintln!("file playback summary: {summary}");
+    // The mono file plays on both channels of the probe's stereo render.
+    let file_samples = 2 * AUDIO_FILE_FRAMES as usize;
     assert!(
-        (17_000..=19_200).contains(&audible_samples),
+        (file_samples - 2_200..=file_samples).contains(&audible_samples),
         "pause/resume lost or replayed file samples: {summary}"
     );
     assert!(paused_blocks > 20, "pause interval was not exercised");
