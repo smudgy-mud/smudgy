@@ -4385,6 +4385,7 @@ impl Inner<'_> {
             .as_ref()
             .map(Mapper::mapper_event_notifications)
             .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
+        let mut mapper_publications = mapper_events::PublicationCursor::new(self.mapper.as_ref());
 
         info!("Starting session event loop");
 
@@ -4394,24 +4395,27 @@ impl Inner<'_> {
         let mut idle_pump_error: Option<deno_core::error::CoreError> = None;
 
         loop {
-            // Arm before checking the subscriber, so publication between the
-            // drain and idle select cannot lose a wakeup.
-            let mapper_event_wake = mapper_event_notify.notified();
-            tokio::pin!(mapper_event_wake);
-            mapper_event_wake.as_mut().enable();
+            // Every pass between two actions comes through here, so the
+            // subscription and the arrivals channel are read only once the
+            // mapper has published since the last look. The look comes before
+            // the load poll: progress reported after the poll moves the epoch
+            // past it, and the idle path wakes for that instead of parking.
+            let published = mapper_publications.catch_up(&self.mapper_events);
             self.poll_map_load();
-            let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
-            if !remaps.is_empty() {
-                if let Some(frame) = action_stack.last_mut() {
-                    mapper_events::insert_remaps(frame, remaps);
-                } else {
-                    action_stack.push(remaps);
+            if published {
+                let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
+                if !remaps.is_empty() {
+                    if let Some(frame) = action_stack.last_mut() {
+                        mapper_events::insert_remaps(frame, remaps);
+                    } else {
+                        action_stack.push(remaps);
+                    }
                 }
-            }
-            if let Some(arrived) = self.take_map_arrivals() {
-                match action_stack.last_mut() {
-                    Some(frame) => frame.push_back(arrived),
-                    None => action_stack.push(VecDeque::from([arrived])),
+                if let Some(arrived) = self.take_map_arrivals() {
+                    match action_stack.last_mut() {
+                        Some(frame) => frame.push_back(arrived),
+                        None => action_stack.push(VecDeque::from([arrived])),
+                    }
                 }
             }
             // A receiver can disappear between any two actions. Stop after the
@@ -4510,12 +4514,16 @@ impl Inner<'_> {
             // Pumping a lazy mapper op may have adopted a commit and staged
             // native callbacks. Splice them before dispatching any newly
             // queued marker, using the same ordering as the pre-pump drain.
-            let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
-            if !remaps.is_empty() {
-                if let Some(frame) = action_stack.last_mut() {
-                    mapper_events::insert_remaps(frame, remaps);
-                } else {
-                    action_stack.push(remaps);
+            // The cursor stays where it is, so the next pass still takes any
+            // arrivals the same publication announced.
+            if mapper_publications.pending(&self.mapper_events) {
+                let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
+                if !remaps.is_empty() {
+                    if let Some(frame) = action_stack.last_mut() {
+                        mapper_events::insert_remaps(frame, remaps);
+                    } else {
+                        action_stack.push(remaps);
+                    }
                 }
             }
 
@@ -4576,6 +4584,14 @@ impl Inner<'_> {
                     }
                     Ok(None) => {}
                     Err(e) => warn!("Failed to flush buffered output before idle: {e:?}"),
+                }
+                // Armed before the last look at the mapper, so a publication
+                // after that look still wakes the select below.
+                let mapper_event_wake = mapper_event_notify.notified();
+                tokio::pin!(mapper_event_wake);
+                mapper_event_wake.as_mut().enable();
+                if mapper_publications.pending(&self.mapper_events) {
+                    continue;
                 }
                 // No spawned actions: park until external input arrives OR an isolate's event
                 // loop has work (resolved promise / elapsed timer / async module load). The

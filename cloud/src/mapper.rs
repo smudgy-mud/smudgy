@@ -3750,6 +3750,14 @@ impl Mapper {
         self.inner.pending.event_notifications()
     }
 
+    /// Advances before every wake of [`Self::mapper_event_notifications`],
+    /// so a consumer can tell without locking whether anything was published
+    /// since it last looked.
+    #[must_use]
+    pub fn mapper_event_epoch(&self) -> pending::EventEpoch {
+        self.inner.pending.event_epoch()
+    }
+
     /// A dedicated lossless migration subscription. Its queue is retired when
     /// the subscriber drops, and no unrelated save-status events enter it.
     #[must_use]
