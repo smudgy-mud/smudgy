@@ -157,7 +157,7 @@ const fn version_has_prerelease_marker(bytes: &[u8], marker: &[u8]) -> bool {
 /// staging service; a release or prod-like prerelease defaults to prod.
 /// Override via `api_base_url` in settings.json.
 pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
-    "https://cloud.smudgy.org"
+    "https://api.staging.smudgy.org"
 } else {
     "https://api.smudgy.org"
 };
