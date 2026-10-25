@@ -311,6 +311,24 @@ impl RoomRemapSubscription {
     }
 }
 
+/// Advances right before every wake of the mapper's event notification, after
+/// whatever that wake announces has been published. A consumer that remembers
+/// the last value it read can tell with one atomic load whether a wake was
+/// sent since.
+#[derive(Clone, Default)]
+pub struct EventEpoch(Arc<AtomicU64>);
+
+impl EventEpoch {
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn advance(&self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Verdict of [`PendingQueue::transport_failure`]. All terminal accounting
 /// keys off this returned verdict — never off a later status re-read, which
 /// a concurrent resolution could race.
@@ -569,6 +587,7 @@ pub struct PendingQueue {
     projection_notify: Arc<Notify>,
     events: broadcast::Sender<MapperEvent>,
     event_notify: Arc<Notify>,
+    event_epoch: EventEpoch,
     remap_subscribers: Mutex<Vec<std::sync::Weak<RoomRemapSubscription>>>,
 }
 
@@ -613,6 +632,7 @@ impl PendingQueue {
             projection_notify: Arc::new(Notify::new()),
             events,
             event_notify: Arc::new(Notify::new()),
+            event_epoch: EventEpoch::default(),
             remap_subscribers: Mutex::new(Vec::new()),
         };
         queue.cleanup_retired_records();
@@ -652,11 +672,22 @@ impl PendingQueue {
             });
         }
         let _ = self.events.send(event);
-        self.event_notify.notify_waiters();
+        self.notify_event_consumers();
     }
 
     pub(crate) fn event_notifications(&self) -> Arc<Notify> {
         Arc::clone(&self.event_notify)
+    }
+
+    pub(crate) fn event_epoch(&self) -> EventEpoch {
+        self.event_epoch.clone()
+    }
+
+    /// Wakes every event consumer. Call it after publishing what the wake
+    /// announces, so a consumer that sees the epoch advance also sees that.
+    pub(crate) fn notify_event_consumers(&self) {
+        self.event_epoch.advance();
+        self.event_notify.notify_waiters();
     }
 
     pub(crate) fn subscribe_room_remaps(&self) -> Arc<RoomRemapSubscription> {
@@ -4152,6 +4183,31 @@ mod tests {
         assert!(
             queue.remap_subscribers.lock().is_empty(),
             "dropped sessions retire their queue"
+        );
+    }
+
+    #[test]
+    fn an_event_advances_the_epoch_and_wakes_a_consumer_armed_before_it() {
+        let queue = PendingQueue::new();
+        let subscriber = queue.subscribe_room_remaps();
+        let epoch = queue.event_epoch();
+        let notify = queue.event_notifications();
+        let seen = epoch.current();
+        let mut wake = std::pin::pin!(notify.notified());
+        wake.as_mut().enable();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(wake.as_mut().poll(&mut cx).is_pending());
+
+        queue.emit(MapperEvent::AreasMerged {
+            into: AreaId(Uuid::new_v4()),
+            deleted: Vec::new(),
+            rooms: Vec::new(),
+        });
+        assert_ne!(epoch.current(), seen, "a consumer that looks sees it");
+        assert_eq!(subscriber.take().len(), 1, "and finds what it announced");
+        assert!(
+            wake.as_mut().poll(&mut cx).is_ready(),
+            "a consumer that parked after arming is woken"
         );
     }
 

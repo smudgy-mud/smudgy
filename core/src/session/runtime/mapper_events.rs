@@ -7,7 +7,10 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use smudgy_cloud::{AreaId, Mapper, RoomRemap, mapper::MapperEvent};
+use smudgy_cloud::{
+    AreaId, Mapper, RoomRemap,
+    mapper::{MapperEvent, pending::EventEpoch},
+};
 
 use super::{CurrentLocation, RuntimeAction};
 
@@ -27,6 +30,45 @@ pub(crate) fn subscribe(mapper: Option<&Mapper>) -> SharedMapperEvents {
         subscription: mapper.map(Mapper::subscribe_room_remaps),
         pending_markers: Rc::default(),
         queued_remaps: Rc::default(),
+    }
+}
+
+/// How far the session loop has caught up with the mapper's publications.
+/// Asking costs one atomic load and a cell borrow, so the loop drains the
+/// subscription and the arrivals channel only once something was published
+/// or an op staged remaps.
+pub(crate) struct PublicationCursor {
+    epoch: Option<EventEpoch>,
+    seen: Option<u64>,
+}
+
+impl PublicationCursor {
+    /// A cursor that has seen nothing, so its first [`Self::catch_up`] reports
+    /// whatever the mapper published before the loop started.
+    pub(crate) fn new(mapper: Option<&Mapper>) -> Self {
+        Self {
+            epoch: mapper.map(Mapper::mapper_event_epoch),
+            seen: None,
+        }
+    }
+
+    /// Whether anything arrived since the last catch-up, without moving it.
+    pub(crate) fn pending(&self, events: &SharedMapperEvents) -> bool {
+        self.epoch.as_ref().map(EventEpoch::current) != self.seen
+            || !events.queued_remaps.borrow().is_empty()
+    }
+
+    /// Moves to the current epoch and reports whether anything arrived since
+    /// the last catch-up. Reading the epoch before the caller drains means a
+    /// publication that lands during the drain is reported next time.
+    pub(crate) fn catch_up(&mut self, events: &SharedMapperEvents) -> bool {
+        let current = self.epoch.as_ref().map(EventEpoch::current);
+        let staged = !events.queued_remaps.borrow().is_empty();
+        if current == self.seen && !staged {
+            return false;
+        }
+        self.seen = current;
+        true
     }
 }
 
@@ -299,6 +341,32 @@ mod tests {
             RuntimeAction::CallJavascriptFunction { .. }
         ));
         assert!(matches!(frame[1], RuntimeAction::MapperRoomsMerged { into, .. } if into == third));
+    }
+
+    #[test]
+    fn the_cursor_reports_staged_remaps_until_they_are_drained() {
+        let area = AreaId(Uuid::new_v4());
+        let events = subscribe(None);
+        let current = standing_at(area, 2);
+        let mut cursor = PublicationCursor::new(None);
+        assert!(!cursor.pending(&events));
+        assert!(
+            !cursor.catch_up(&events),
+            "a session without a mapper has nothing to look at"
+        );
+
+        let staged = remap_actions([migration(area, 2, area, 1)], &events, &current);
+        insert_remaps(&mut events.queued_remaps.borrow_mut(), staged);
+        assert!(cursor.pending(&events));
+        assert!(cursor.catch_up(&events));
+        assert!(
+            cursor.catch_up(&events),
+            "staged remaps stay reported until drained"
+        );
+
+        assert_eq!(drain(&events, &current).len(), 2);
+        assert!(!cursor.pending(&events));
+        assert!(!cursor.catch_up(&events));
     }
 
     #[test]

@@ -429,7 +429,7 @@ impl Inner {
         // `ready()` covers; only later ones arrive.
         if !area_ids.is_empty() && self.loads.session_started.load(Ordering::Acquire) {
             self.loads.note_arrivals(area_ids);
-            self.pending.event_notifications().notify_waiters();
+            self.pending.notify_event_consumers();
         }
     }
 
@@ -566,7 +566,7 @@ impl Inner {
             *summary = tally.summary();
             true
         });
-        self.pending.event_notifications().notify_waiters();
+        self.pending.notify_event_consumers();
     }
 
     /// Shows the maps on this device: the local ones through the local
