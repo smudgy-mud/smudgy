@@ -13,7 +13,7 @@ use smudgy_cloud::image_source::{
 use smudgy_cloud::{
     Mapper, Node, StoreBindings, WidgetIsolate, WidgetShadersEnabled, WidgetsEnabled,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 type WidgetCallbacks =
     smudgy_session_model::native_callback::CallbackRegistry<v8::Global<v8::Function>>;
@@ -172,11 +172,12 @@ deno_core::extension!(
     // Process-global; the same handle is passed to every isolate's extension init. `None`
     // in headless/test runtimes with no UI image loader — the build op then degrades every
     // `<Image>` to its placeholder.
-    image_store: Option<ImageStore>
+    image_store: Option<ImageStore>,
+    scrollback: ScrollbackLines
   },
   state = |state, options| {
     state.put::<WidgetCallbacks>(WidgetCallbacks::default());
-    state.put::<InlineLifetime>(InlineLifetime::default());
+    state.put::<InlineLifetime>(InlineLifetime::new(options.scrollback));
     state.put::<ShaderBudget>(ShaderBudget::default());
     state.put::<SmudgyWidgetRoot>(options.widget_root);
     state.put::<Option<Mapper>>(options.mapper);
@@ -3401,7 +3402,8 @@ mod tests {
             probe.store(u8::from(maps) | (u8::from(text) << 1), Ordering::Relaxed);
             iced::widget::text("probe").into()
         });
-        let resource = Arc::new(NativeInlineWidget(std::sync::Mutex::new(Some(factory))));
+        let mut lifetime = InlineLifetime::new(ScrollbackLines::new(1));
+        let resource = lifetime.track(factory).unwrap();
         let object = InlineObject::new(0..5, resource, InlineOwner::default());
         // The enclosing pane lays its spans out after leaving both contexts.
         assert!(crate::map::with_active_store(|_| ()).is_none());
@@ -3416,6 +3418,53 @@ mod tests {
         let bare = nested_inline_resolver();
         bare.resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object);
         assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn released_terminal_widgets_free_their_slots_and_teardown_takes_survivors() {
+        let mut state = OpState::new(None);
+        state.put(InlineLifetime::new(ScrollbackLines::new(100)));
+        let element = Element::new(|| iced::widget::text("widget").into());
+        let mut held: Vec<_> = (0..1000)
+            .map(|_| inline_content(&mut state, &element).unwrap())
+            .collect();
+        let Err(error) = inline_content(&mut state, &element) else {
+            panic!("ten live widgets per scrollback line is the cap");
+        };
+        assert!(error.to_string().contains("at most 1000"));
+        // Terminal lines release their widgets on the UI thread.
+        let released: Vec<_> = held.drain(..500).collect();
+        std::thread::spawn(move || drop(released)).join().unwrap();
+        held.push(inline_content(&mut state, &element).unwrap());
+        assert_eq!(state.borrow::<InlineLifetime>().live.len(), 501);
+        let survivor = held[0].objects[0].clone();
+        drop(state);
+        assert!(!survivor.owner.active());
+        let resource = survivor
+            .resource
+            .downcast_ref::<NativeInlineWidget>()
+            .unwrap();
+        assert!(resource.factory.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_widget_cap_follows_the_shared_scrollback_setting() {
+        let scrollback = ScrollbackLines::new(2);
+        let mut state = OpState::new(None);
+        state.put(InlineLifetime::new(scrollback.clone()));
+        let element = Element::new(|| iced::widget::text("widget").into());
+        let mut held: Vec<_> = (0..20)
+            .map(|_| inline_content(&mut state, &element).unwrap())
+            .collect();
+        assert!(inline_content(&mut state, &element).is_err());
+        scrollback.set(3);
+        held.extend((0..10).map(|_| inline_content(&mut state, &element).unwrap()));
+        assert!(inline_content(&mut state, &element).is_err());
+        // Lowering the setting keeps existing widgets and refuses new ones.
+        scrollback.set(1);
+        assert!(inline_content(&mut state, &element).is_err());
+        assert_eq!(state.borrow::<InlineLifetime>().live.len(), 30);
+        drop(held);
     }
 
     #[test]
@@ -3964,17 +4013,83 @@ mod tests {
     }
 }
 
-#[derive(Default)]
-struct InlineLifetime(
-    smudgy_session_model::inline_content::InlineOwner,
-    Vec<std::sync::Weak<NativeInlineWidget>>,
-);
+/// A session's scrollback length in lines. One handle is shared by the UI and
+/// every isolate the session builds, so a settings change applies at once. Each
+/// isolate keeps at most [`WIDGETS_PER_SCROLLBACK_LINE`] live terminal widgets
+/// per line.
+#[derive(Clone)]
+pub struct ScrollbackLines(Arc<AtomicUsize>);
+impl ScrollbackLines {
+    #[must_use]
+    pub fn new(lines: usize) -> Self {
+        Self(Arc::new(AtomicUsize::new(lines)))
+    }
+    pub fn set(&self, lines: usize) {
+        self.0.store(lines, Ordering::Relaxed);
+    }
+    fn widget_cap(&self) -> usize {
+        self.0
+            .load(Ordering::Relaxed)
+            .saturating_mul(WIDGETS_PER_SCROLLBACK_LINE)
+    }
+}
+pub const WIDGETS_PER_SCROLLBACK_LINE: usize = 10;
+
+/// An isolate's terminal widgets. Terminal lines own them; a widget's drop, on
+/// whichever thread, queues its id here, and the next `track` removes the queued
+/// ids, so tracking costs one removal per death, independent of the live count.
+/// Teardown retires the owner and takes every surviving factory on the isolate's
+/// thread.
+struct InlineLifetime {
+    owner: smudgy_session_model::inline_content::InlineOwner,
+    live: std::collections::BTreeMap<u64, std::sync::Weak<NativeInlineWidget>>,
+    next_id: u64,
+    deaths: std::sync::mpsc::Sender<u64>,
+    dead: std::sync::mpsc::Receiver<u64>,
+    scrollback: ScrollbackLines,
+}
+impl InlineLifetime {
+    fn new(scrollback: ScrollbackLines) -> Self {
+        let (deaths, dead) = std::sync::mpsc::channel();
+        Self {
+            owner: smudgy_session_model::inline_content::InlineOwner::default(),
+            live: std::collections::BTreeMap::new(),
+            next_id: 0,
+            deaths,
+            dead,
+            scrollback,
+        }
+    }
+
+    fn track(&mut self, factory: NativeFactory) -> Result<Arc<NativeInlineWidget>, InlineError> {
+        for id in self.dead.try_iter() {
+            self.live.remove(&id);
+        }
+        let cap = self.scrollback.widget_cap();
+        if self.live.len() >= cap {
+            return Err(format!(
+                "at most {cap} live terminal widget resources are allowed \
+                 ({WIDGETS_PER_SCROLLBACK_LINE} per scrollback line); clear old output before adding more"
+            )
+            .into());
+        }
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("inline widget id exhausted");
+        let resource = Arc::new(NativeInlineWidget {
+            factory: std::sync::Mutex::new(Some(factory)),
+            id,
+            deaths: self.deaths.clone(),
+        });
+        self.live.insert(id, Arc::downgrade(&resource));
+        Ok(resource)
+    }
+}
 impl Drop for InlineLifetime {
     fn drop(&mut self) {
-        self.0.retire();
-        for resource in &self.1 {
+        self.owner.retire();
+        for resource in self.live.values() {
             if let Some(resource) = resource.upgrade() {
-                resource.0.lock().unwrap().take();
+                resource.factory.lock().unwrap().take();
             }
         }
     }
@@ -4336,7 +4451,7 @@ fn prepare_text_effect(
             duration_ms: spec.duration,
             outset: spec.outset,
         },
-        state.borrow::<InlineLifetime>().0.clone(),
+        state.borrow::<InlineLifetime>().owner.clone(),
     ))
 }
 
@@ -4360,7 +4475,16 @@ type NativeFactory = Arc<
         + Send
         + Sync,
 >;
-struct NativeInlineWidget(std::sync::Mutex<Option<NativeFactory>>);
+struct NativeInlineWidget {
+    factory: std::sync::Mutex<Option<NativeFactory>>,
+    id: u64,
+    deaths: std::sync::mpsc::Sender<u64>,
+}
+impl Drop for NativeInlineWidget {
+    fn drop(&mut self) {
+        let _ = self.deaths.send(self.id);
+    }
+}
 
 /// A nested span builds its widgets during the enclosing pane's layout, after
 /// the enclosing resolver's store contexts have been left. This view closure
@@ -4391,7 +4515,7 @@ pub fn inline_element(
         return None;
     }
     let resource = object.resource.downcast_ref::<NativeInlineWidget>()?;
-    let guard = resource.0.lock().ok()?;
+    let guard = resource.factory.lock().ok()?;
     guard
         .as_ref()
         .map(|factory| crate::canvas::with_inline_start(object.started, || factory()))
@@ -4406,20 +4530,13 @@ fn inline_content(
         return Ok(content.clone());
     }
     let lifetime = state.borrow_mut::<InlineLifetime>();
-    lifetime.1.retain(|resource| resource.strong_count() != 0);
-    if lifetime.1.len() >= 1024 {
-        return Err("at most 1024 live terminal widget resources are allowed; clear old output before adding more".into());
-    }
-    let resource = Arc::new(NativeInlineWidget(std::sync::Mutex::new(Some(
-        element.view_fn.clone(),
-    ))));
-    lifetime.1.push(Arc::downgrade(&resource));
+    let resource = lifetime.track(element.view_fn.clone())?;
     let text = if element.terminal_text.is_empty() {
         "[widget]"
     } else {
         &element.terminal_text
     };
-    let mut object = InlineObject::new(0..text.len(), resource, lifetime.0.clone());
+    let mut object = InlineObject::new(0..text.len(), resource, lifetime.owner.clone());
     object.paint_outset = element.paint_outset;
     Ok(Arc::new(InlineContent {
         runs: Arc::new(vec![smudgy_session_model::line_operation::SpliceRun {

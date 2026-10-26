@@ -52,7 +52,8 @@ use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
 use smudgy_theme::builtins::container::default;
 use smudgy_widgets::{
-    MapStore, MapWidgetId, TextEditorStore, WidgetRoot, with_store_context, with_text_store_context,
+    MapStore, MapWidgetId, ScrollbackLines, TextEditorStore, WidgetRoot, with_store_context,
+    with_text_store_context,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -455,6 +456,9 @@ pub struct ManagedSession {
     main_font_size: Option<f32>,
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
+    /// Shared with every isolate this session builds; it bounds each isolate's
+    /// live terminal widgets.
+    scrollback_lines: ScrollbackLines,
     map_store: MapStore,
     /// Where the mapper last placed the player, so a map editor opened from
     /// this session starts there.
@@ -1466,15 +1470,18 @@ impl ManagedSession {
         image_store.register_waker(widget_root.wake_handle());
         crate::images::set_package_client(package_client.clone());
 
+        let scrollback_lines = ScrollbackLines::new(scrollback_limit(&settings).get());
         let extra_script_extensions = {
             let widget_root = WidgetRoot::clone(&widget_root);
             let mapper = mapper.clone();
             let image_store = image_store.clone();
+            let scrollback_lines = scrollback_lines.clone();
             Arc::new(move || {
                 vec![smudgy_widgets::ext::init(
                     widget_root.clone(),
                     mapper.clone(),
                     Some(image_store.clone()),
+                    scrollback_lines.clone(),
                 )]
             })
         };
@@ -1731,6 +1738,7 @@ impl ManagedSession {
             workspace_dirty: false,
             mapper,
             widget_root,
+            scrollback_lines,
             map_store,
             current_location: None,
             text_store,
@@ -3156,6 +3164,7 @@ impl ManagedSession {
                         buffer.refresh_styles();
                     }
                 }
+                self.scrollback_lines.set(scrollback_limit(&settings).get());
 
                 // Re-run the telnet auto-mask gate under the (possibly
                 // toggled) preference: the gate is otherwise evaluated only
