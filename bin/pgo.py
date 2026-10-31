@@ -59,7 +59,7 @@ def identity():
                 configs[str(path)] = sha(path)
     names = capture("git", "ls-files", "-c", "-o", "--exclude-standard", "-z").split("\0")
     files = {name: sha(ROOT/name) for name in sorted(set(names))
-             if name and name != "THIRD-PARTY-NOTICES.md" and (ROOT/name).is_file()}
+             if name and (ROOT/name).is_file()}
     # Cargo metadata resolves the same shipping feature graph, including path
     # dependencies outside the checkout and generated target/patch sources.
     metadata = json.loads(capture("cargo", "metadata", "--locked", "--format-version", "1",

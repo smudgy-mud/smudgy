@@ -74,6 +74,34 @@ class PgoTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "failed workload"):
             pgo.export(self.run)
 
+    def test_compiled_notices_are_part_of_input_identity(self):
+        # The settings window embeds this generated file with include_str!.
+        # Regenerating it between training and use must invalidate the profile.
+        self.patch_identity.stop()
+        notice = self.run/"THIRD-PARTY-NOTICES.md"
+        notice.write_text("original embedded notices", encoding="utf-8")
+
+        def capture(*command):
+            if command[0] == "git":
+                return "THIRD-PARTY-NOTICES.md"
+            if command[:2] == ("cargo", "metadata"):
+                return json.dumps({"packages": []})
+            return "test toolchain"
+
+        with (
+            patch.object(pgo, "ROOT", self.run),
+            patch.object(pgo, "capture", capture),
+            patch.dict(pgo.os.environ, {
+                "CARGO_HOME": str(self.run), "HOME": str(self.run), "USERPROFILE": str(self.run),
+            }, clear=True),
+        ):
+            before = pgo.identity()
+            pgo.write(self.run/"run.json", {"identity": before})
+            notice.write_text("regenerated embedded notices", encoding="utf-8")
+            self.assertNotEqual(before["files"], pgo.identity()["files"])
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                pgo.build(self.run, "use")
+
     def test_changed_source_cannot_build_with_old_profile(self):
         with patch.object(pgo, "identity", return_value={"source": "different"}):
             with self.assertRaisesRegex(RuntimeError, "changed"):
