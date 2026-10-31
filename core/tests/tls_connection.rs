@@ -86,6 +86,9 @@ fn drain(
     while Instant::now() < deadline {
         match rx.try_recv() {
             Ok(RuntimeAction::HandleIncomingLine(line)) => lines.push(line.text.clone()),
+            Ok(RuntimeAction::HandleIncomingLines(batch)) => {
+                lines.extend(batch.iter().map(|line| line.text.clone()));
+            }
             Ok(RuntimeAction::HandleIncomingPartialLine(line)) => lines.push(line.text.clone()),
             Ok(RuntimeAction::Echo(text)) => echoes.push(text.to_string()),
             // The connect failure reaches the session as its own action now,
