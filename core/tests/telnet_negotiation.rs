@@ -252,6 +252,9 @@ fn mccp2_compresses_the_stream_and_reverts_on_stream_end() {
     while lines.len() < 4 && Instant::now() < deadline {
         match runtime_rx.try_recv() {
             Ok(RuntimeAction::HandleIncomingLine(line)) => lines.push(line.text.clone()),
+            Ok(RuntimeAction::HandleIncomingLines(batch)) => {
+                lines.extend(batch.iter().map(|line| line.text.clone()));
+            }
             Ok(RuntimeAction::Echo(text)) => echoes.push(text.to_string()),
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -399,6 +402,9 @@ fn nested_marker_at_stream_end_does_not_strand_the_latch() {
     while lines.len() < 3 && Instant::now() < deadline {
         match runtime_rx.try_recv() {
             Ok(RuntimeAction::HandleIncomingLine(line)) => lines.push(line.text.clone()),
+            Ok(RuntimeAction::HandleIncomingLines(batch)) => {
+                lines.extend(batch.iter().map(|line| line.text.clone()));
+            }
             Ok(RuntimeAction::Echo(text)) => echoes.push(text.to_string()),
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -518,6 +524,9 @@ fn wait_for_lines(
     while lines.len() < count && Instant::now() < deadline {
         match runtime_rx.try_recv() {
             Ok(RuntimeAction::HandleIncomingLine(line)) => lines.push(line.text.clone()),
+            Ok(RuntimeAction::HandleIncomingLines(batch)) => {
+                lines.extend(batch.iter().map(|line| line.text.clone()));
+            }
             Ok(RuntimeAction::Echo(text)) => echoes.push(text.to_string()),
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -635,6 +644,13 @@ fn mccpx_zstd_invalid_frame_boundary_disconnects() {
         match runtime_rx.try_recv() {
             Ok(RuntimeAction::HandleIncomingLine(line))
                 if line.text == "line before invalid boundary" =>
+            {
+                line_delivered = true;
+            }
+            Ok(RuntimeAction::HandleIncomingLines(batch))
+                if batch
+                    .iter()
+                    .any(|line| line.text == "line before invalid boundary") =>
             {
                 line_delivered = true;
             }
