@@ -3,7 +3,12 @@ import {
   lastWindow, profile, resetFixture, seedCatalog, server, waitForHighlight, waitForOpen, waitForPurple,
 } from './support.mjs';
 
-test.beforeEach(async ({ request }) => resetFixture(request));
+test.beforeEach(async ({ request, page }) => {
+  // Holiday costumes change the empty-state height. Keep these fixed-coordinate
+  // layout tests on an ordinary date while animation and timers continue.
+  await page.clock.setFixedTime(new Date('2026-07-15T12:00:00Z'));
+  await resetFixture(request);
+});
 
 async function savedLayouts(page, serverName) {
   return page.evaluate(async (name) => {
