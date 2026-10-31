@@ -1,5 +1,4 @@
 import { expect } from '@playwright/test';
-import { PNG } from 'pngjs';
 
 export const endpoint = (id) => `wss://127.0.0.1:9443/mud/${id}`;
 
@@ -252,12 +251,21 @@ export function profile(name, automation = {}) {
   };
 }
 
-// iced paints one canvas. Decode its screenshot in the test runner so pixel
-// checks do not wait for image decoding on the busy application thread.
+// iced paints one canvas. Decode a screenshot in a throwaway 2D canvas so
+// readiness/theme checks still observe pixels produced by the real renderer.
 export async function pixel(page, x, y) {
-  const image = PNG.sync.read(await page.screenshot());
-  const offset = (image.width * y + x) * 4;
-  return [...image.data.subarray(offset, offset + 4)];
+  const png = (await page.screenshot()).toString('base64');
+  return page.evaluate(async ({ png, x, y }) => {
+    const image = new Image();
+    image.src = `data:image/png;base64,${png}`;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const context = canvas.getContext('2d');
+    context.drawImage(image, -x, -y);
+    return [...context.getImageData(0, 0, 1, 1).data];
+  }, { png, x, y });
 }
 
 export async function waitForPurple(page, x, y) {
