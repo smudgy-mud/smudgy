@@ -1,5 +1,8 @@
 # Opt-in Windows PGO builds
 
+For the current cross-platform workflow, portable exports and native V8 input
+contract, see [PGO.md](PGO.md). This page retains the Windows command examples.
+
 The default release workflow is unchanged. This local release lane requires
 Python 3.11+, the repository Rust toolchain, `llvm-tools-preview`, and the usual
 Windows build dependencies, including `cargo-about 0.9.0`. Run commands from the
@@ -81,4 +84,5 @@ intact. The inspector sidecar uses its ordinary release build. Signing and relea
 publication remain separate from PGO training and validation. Other architectures
 and operating systems need independent training and validation before adoption.
 
-Tooling tests: `python -m unittest discover -s bin -p test_pgo.py`.
+Tooling tests (install `bin/requirements-pgo.txt` first):
+`python -m unittest discover -s bin -p 'test_pgo*.py'`.

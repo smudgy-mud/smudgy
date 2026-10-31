@@ -218,10 +218,14 @@ def build(run, stage, rustflags=(), target=None):
     print(json.dumps({key: manifest[key] for key in ("stage", "seconds", "executable")}), flush=True)
 
 
-def check_build(path, target=None):
-    build = read(path)
+def check_build_receipt(build, target=None):
     require(build.get("exit_code") == 0 and build.get("inputs_verified") and not build.get("pgo_diagnostics"), "Build is incomplete or has unresolved PGO diagnostics")
     require(target is None or build.get("target") == target, "Build target differs from PGO run")
+
+
+def check_build(path, target=None):
+    build = read(path)
+    check_build_receipt(build, target)
     require(sha(build["executable"]) == build["executable_sha256"], "Executable differs from build manifest")
     return build
 
@@ -274,12 +278,26 @@ def accepted(run, directory, executable_hash):
     records = []
     for path in sorted((run/directory).glob("*/manifest.json")):
         record = read(path)
-        require(record.get("exit_code") == 0 and record.get("verification_exit_code") == 0,
-                f"Incomplete or failed workload: {path}; preserve it and start a fresh run")
-        require(record["executable_sha256"] == executable_hash, f"Wrong executable in {path}")
+        check_workload_receipt(record, executable_hash)
         records.append(record)
     require(records, f"No verified {directory} workloads")
     return records
+
+
+def check_workload_receipt(record, executable_hash):
+    require(record.get("exit_code") == 0 and record.get("verification_exit_code") == 0,
+            "Incomplete or failed workload receipt; preserve it and start a fresh run")
+    require(record["executable_sha256"] == executable_hash, "Wrong executable in workload receipt")
+
+
+def check_coverage(records, validation):
+    categories = {c for r in records for c in r["scenario"]["categories"]}
+    if validation:
+        require({"replay", "captures", "heldout", "interactive"} <= categories,
+                "Validation requires replay, captures, held-out and interactive coverage")
+    else:
+        require({"replay", "captures", "interactive"} <= categories,
+                "Training requires replay, captures and interactive coverage")
 
 
 def merge(run):
@@ -288,8 +306,7 @@ def merge(run):
     require(identity(config["target"]) == config["identity"], "Build inputs changed")
     generated = check_build(run/"generate/manifest.json", config["target"])
     records = accepted(run, "training", generated["executable_sha256"])
-    categories = {c for r in records for c in r["scenario"]["categories"]}
-    require({"replay", "captures", "interactive"} <= categories, "Training requires replay, captures and interactive coverage")
+    check_coverage(records, validation=False)
     raw = {p: digest for r in records for p, digest in r["raw"].items()}
     require(raw and all(sha(p) == digest for p, digest in raw.items()), "Raw profiles are missing or changed")
     tool = profdata_tool()
@@ -306,9 +323,7 @@ def export(run):
     built = check_build(run/"use/manifest.json", config["target"])
     require(built["profile_sha256"] == sha(run/"merged.profdata"), "Profile changed after compilation")
     records = accepted(run, "validation", built["executable_sha256"])
-    categories = {c for r in records for c in r["scenario"]["categories"]}
-    require({"replay", "captures", "heldout", "interactive"} <= categories,
-            "Validation requires replay, captures, held-out and interactive coverage")
+    check_coverage(records, validation=True)
     output = run/"dist"
     output.mkdir()
     name = executable_name(config["target"])
@@ -344,12 +359,13 @@ def verify_artifact(path, target=None, portable=False):
         require(target is not None, "Portable verification requires an explicit target")
         require(source_files() == manifest["build_identity"]["files"], "Packaging source differs from validated PGO inputs")
         built = manifest["build"]
-        require(built.get("exit_code") == 0 and built.get("inputs_verified") and not built.get("pgo_diagnostics"), "Incomplete PGO build")
-        require(built["target"] == recorded_target == manifest["build_identity"]["target"], "Inconsistent PGO target provenance")
+        check_build_receipt(built, recorded_target)
         require(built["executable_sha256"] == manifest["executable_sha256"] and built["profile_sha256"] == manifest["profile_sha256"], "Inconsistent PGO build provenance")
         records = manifest["validation"]
-        require(records and all(r.get("exit_code") == 0 and r.get("verification_exit_code") == 0 and r["executable_sha256"] == built["executable_sha256"] for r in records), "Incomplete PGO validation provenance")
-        require({"replay", "captures", "heldout", "interactive"} <= {c for r in records for c in r["scenario"]["categories"]}, "Missing held-out or interactive validation")
+        require(records, "No verified validation workloads")
+        for record in records:
+            check_workload_receipt(record, built["executable_sha256"])
+        check_coverage(records, validation=True)
         manifest["executable"] = str(executable)
         return manifest
     run = Path(manifest["run"])
