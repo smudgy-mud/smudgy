@@ -85,6 +85,15 @@ jobs:
         run: |
           bash -n bin/release-linux.sh
           bash -n bin/release-mac.sh
+      - name: Upload PGO smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pgo-smoke-${{ matrix.target }}
+          path: |
+            target/pgo-smoke/use.log
+            target/pgo-smoke/profile.txt
+          if-no-files-found: ignore
 
   packages:
     name: Package tests

@@ -37,7 +37,10 @@ fn main() {
     raw.mkdir()
     env = dict(os.environ)
     env.pop("LLVM_PROFILE_FILE", None)
-    command = ["rustc", str(source), "--target", target, "-Copt-level=3"]
+    # Exercise the same optimization pipeline as Cargo's release-full profile.
+    # LTO and partitioning affect which functions survive to instrumentation.
+    command = ["rustc", str(source), "--target", target, "-Copt-level=3",
+               "-Clto=fat", "-Ccodegen-units=1"]
     subprocess.run([*command, f"-Cprofile-generate={raw}", "-o", str(generated)], env=env, check=True)
     results = {}
     for count in (2000, 19001):
@@ -48,6 +51,8 @@ fn main() {
     merged = output/"merged.profdata"
     subprocess.run([str(tool), "merge", "--failure-mode=any", "-o", str(merged), *map(str, profiles)], check=True)
     summary = subprocess.check_output([str(tool), "show", str(merged)], text=True)
+    (output/"profile.txt").write_text(subprocess.check_output(
+        [str(tool), "show", "--all-functions", "--counts", str(merged)], text=True), encoding="utf-8")
     built = subprocess.run([*command, f"-Cprofile-use={merged}", "-Cllvm-args=-pgo-warn-missing-function",
                             "-o", str(optimized)], env=env, capture_output=True, text=True)
     (output/"use.log").write_text(built.stdout + built.stderr, encoding="utf-8")
@@ -59,7 +64,7 @@ fn main() {
         actual = subprocess.check_output([str(optimized), str(count)], env=env, text=True).strip()
         pgo.require(actual == expected, "Optimized output differs from instrumented output")
     pgo.write(output/"result.json", dict(target=target, compiler=pgo.capture("rustc", "-vV"),
-        tool=str(tool), profile_sha256=pgo.sha(merged), summary=summary, outputs=results,
+        tool=str(tool), command=command, profile_sha256=pgo.sha(merged), summary=summary, outputs=results,
         executable_sha256=pgo.sha(optimized), passed=True))
     print(f"PASS: {target}; flushed {len(profiles)} profiles, merged, used, and verified both outputs")
 
