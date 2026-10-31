@@ -35,8 +35,7 @@ $pgo = $null
 # cannot silently fall back to whatever ordinary binary sits in target/.
 $pgoPending = Join-Path $repoRoot 'target\pgo-package\pending-manifest.txt'
 if ($PgoManifest) {
-    $PgoManifest = (Resolve-Path -LiteralPath $PgoManifest).Path
-    $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest
+    $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'PGO artifact verification failed' }
     $pgo = $verified | ConvertFrom-Json
     if ($SkipBuild) {
