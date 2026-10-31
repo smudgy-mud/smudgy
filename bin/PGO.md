@@ -236,7 +236,15 @@ python3 bin/pgo_smoke.py --output /path/to/fresh-smoke-run
 The CI tooling matrix covers all five targets, with separate native Intel/ARM
 Mac and Linux jobs. The smoke test compiles
 a tiny Rust program, collects profiles, merges them, builds with profile use,
-and compares outputs. It checks the Rust PGO toolchain, not Smudgy performance,
+and verifies exact profile counts and matching outputs. For Rust 1.97.1 on Mac,
+the probe records and reports two narrowly identified startup-helper warnings:
+Darwin's linker can discard dead helpers and their profile records
+([LLVM explanation](https://reviews.llvm.org/D25456)). Unknown diagnostics and
+incorrect counts still fail. This probe-only exception does not relax `pgo.py`:
+full application builds with any PGO coverage diagnostics still require
+investigation and cannot be exported by this helper.
+
+It checks the Rust PGO toolchain, not Smudgy performance,
 native V8, Flatpak runtime compatibility, both Mac slices or signing. Native
 application training, held-out comparisons and final-package smoke tests remain
 required qualification steps. A tooling test pass alone must not enable PGO
