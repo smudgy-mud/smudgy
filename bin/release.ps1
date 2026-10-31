@@ -95,11 +95,15 @@ if (-not $SkipBuild) {
     cargo patch-crate --force
     if ($LASTEXITCODE -ne 0) { throw "cargo patch-crate failed" }
 
-    Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
-    cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
-    if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
-    python bin/normalize-third-party-notices.py
-    if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    # The PGO app embeds the notice used during training. Its input fingerprint
+    # verifies that same file, so package it without regenerating it here.
+    if (-not $pgo) {
+        Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
+        cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+        if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
+        python bin/normalize-third-party-notices.py
+        if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    }
     Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
     # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
     # default-members, so name it explicitly alongside the app.

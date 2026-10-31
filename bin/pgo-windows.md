@@ -2,12 +2,14 @@
 
 The default release workflow is unchanged. This local release lane requires
 Python 3.11+, the repository Rust toolchain, `llvm-tools-preview`, and the usual
-Windows build dependencies. Run commands from the checkout. Materialize dependency
-patches with `cargo patch-crate --force` first. Keep run directories outside the
+Windows build dependencies, including `cargo-about 0.9.0`. Run commands from the
+checkout. Materialize dependency patches with `cargo patch-crate --force` first. Keep run directories outside the
 source tree or under its ignored `target/` directory.
 
 ```powershell
 rustup component add llvm-tools-preview
+cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+python bin/normalize-third-party-notices.py
 python bin/pgo.py generate C:/pgo/run-001 --rustflag=-Cdebuginfo=1
 python bin/pgo.py train C:/pgo/run-001 --label replay --scenario C:/workloads/replay.json
 python bin/pgo.py train C:/pgo/run-001 --label captures --scenario C:/workloads/captures.json
@@ -53,7 +55,8 @@ latency, exact callback vectors, total CPU and multi-session behavior distinct.
 
 Generation and use share `release-full`, the Windows x64 target, audio feature
 graph and explicit base flags. Keep source, toolchain, local patches, configuration
-and symbol settings unchanged. The helper checks these inputs, records every stage,
+and symbol settings unchanged. The generated notices are embedded in the app;
+prepare them before generation and keep them unchanged through packaging. The helper checks these inputs, records every stage,
 merges dense profiles with the toolchain's LLVM tool and rejects unresolved profile
 diagnostics. Use a new run directory after a failure or input change; do not clean
 the checkout or silently reuse old profile data. `-Cdebuginfo=1` retains a PDB for
@@ -67,7 +70,8 @@ To package a validated export, pass its manifest explicitly in **both** phases:
 ```
 
 Packaging checks identity and hashes, signs a staging copy, and passes that exact
-executable path to Inno Setup. The validated unsigned executable and symbols stay
+executable path to Inno Setup. The PGO lane packages the fingerprinted notices
+without regenerating them, matching the text embedded in the validated app. The validated unsigned executable and symbols stay
 intact. The inspector sidecar uses its ordinary release build. Signing and release
 publication remain separate from PGO training and validation. Other architectures
 and operating systems need independent training and validation before adoption.
