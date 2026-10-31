@@ -62,7 +62,14 @@ pub fn session_fixture(
         mapper: None,
         package_client: None,
         extra_script_extensions: Arc::new(move || {
-            vec![smudgy_widgets::ext::init(factory_root.clone(), None, None)]
+            vec![smudgy_widgets::ext::init(
+                factory_root.clone(),
+                None,
+                None,
+                smudgy_widgets::ScrollbackLines::new(
+                    smudgy_session_model::DEFAULT_SCROLLBACK_LINES,
+                ),
+            )]
         }),
         on_engine_rebuild: None,
     });

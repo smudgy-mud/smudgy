@@ -7,7 +7,9 @@ mod text_editor;
 mod widget;
 
 pub use extension::inline_element;
-pub use extension::{SmudgyMarkdownViewer, smudgy_widgets as ext};
+pub use extension::{
+    ScrollbackLines, SmudgyMarkdownViewer, WIDGETS_PER_SCROLLBACK_LINE, smudgy_widgets as ext,
+};
 pub use smudgy_session_model::native_callback::CallbackLease as WidgetCallback;
 
 pub use image_store::{
