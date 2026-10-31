@@ -1,14 +1,10 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { test } from './calendar.mjs';
 import {
   lastWindow, profile, resetFixture, seedCatalog, server, waitForHighlight, waitForOpen, waitForPurple,
 } from './support.mjs';
 
-test.beforeEach(async ({ request, page }) => {
-  // Holiday costumes change the empty-state height. Keep these fixed-coordinate
-  // layout tests on an ordinary date with wall time, animation and timers advancing.
-  await page.clock.setSystemTime(new Date('2026-07-15T12:00:00Z'));
-  await resetFixture(request);
-});
+test.beforeEach(async ({ request }) => resetFixture(request));
 
 async function savedLayouts(page, serverName) {
   return page.evaluate(async (name) => {
