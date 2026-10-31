@@ -13,10 +13,15 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 TARGET = "x86_64-pc-windows-msvc"
 ROOT = Path(__file__).resolve().parents[1]
 FEATURES = "smudgy_ui/web-audio-cpal"
+COMPILER_OVERRIDES = {
+    "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+}
 
 
 def require(condition, message):
@@ -44,18 +49,26 @@ def capture(*args):
 def identity():
     """Include local patch sources and Cargo configuration, not just Git HEAD."""
     forbidden = [key for key in os.environ if os.environ[key] and (
-        key in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"}
+        key in COMPILER_OVERRIDES | {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}
         or key.startswith("CARGO_PROFILE_") or key.endswith("_RUSTFLAGS"))]
     require(not forbidden, f"Unset build overrides before PGO: {forbidden}")
     configs = {}
     config_directories = [directory/".cargo" for directory in [ROOT, *ROOT.parents]]
-    config_directories.append(Path(os.environ.get("CARGO_HOME", Path.home()/".cargo")))
+    config_directories.append(Path(os.environ.get("CARGO_HOME") or Path.home()/".cargo"))
     for directory in config_directories:
         for name in ("config", "config.toml"):
             path = directory / name
             if path.is_file():
                 content = path.read_text(encoding="utf-8")
                 require("rustflags" not in content, f"Move rustflags from {path} into --rustflag; implicit flags are unsupported")
+                config = tomllib.loads(content)
+                require(not config.get("include"),
+                        f"Flatten included Cargo configs before PGO: {path}; all build inputs must be fingerprinted")
+                require(not any(config.get("build", {}).get(key) for key in
+                                ("rustc", "rustc-wrapper", "rustc-workspace-wrapper")),
+                        f"Remove compiler/wrapper overrides from {path}; PGO must use the rustc resolved on PATH")
+                require(not (COMPILER_OVERRIDES | {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}) & config.get("env", {}).keys(),
+                        f"Remove compiler/flag environment overrides from {path}")
                 configs[str(path)] = sha(path)
     names = capture("git", "ls-files", "-c", "-o", "--exclude-standard", "-z").split("\0")
     files = {name: sha(ROOT/name) for name in sorted(set(names))

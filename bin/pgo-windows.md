@@ -6,6 +6,11 @@ Windows build dependencies, including `cargo-about 0.9.0`. Run commands from the
 checkout. Materialize dependency patches with `cargo patch-crate --force` first. Keep run directories outside the
 source tree or under its ignored `target/` directory.
 
+Cargo must use the same PATH-selected rustc that supplies the profile merger.
+Compiler/wrapper overrides (including Cargo configuration equivalents) are
+rejected. Flatten configuration includes before starting a new run so all
+configuration inputs are fingerprinted.
+
 ```powershell
 rustup component add llvm-tools-preview
 cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md

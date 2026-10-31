@@ -130,5 +130,32 @@ class PgoTests(unittest.TestCase):
         self.assertNotIn("verification_exit_code", record)
 
 
+    def test_compiler_environment_overrides_cannot_bypass_identity(self):
+        self.patch_identity.stop()
+        for variable in pgo.COMPILER_OVERRIDES:
+            with self.subTest(variable=variable), patch.dict(pgo.os.environ, {variable: "another-compiler"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "Unset build overrides"):
+                    pgo.identity()
+
+
+    def test_cargo_config_cannot_select_a_different_compiler(self):
+        self.patch_identity.stop()
+        directory = self.run/".cargo"
+        directory.mkdir()
+        contents = [
+            '[build]\nrustc = "other-rustc"\n',
+            '[build]\nrustc-wrapper = "wrapper"\n',
+            '[build]\nrustc-workspace-wrapper = "wrapper"\n',
+            '[env]\nCARGO_BUILD_RUSTC = { value = "other-rustc", force = true }\n',
+            'include = ["another-compiler.toml"]\n',
+        ]
+        with patch.object(pgo, "ROOT", self.run), patch.dict(pgo.os.environ, {"CARGO_HOME": str(directory)}, clear=True):
+            for content in contents:
+                with self.subTest(content=content):
+                    (directory/"config.toml").write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "Remove compiler|Flatten included"):
+                        pgo.identity()
+
+
 if __name__ == "__main__":
     unittest.main()
