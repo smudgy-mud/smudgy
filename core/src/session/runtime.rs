@@ -20,13 +20,12 @@ use std::{
 
 use tokio::{
     select,
-    sync::{
-        broadcast,
-        mpsc::{UnboundedReceiver, UnboundedSender},
-    },
+    sync::{broadcast, mpsc::UnboundedSender},
 };
 
 mod captures;
+mod incoming;
+use incoming::IncomingActions;
 pub(crate) mod mapper_events;
 mod matcher;
 mod trigger;
@@ -283,7 +282,7 @@ impl MainPrefixDisposition {
 /// Stop accepting external work and terminally fail any tooltip resolutions
 /// already queued behind shutdown. Once the receiver is closed, concurrent
 /// forwards take the send-failure path instead.
-fn close_runtime_action_queue(receiver: &mut UnboundedReceiver<RuntimeAction>) {
+fn close_runtime_action_queue(receiver: &mut IncomingActions) {
     receiver.close();
     while let Ok(action) = receiver.try_recv() {
         if let RuntimeAction::ResolveLinkTooltip { state, .. } = action {
@@ -372,7 +371,8 @@ mod runtime_helper_tests {
 
     #[test]
     fn shutdown_fails_tooltips_already_queued_behind_it() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rx = super::IncomingActions::from(rx);
         let state = Arc::new(LinkTooltipState::default());
         assert!(state.begin_request());
         tx.send(RuntimeAction::ResolveLinkTooltip {
@@ -1910,7 +1910,7 @@ impl Runtime {
                 server_name: &local_server_name,
                 profile_name: &local_profile_name,
                 mapper: mapper.clone(),
-                session_runtime_rx,
+                session_runtime_rx: session_runtime_rx.into(),
                 mapper_events: mapper_events.clone(),
                 session_runtime_tx: local_session_runtime_tx.clone(),
                 spawned_actions: spawned_actions.clone(),
@@ -2072,7 +2072,7 @@ impl Runtime {
                     std::mem::replace(&mut inner.session_runtime_rx, {
                         // Create a dummy receiver that will be immediately replaced
                         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
-                        rx
+                        rx.into()
                     });
 
                 // Purge engine-bound actions left queued behind the `Reload` (chiefly session-store
@@ -2638,7 +2638,7 @@ struct Inner<'a> {
     script_engine: ScriptEngine<'a>,
     server_name: &'a Arc<String>,
     profile_name: &'a Arc<String>,
-    session_runtime_rx: UnboundedReceiver<RuntimeAction>,
+    session_runtime_rx: IncomingActions,
     mapper_events: mapper_events::SharedMapperEvents,
     session_runtime_tx: UnboundedSender<RuntimeAction>,
     spawned_actions: ActionQueue,
@@ -4202,6 +4202,10 @@ impl Inner<'_> {
 
         // Stack-based action processing
         let mut action_stack: Vec<VecDeque<RuntimeAction>> = Vec::new();
+        // A burst repeatedly opens and drains one line's expansion. Reuse both
+        // queues instead of allocating a transfer vector and frame for every line.
+        let mut spare_frame = VecDeque::new();
+        let mut spawned = VecDeque::new();
         const MAX_STACK_DEPTH: usize = 100;
 
         // The logs directory may legitimately be missing; a logging failure
@@ -4535,7 +4539,7 @@ impl Inner<'_> {
                     Some(spawned_action)
                 } else {
                     // Current frame is empty, pop it and continue
-                    action_stack.pop();
+                    spare_frame = action_stack.pop().expect("current frame exists");
                     if runtime_ready_pending {
                         debug_assert!(action_stack.is_empty());
                         runtime_ready_pending = false;
@@ -4571,6 +4575,11 @@ impl Inner<'_> {
                 Some(external_action)
             } else {
                 self.drain_point_bookkeeping();
+                // Retain ordinary dispatch storage while idle, but release an
+                // unusually large expansion. Do this only at a drain point so
+                // dense bursts can reuse their larger queues between lines.
+                spare_frame.shrink_to(1024);
+                spawned.shrink_to(1024);
                 // About to park: flush any still-buffered lines so they paint now instead of
                 // waiting for the next wake. Anything buffered at this point has already been
                 // fully drained of in-flight actions, so this can't split a coalesced batch — it
@@ -4646,8 +4655,7 @@ impl Inner<'_> {
                 // of siblings already queued behind it (depth-first
                 // expansion). An explicit Run result (e.g. command splitting,
                 // a script's return value) executes after those emissions.
-                let mut spawned: Vec<RuntimeAction> =
-                    self.spawned_actions.borrow_mut().drain(..).collect();
+                self.spawned_actions.borrow_mut().take_into(&mut spawned);
 
                 match result {
                     Ok(ActionResult::None) => {}
@@ -4704,15 +4712,19 @@ impl Inner<'_> {
                 if !spawned.is_empty() {
                     if let Some(current_frame) = action_stack.last_mut() {
                         // Splice ahead of queued siblings for depth-first order
-                        for spawned_action in spawned.into_iter().rev() {
+                        for spawned_action in spawned.drain(..).rev() {
                             current_frame.push_front(spawned_action);
                         }
                         trace!("Spliced spawned actions into current frame");
                     } else if action_stack.len() >= MAX_STACK_DEPTH {
                         warn!("Maximum action stack depth exceeded: {MAX_STACK_DEPTH}");
                         self.echo_str_sync("Error: Maximum execution depth exceeded");
+                        spawned.clear();
                     } else {
-                        action_stack.push(VecDeque::from(spawned));
+                        action_stack.push(std::mem::replace(
+                            &mut spawned,
+                            std::mem::take(&mut spare_frame),
+                        ));
                         trace!(
                             "Pushed new action frame, stack depth: {}",
                             action_stack.len()

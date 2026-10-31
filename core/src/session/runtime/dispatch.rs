@@ -658,6 +658,9 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::None)
             }
+            RuntimeAction::HandleIncomingLines(_) => {
+                unreachable!("transport batches are expanded by the input receiver")
+            }
             RuntimeAction::HandleIncomingFragmentedLine {
                 line,
                 completion_fragment,
