@@ -5,8 +5,8 @@ import {
 
 test.beforeEach(async ({ request, page }) => {
   // Holiday costumes change the empty-state height. Keep these fixed-coordinate
-  // layout tests on an ordinary date while animation and timers continue.
-  await page.clock.setFixedTime(new Date('2026-07-15T12:00:00Z'));
+  // layout tests on an ordinary date with wall time, animation and timers advancing.
+  await page.clock.setSystemTime(new Date('2026-07-15T12:00:00Z'));
   await resetFixture(request);
 });
 
