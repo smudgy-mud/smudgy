@@ -128,12 +128,13 @@ class PgoTests(unittest.TestCase):
             '[build]\nrustc-wrapper = "wrapper"\n',
             '[build]\nrustc-workspace-wrapper = "wrapper"\n',
             '[env]\nCARGO_BUILD_RUSTC = { value = "other-rustc", force = true }\n',
+            'include = ["another-compiler.toml"]\n',
         ]
         with patch.object(pgo, "ROOT", self.run), patch.dict(pgo.os.environ, {"CARGO_HOME": str(directory)}, clear=True):
             for content in contents:
                 with self.subTest(content=content):
                     (directory/"config.toml").write_text(content, encoding="utf-8")
-                    with self.assertRaisesRegex(RuntimeError, "Remove compiler"):
+                    with self.assertRaisesRegex(RuntimeError, "Remove compiler|Flatten included"):
                         pgo.identity()
 
     def test_missing_training_categories_cannot_merge(self):

@@ -33,6 +33,8 @@ The helper rejects compiler overrides (including `RUSTC`, `CARGO_BUILD_RUSTC`
 and Cargo config equivalents), implicit Rust flags/wrappers and profile overrides;
 Cargo must use the same PATH-selected rustc that identifies the target and merger. Supply
 explicit base flags through repeated `--rustflag` arguments to `generate`.
+Flatten Cargo configuration includes before starting; indirect configuration
+files are not supported by this fingerprinting workflow.
 
 Keep profiles, scenario files, logs, data homes and package fixtures outside the
 source tree, or under ignored `target/`. Do not commit user scripts, private
