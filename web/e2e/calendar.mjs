@@ -17,8 +17,8 @@ export function installCalendarDate(isoDate) {
 
 export const test = base.extend({
   calendarDate: ['2026-07-15T12:00:00Z', { option: true }],
-  page: async ({ page, calendarDate }, use) => {
-    await page.addInitScript(installCalendarDate, calendarDate);
-    await use(page);
+  context: async ({ context, calendarDate }, use) => {
+    await context.addInitScript(installCalendarDate, calendarDate);
+    await use(context);
   },
 });
