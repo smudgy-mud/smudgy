@@ -20,17 +20,22 @@ class PgoTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.run = Path(self.temp.name)
-        pgo.write(self.run/"run.json", {"identity": {"source": "same"}, "revision": "test"})
-        self.patch_identity = patch.object(pgo, "identity", return_value={"source": "same"})
+        self.target = "x86_64-pc-windows-msvc"
+        self.identity = {"source": "same", "target": self.target, "files": {"source.rs": "digest"}}
+        pgo.write(self.run/"run.json", {"identity": self.identity, "revision": "test", "target": self.target})
+        self.patch_identity = patch.object(pgo, "identity", return_value=self.identity)
         self.patch_identity.start()
         self.addCleanup(self.patch_identity.stop)
+        self.patch_target = patch.object(pgo, "native_target", side_effect=lambda target=None: target or self.target)
+        self.patch_target.start()
+        self.addCleanup(self.patch_target.stop)
         (self.run/"merged.profdata").write_bytes(b"profile")
         for stage in ("generate", "use"):
             directory = self.run/stage
             directory.mkdir()
             exe = directory/"smudgy.exe"
             exe.write_bytes(stage.encode())
-            pgo.write(directory/"manifest.json", dict(exit_code=0, inputs_verified=True,
+            pgo.write(directory/"manifest.json", dict(target=self.target, exit_code=0, inputs_verified=True,
                 executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=[],
                 profile_sha256=pgo.sha(self.run/"merged.profdata") if stage == "use" else None))
 
@@ -96,7 +101,7 @@ class PgoTests(unittest.TestCase):
             }, clear=True),
         ):
             before = pgo.identity()
-            pgo.write(self.run/"run.json", {"identity": before})
+            pgo.write(self.run/"run.json", {"identity": before, "target": self.target})
             notice.write_text("regenerated embedded notices", encoding="utf-8")
             self.assertNotEqual(before["files"], pgo.identity()["files"])
             with self.assertRaisesRegex(RuntimeError, "changed"):
@@ -128,6 +133,108 @@ class PgoTests(unittest.TestCase):
         record = pgo.read(self.run/"training/aborted/manifest.json")
         self.assertEqual(record["exit_code"], 1)
         self.assertNotIn("verification_exit_code", record)
+
+    def test_native_targets_and_executable_names(self):
+        self.patch_target.stop()
+        for target, (platform, name) in pgo.TARGETS.items():
+            with self.subTest(target=target), patch.object(pgo, "host_target", return_value=target), patch.object(pgo.sys, "platform", platform):
+                self.assertEqual(pgo.native_target(), target)
+                self.assertEqual(pgo.executable_name(target), name)
+                other = next(t for t in pgo.TARGETS if t != target)
+                with self.assertRaisesRegex(RuntimeError, "matching native"):
+                    pgo.native_target(other)
+
+    def test_profdata_uses_host_tool_and_platform_suffix(self):
+        for target, (platform, _) in pgo.TARGETS.items():
+            with self.subTest(target=target), patch.object(pgo, "host_target", return_value=target), patch.object(pgo.sys, "platform", platform), patch.object(pgo, "capture", return_value=str(self.run)):
+                tool = pgo.profdata_tool()
+                self.assertEqual(tool.parent.parent.name, target)
+                self.assertEqual(tool.name, "llvm-profdata.exe" if platform == "win32" else "llvm-profdata")
+
+    def test_portable_export_does_not_need_original_run(self):
+        self.validation()
+        pgo.export(self.run)
+        path = self.run/"dist/manifest.json"
+        manifest = pgo.read(path)
+        manifest["run"] = "missing-original-run"
+        manifest["executable"] = "missing-original-executable"
+        pgo.write(path, manifest)
+        with patch.object(pgo, "source_files", return_value=self.identity["files"]):
+            verified = pgo.verify_artifact(path, self.target, portable=True)
+            self.assertEqual(Path(verified["executable"]).read_bytes(), b"use")
+            with self.assertRaisesRegex(RuntimeError, "target mismatch"):
+                pgo.verify_artifact(path, "aarch64-apple-darwin", portable=True)
+        with patch.object(pgo, "source_files", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "Packaging source"):
+                pgo.verify_artifact(path, self.target, portable=True)
+
+    def test_portable_export_rejects_inconsistent_receipts(self):
+        self.validation()
+        pgo.export(self.run)
+        path = self.run/"dist/manifest.json"
+        original = pgo.read(path)
+        for section, key, value in (("build", "target", "aarch64-apple-darwin"),
+                                    ("build", "exit_code", 1),
+                                    ("build", "profile_sha256", "changed")):
+            with self.subTest(key=key), patch.object(pgo, "source_files", return_value=self.identity["files"]):
+                changed = json.loads(json.dumps(original))
+                changed[section][key] = value
+                pgo.write(path, changed)
+                with self.assertRaises(RuntimeError):
+                    pgo.verify_artifact(path, self.target, portable=True)
+
+    def test_native_pgo_target_and_archive_are_checked(self):
+        archive = self.run/"v8.a"
+        binding = self.run/"binding.rs"
+        profile = self.run/"native.profdata"
+        for path in (archive, binding, profile):
+            path.write_bytes(path.name.encode())
+        manifest_path = self.run/"native.json"
+        manifest = dict(schema=1, stage="native-pgo-use", target=self.target,
+                        compiler="clang test", source_sha256="native-source-digest",
+                        archive={"sha256":pgo.sha(archive)}, bindings={"sha256":pgo.sha(binding)},
+                        profile={"path":str(profile), "sha256":pgo.sha(profile)})
+        pgo.write(manifest_path, manifest)
+        with patch.dict(pgo.os.environ, {"RUSTY_V8_ARCHIVE":str(archive),
+                                        "RUSTY_V8_SRC_BINDING_PATH":str(binding),
+                                        "SMUDGY_NATIVE_PGO_MANIFEST":str(manifest_path)}, clear=True):
+            self.assertIn("native_pgo", pgo.native_inputs(self.target))
+            with self.assertRaisesRegex(RuntimeError, "target differs"):
+                pgo.native_inputs("aarch64-apple-darwin")
+            archive.write_bytes(b"replaced")
+            with self.assertRaisesRegex(RuntimeError, "archive differs"):
+                pgo.native_inputs(self.target)
+
+    def test_unix_export_retains_executable_mode(self):
+        self.validation()
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin"):
+            with self.subTest(target=target):
+                config = pgo.read(self.run/"run.json")
+                config["target"] = target
+                self.identity["target"] = target
+                config["identity"] = self.identity
+                pgo.write(self.run/"run.json", config)
+                built = pgo.read(self.run/"use/manifest.json")
+                built["target"] = target
+                pgo.write(self.run/"use/manifest.json", built)
+                if (self.run/"dist").exists():
+                    import shutil
+                    shutil.rmtree(self.run/"dist")
+                original = self.run/"use/smudgy.exe"
+                original.chmod(0o755)
+                pgo.export(self.run)
+                self.assertEqual((self.run/"dist/smudgy").read_bytes(), b"use")
+                if sys.platform != "win32":
+                    self.assertEqual((self.run/"dist/smudgy").stat().st_mode & 0o777, 0o755)
+
+    def test_mismatched_build_target_cannot_export(self):
+        self.validation()
+        built = pgo.read(self.run/"use/manifest.json")
+        built["target"] = "aarch64-apple-darwin"
+        pgo.write(self.run/"use/manifest.json", built)
+        with self.assertRaisesRegex(RuntimeError, "Build target"):
+            pgo.export(self.run)
+        self.assertFalse((self.run/"dist").exists())
 
 
     def test_compiler_environment_overrides_cannot_bypass_identity(self):

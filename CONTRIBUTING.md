@@ -47,6 +47,9 @@ cargo run
 The first build may take some time because Smudgy has a large Rust dependency
 graph, including its embedded scripting runtime.
 
+For opt-in profile-guided release builds and per-platform training, see
+[the PGO runbook](bin/PGO.md).
+
 On Debian or Ubuntu, the desktop build needs the ALSA development package for
 audio output, and all-workspace builds also require WebKitGTK:
 
