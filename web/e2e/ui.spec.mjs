@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { test } from './calendar.mjs';
 import { fileURLToPath } from 'node:url';
 import {
   catalog, endpoint, mudState, pixel, profile, resetFixture, seedCatalog, server,
@@ -6,12 +7,7 @@ import {
   dropConnections, emit, lastWindow,
 } from './support.mjs';
 
-test.beforeEach(async ({ request, page }) => {
-  // Holiday costumes change the empty-state height. Keep these fixed-coordinate
-  // layout tests on an ordinary date with wall time, animation and timers advancing.
-  await page.clock.setSystemTime(new Date('2026-07-15T12:00:00Z'));
-  await resetFixture(request);
-});
+test.beforeEach(async ({ request }) => resetFixture(request));
 
 // Coordinates are intentionally tied to the fixed 1100×900 viewport in
 // playwright.config.mjs. They exercise iced's real canvas hit testing.
@@ -46,15 +42,18 @@ async function browserSettings(page) {
   });
 }
 
-test('Halloween empty-state action opens the shared Connect modal', async ({ page }) => {
-  await page.clock.setSystemTime(new Date('2026-10-31T12:00:00Z'));
-  await seedCatalog(page, [server('halloween', [profile('main')])]);
-  await page.goto('/');
-  await expect(page.locator('canvas')).toHaveCount(1);
-  // The 56-point taller witch hat moves the centered button down 28 points.
-  await waitForPurple(page, 500, 611);
-  await page.mouse.click(550, 611);
-  await waitForPurple(page, 500, 165);
+test.describe('Halloween', () => {
+  test.use({ calendarDate: '2026-10-31T12:00:00Z' });
+
+  test('Halloween empty-state action opens the shared Connect modal', async ({ page }) => {
+    await seedCatalog(page, [server('halloween', [profile('main')])]);
+    await page.goto('/');
+    await expect(page.locator('canvas')).toHaveCount(1);
+    // The 56-point taller witch hat moves the centered button down 28 points.
+    await waitForPurple(page, 500, 611);
+    await page.mouse.click(550, 611);
+    await waitForPurple(page, 500, 165);
+  });
 });
 
 test('empty state and shared Connect modal render with Smudgy accent', async ({ page }) => {
