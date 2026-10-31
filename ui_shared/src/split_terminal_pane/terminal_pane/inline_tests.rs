@@ -84,6 +84,96 @@ fn tree(pane: &TerminalPane<'_, ()>) -> Tree {
 }
 
 #[test]
+fn concealed_tail_and_scroll_anchor_fill_from_earlier_visible_lines() {
+    use smudgy_session_model::{
+        LinkProtocol, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire,
+    };
+
+    let renderer = painter();
+    let buffer = RefCell::new(TerminalBuffer::new());
+    for number in 1..=8 {
+        let mut line = StyledLine::from_output_str(&format!("Line {number}"));
+        if number >= 7 {
+            line.links.push(LinkSpan {
+                begin_pos: 0,
+                end_pos: line.text.len(),
+                action: LinkAction::Configured {
+                    primary: Some(Box::new(LinkAction::Send(Arc::from("look")))),
+                    disabled: false,
+                    primary_enabled: true,
+                    menu: None,
+                    menu_on_left_click: false,
+                    protocol: Some(LinkProtocol {
+                        visibility: Some(LinkVisibility {
+                            action: if number == 7 {
+                                LinkVisibilityAction::Conceal
+                            } else {
+                                LinkVisibilityAction::Reveal
+                            },
+                            delay_ms: (number == 8).then_some(0),
+                            expire: LinkVisibilityExpire {
+                                input: false,
+                                prompt: false,
+                                output: false,
+                                output_delay_ms: 0,
+                            },
+                            whole_line: true,
+                        }),
+                        ..LinkProtocol::default()
+                    }),
+                },
+                tooltip: None,
+                style: None,
+            });
+        }
+        buffer.borrow_mut().push_line(Arc::new(line));
+    }
+    let links = buffer.borrow().link_state();
+    let deleted_key = buffer.borrow().link_keys().next().unwrap();
+    assert_eq!(links.borrow().line(deleted_key), Some(7));
+    links
+        .borrow_mut()
+        .activate_visibility(deleted_key, Instant::now());
+
+    let selection = Rc::new(RefCell::new(Selection::None));
+    let mut pane = TerminalPane::new(buffer.borrow(), selection.clone());
+    let mut state = tree(&pane);
+    let (_, line_height) = effective_metrics(&crate::prefs::current(), None);
+    let size = Size::new(600.0, line_height * 2.5);
+    for anchor in [None, Some(7), Some(4)] {
+        pane.last_line_number = anchor;
+        layout(&mut pane, &mut state, &renderer, size);
+        let cached = state.state.downcast_ref::<Cache>();
+        assert_eq!(cached.last_line_number, anchor.unwrap_or(8));
+        assert_eq!(cached.cache[0].line_number, anchor.unwrap_or(8).min(6));
+        assert!(cached.cache.iter().all(|row| row.line_number <= 6));
+        assert!(
+            cached
+                .cache
+                .iter()
+                .map(ParagraphCache::row_height)
+                .sum::<f32>()
+                >= size.height
+        );
+    }
+    assert!(!links.borrow().contains(deleted_key));
+    assert!(
+        links.borrow().line_concealed(7),
+        "retirement retains the tombstone"
+    );
+
+    // A timer reveals the newest line without changing the retained line count.
+    links
+        .borrow_mut()
+        .update_visibility_timers(Instant::now() + Duration::from_millis(1));
+    pane.last_line_number = None;
+    layout(&mut pane, &mut state, &renderer, size);
+    let cached = state.state.downcast_ref::<Cache>();
+    assert_eq!(cached.cache[0].line_number, 8);
+    assert!(cached.cache.iter().all(|row| row.line_number != 7));
+}
+
+#[test]
 fn wrapped_effect_uses_text_geometry_and_preserves_copy_and_instance() {
     let renderer = painter();
     let buffer = RefCell::new(TerminalBuffer::new());
