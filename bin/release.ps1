@@ -20,12 +20,22 @@ param(
     # Build the binaries and stop before signing/packaging. CI splits the run
     # this way: the federated login assertion used for signing lives only ~5
     # minutes, so the workflow re-authenticates between build and sign.
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    # Opt-in: package the exact validated export from bin/pgo.py. The DevTools
+    # sidecar still uses its ordinary release-full build.
+    [string]$PgoManifest
 )
 if ($BuildOnly -and $SkipBuild) { throw '-BuildOnly and -SkipBuild are mutually exclusive' }
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+$pgo = $null
+if ($PgoManifest) {
+    $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest
+    if ($LASTEXITCODE -ne 0) { throw 'PGO artifact verification failed' }
+    $pgo = $verified | ConvertFrom-Json
+}
 
 $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
     Where-Object FullName -Match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1 -ExpandProperty FullName
@@ -85,21 +95,39 @@ if (-not $SkipBuild) {
     cargo patch-crate --force
     if ($LASTEXITCODE -ne 0) { throw "cargo patch-crate failed" }
 
-    Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
-    cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
-    if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
-    python bin/normalize-third-party-notices.py
-    if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    # The PGO app embeds the notice used during training. Its input fingerprint
+    # verifies that same file, so package it without regenerating it here.
+    if (-not $pgo) {
+        Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
+        cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+        if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
+        python bin/normalize-third-party-notices.py
+        if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    }
     Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
     # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
     # default-members, so name it explicitly alongside the app.
-    cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal
+    if ($pgo) {
+        cargo build --locked --profile release-full -p smudgy_inspector
+    } else {
+        cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 }
 
 # The app and its bundled DevTools sidecar -- both signed and packaged.
 $exe = Join-Path $repoRoot 'target\release-full\smudgy.exe'
 $inspector = Join-Path $repoRoot 'target\release-full\smudgy_inspector.exe'
+if ($pgo) {
+    # Sign a staging copy so the validated unsigned artifact remains verifiable.
+    $pgoStage = Join-Path $repoRoot ('target\pgo-package\' + $pgo.executable_sha256)
+    New-Item -ItemType Directory -Force $pgoStage | Out-Null
+    $exe = Join-Path $pgoStage 'smudgy.exe'
+    Copy-Item -LiteralPath $pgo.executable -Destination $exe -Force
+    if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pgo.executable_sha256) {
+        throw 'Staged PGO executable hash mismatch'
+    }
+}
 foreach ($f in @($exe, $inspector)) {
     if (-not (Test-Path $f)) { throw "$f not found" }
 }
@@ -147,6 +175,7 @@ Write-Host "    $version -> $channel build" -ForegroundColor Cyan
 # $q is Inno's escape for a double-quote; $f is the file being signed.
 $signDef = '/Ssmudgysign=$q{0}$q sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $q{1}$q /dmdf $q{2}$q $f' -f $signtool, $dlib, $metadata
 $isccArgs = @($signDef)
+if ($pgo) { $isccArgs += "/DSmudgyAppExe=$exe" }
 if ($channel -eq 'dev') { $isccArgs += '/DSmudgyDevBuild' }
 & $iscc @isccArgs $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
