@@ -29,7 +29,9 @@ first instrumented build. Notices are compiled into the executable.
 Freeze source, Cargo.lock, generated patches, Cargo configuration, compiler,
 native archives, and build flags for the whole cycle. Local dependency contents
 and selected native archives are fingerprinted, including files outside Git.
-The helper rejects implicit Rust flags/wrappers and profile overrides; supply
+The helper rejects compiler overrides (including `RUSTC`, `CARGO_BUILD_RUSTC`
+and Cargo config equivalents), implicit Rust flags/wrappers and profile overrides;
+Cargo must use the same PATH-selected rustc that identifies the target and merger. Supply
 explicit base flags through repeated `--rustflag` arguments to `generate`.
 
 Keep profiles, scenario files, logs, data homes and package fixtures outside the
