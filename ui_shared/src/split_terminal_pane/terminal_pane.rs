@@ -504,27 +504,12 @@ fn link_action_disabled(action: &LinkAction) -> bool {
             .is_some_and(|selection| selection.disabled)
 }
 
-fn concealed_whole_lines(
-    terminal_buffer: &TerminalBuffer,
-    buffer_link_state: &BufferLinkState,
-) -> HashSet<usize> {
-    terminal_buffer
-        .iter_rev_with_line_number(None)
-        .map(|(line_number, _)| line_number)
-        .filter(|line_number| buffer_link_state.line_concealed(*line_number))
-        .collect()
-}
-
-fn link_key_available(
-    key: LinkKey,
-    buffer_link_state: &BufferLinkState,
-    hidden_lines: &HashSet<usize>,
-) -> bool {
+fn link_key_available(key: LinkKey, buffer_link_state: &BufferLinkState) -> bool {
     buffer_link_state.contains(key)
         && !buffer_link_state.concealed(key)
         && buffer_link_state
             .line(key)
-            .is_none_or(|line| !hidden_lines.contains(&line))
+            .is_none_or(|line| !buffer_link_state.line_concealed(line))
 }
 
 fn hidden_blink_spans(
@@ -848,14 +833,11 @@ struct LinkMenuPopup {
     source: Option<(LinkKey, LinkAction)>,
 }
 
-fn menu_source_is_available(
-    popup: &LinkMenuPopup,
-    live: &BufferLinkState,
-    hidden_lines: &HashSet<usize>,
-) -> bool {
-    popup.source.as_ref().is_none_or(|(key, action)| {
-        link_key_available(*key, live, hidden_lines) && !link_action_disabled(action)
-    })
+fn menu_source_is_available(popup: &LinkMenuPopup, live: &BufferLinkState) -> bool {
+    popup
+        .source
+        .as_ref()
+        .is_none_or(|(key, action)| link_key_available(*key, live) && !link_action_disabled(action))
 }
 
 #[derive(Debug)]
@@ -872,9 +854,7 @@ fn resolve_link_menu_invocation<P: text::Paragraph>(
     link: &LinkSpan,
     anchor: Point,
 ) -> LinkMenuInvocation {
-    if !link_key_available(key, buffer_link_state, &state.hidden_lines)
-        || link_action_disabled(&link.action)
-    {
+    if !link_key_available(key, buffer_link_state) || link_action_disabled(&link.action) {
         return LinkMenuInvocation::None;
     }
     let Some(menu) = link.action.menu().cloned() else {
@@ -1423,10 +1403,6 @@ pub(super) struct State<P: text::Paragraph> {
     active_link: Option<LinkKey>,
     focused_link: Option<LinkKey>,
     focus_visible: bool,
-    /// Logical lines concealed with OSC 8 `wholeline`. They are omitted from
-    /// layout and every interaction path, including links that merely share
-    /// the line with the visibility-controlling link.
-    hidden_lines: HashSet<usize>,
     visual_generation: u64,
     seen_link_navigation_reset_epoch: u64,
     /// Group rows the viewer has folded or unfolded, by line number, each
@@ -1457,7 +1433,6 @@ impl<P: text::Paragraph> Default for State<P> {
             active_link: None,
             focused_link: None,
             focus_visible: false,
-            hidden_lines: HashSet::new(),
             visual_generation: 0,
             seen_link_navigation_reset_epoch: 0,
             toggled_groups: HashSet::new(),
@@ -1525,7 +1500,7 @@ impl<P: text::Paragraph> State<P> {
     fn prune_widget_links(&mut self, live: &BufferLinkState) {
         if self
             .hovered_link
-            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+            .is_some_and(|key| !link_key_available(key, live))
         {
             self.hovered_link = None;
             if self
@@ -1538,13 +1513,13 @@ impl<P: text::Paragraph> State<P> {
         }
         if self
             .active_link
-            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+            .is_some_and(|key| !link_key_available(key, live))
         {
             self.active_link = None;
         }
         if self
             .focused_link
-            .is_some_and(|key| !link_key_available(key, live, &self.hidden_lines))
+            .is_some_and(|key| !link_key_available(key, live))
         {
             self.focused_link = None;
             self.focus_visible = false;
@@ -1552,7 +1527,7 @@ impl<P: text::Paragraph> State<P> {
         if self
             .menu_popup
             .as_ref()
-            .is_some_and(|popup| !menu_source_is_available(popup, live, &self.hidden_lines))
+            .is_some_and(|popup| !menu_source_is_available(popup, live))
         {
             self.menu_popup = None;
         }
@@ -1560,9 +1535,7 @@ impl<P: text::Paragraph> State<P> {
             .link_tooltip_hover
             .as_ref()
             .is_some_and(|hover| match hover.origin() {
-                LinkTooltipOrigin::Keyboard(key) => {
-                    !link_key_available(key, live, &self.hidden_lines)
-                }
+                LinkTooltipOrigin::Keyboard(key) => !link_key_available(key, live),
                 LinkTooltipOrigin::Mouse => false,
             })
         {
@@ -1742,7 +1715,7 @@ fn resolve_link_activation<P: text::Paragraph>(
     request: LinkActivationRequest<'_>,
 ) -> LinkActivation {
     state.clear_keyboard_tooltip();
-    if !link_key_available(request.key, buffer_link_state, &state.hidden_lines)
+    if !link_key_available(request.key, buffer_link_state)
         || link_action_disabled(&request.link.action)
     {
         return LinkActivation {
@@ -1906,16 +1879,10 @@ impl<'a, Message> TerminalPane<'a, Message> {
         self
     }
 
-    fn available_link_at<'b, P: text::Paragraph>(
-        &'b self,
-        state: &State<P>,
-        line: usize,
-        column: usize,
-    ) -> Option<(LinkKey, &'b LinkSpan)> {
+    fn available_link_at(&self, line: usize, column: usize) -> Option<(LinkKey, &LinkSpan)> {
         let link = self.terminal_buffer.link_span_at(line, column)?;
         let key = self.terminal_buffer.link_key(line, link)?;
-        link_key_available(key, &self.buffer_link_state.borrow(), &state.hidden_lines)
-            .then_some((key, link))
+        link_key_available(key, &self.buffer_link_state.borrow()).then_some((key, link))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2035,10 +2002,6 @@ where
             None
         };
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
-        state.hidden_lines = {
-            let live_links = self.buffer_link_state.borrow();
-            concealed_whole_lines(&self.terminal_buffer, &live_links)
-        };
         {
             let mut live_links = self.buffer_link_state.borrow_mut();
             live_links.retire_deleted_line_registrations();
@@ -2126,7 +2089,10 @@ where
             // A whole-line visibility action has deletion semantics. Omitting
             // the paragraph collapses its layout slot, removes it from hit
             // testing, and prevents selections from being initiated on it.
-            if state.hidden_lines.contains(&line_number) {
+            // Query only the rows visited while filling the viewport/overscan.
+            // The scroll anchor is an absolute logical line, even if concealed;
+            // there is no need to enumerate hidden lines elsewhere in scrollback.
+            if buffer_link_state.line_concealed(line_number) {
                 continue;
             }
 
@@ -2897,7 +2863,7 @@ where
                     .position_in(layout.bounds())
                     .and_then(|position| state.hit_test(layout.bounds(), position))
                     && self
-                        .available_link_at(state, position.line, position.column)
+                        .available_link_at(position.line, position.column)
                         .is_some_and(|(_, link)| {
                             link.action.is_interactive() && !link_action_disabled(&link.action)
                         })
@@ -3045,7 +3011,7 @@ where
                 .then(|| cursor.position_in(layout.bounds()))
                 .flatten()
                 .and_then(|position| state.hit_test(layout.bounds(), position))
-                .and_then(|position| self.available_link_at(state, position.line, position.column));
+                .and_then(|position| self.available_link_at(position.line, position.column));
             let hovered_key = mouse_link.map(|(key, _)| key);
             if state.hovered_link != hovered_key {
                 state.hovered_link = hovered_key;
@@ -3105,11 +3071,8 @@ where
                     )
                 });
                 let inside = cursor.is_over(geometry.bounds);
-                let source_is_available = menu_source_is_available(
-                    &popup,
-                    &self.buffer_link_state.borrow(),
-                    &state.hidden_lines,
-                );
+                let source_is_available =
+                    menu_source_is_available(&popup, &self.buffer_link_state.borrow());
                 state.menu_popup = None;
                 shell.invalidate_layout();
                 shell.request_redraw();
@@ -3156,7 +3119,7 @@ where
                         .position_in(layout.bounds())
                         .and_then(|position| state.hit_test(layout.bounds(), position))
                     && let Some((key, link)) =
-                        self.available_link_at(state, position.line, position.column)
+                        self.available_link_at(position.line, position.column)
                 {
                     resolve_link_menu_invocation(
                         state,
@@ -3206,7 +3169,7 @@ where
                         .position_in(layout.bounds())
                         .and_then(|position| state.hit_test(layout.bounds(), position))
                     && let Some((key, link)) =
-                        self.available_link_at(state, position.line, position.column)
+                        self.available_link_at(position.line, position.column)
                     && link.action.opens_menu_on_left_click()
                 {
                     let invocation = resolve_link_menu_invocation(
@@ -3251,7 +3214,7 @@ where
 
                     if let Some(position) = state.hit_test(layout.bounds(), click_position) {
                         if let Some((key, link)) =
-                            self.available_link_at(state, position.line, position.column)
+                            self.available_link_at(position.line, position.column)
                             && !link_action_disabled(&link.action)
                         {
                             state.focused_link = Some(key);
@@ -3361,7 +3324,7 @@ where
                     });
                     (is_group
                         && self
-                            .available_link_at(state, position.line, position.column)
+                            .available_link_at(position.line, position.column)
                             .is_none())
                     .then_some(position.line)
                 });
@@ -3386,7 +3349,7 @@ where
                         .and_then(|position| state.hit_test(layout.bounds(), position))
                     && position == pressed
                     && let Some((key, link)) =
-                        self.available_link_at(state, position.line, position.column)
+                        self.available_link_at(position.line, position.column)
                 {
                     let modifiers = state.modifiers;
                     self.activate_link(
@@ -3500,20 +3463,16 @@ where
                             if self.terminal_buffer.has_links() =>
                         {
                             let buffer_link_state = self.buffer_link_state.borrow();
-                            let links: Vec<_> = self
-                                .terminal_buffer
-                                .link_keys()
-                                .filter(|key| {
-                                    link_key_available(
-                                        *key,
-                                        &buffer_link_state,
-                                        &state.hidden_lines,
-                                    ) && self
-                                        .terminal_buffer
-                                        .link_span(*key)
-                                        .is_some_and(|link| !link_action_disabled(&link.action))
-                                })
-                                .collect();
+                            let links: Vec<_> =
+                                self.terminal_buffer
+                                    .link_keys()
+                                    .filter(|key| {
+                                        link_key_available(*key, &buffer_link_state)
+                                            && self.terminal_buffer.link_span(*key).is_some_and(
+                                                |link| !link_action_disabled(&link.action),
+                                            )
+                                    })
+                                    .collect();
                             if !links.is_empty() {
                                 let current = state.focused_link.and_then(|focused| {
                                     links.iter().position(|key| *key == focused)
@@ -4231,7 +4190,26 @@ mod tests {
 
         let ordinary = link_span(LinkAction::ServerSend(Arc::from("co-located")));
         let (ordinary_protocol, mut ordinary_buffer, ordinary_key) = protocol_states(9, &ordinary);
-        state.hidden_lines.insert(9);
+        assert!(link_key_available(ordinary_key, &ordinary_buffer));
+        // Conceal the line through a different link, without a layout pass.
+        // Availability must consult the live protocol state, not a pane snapshot.
+        let mut control = link.clone();
+        control.begin_pos = 0;
+        control.end_pos = 2;
+        let LinkAction::Configured {
+            protocol: Some(protocol),
+            ..
+        } = &mut control.action
+        else {
+            panic!("the control link must have visibility configuration");
+        };
+        protocol.visibility.as_mut().unwrap().whole_line = true;
+        let mut line = StyledLine::new("0123456789", Vec::new());
+        line.links = vec![control, ordinary.clone()];
+        ordinary_buffer.replace_line(9, Some(&line));
+        assert!(ordinary_buffer.contains(ordinary_key));
+        assert!(!ordinary_buffer.concealed(ordinary_key));
+        assert!(ordinary_buffer.line_concealed(9));
         let hidden_line_activation = {
             let mut ordinary_protocol = ordinary_protocol.borrow_mut();
             resolve_link_activation(
@@ -4413,10 +4391,10 @@ mod tests {
             menu_popup: Some(popup.clone()),
             ..State::default()
         };
-        assert!(menu_source_is_available(&popup, &live, &HashSet::new()));
+        assert!(menu_source_is_available(&popup, &live));
 
         live.replace_line(7, None);
-        assert!(!menu_source_is_available(&popup, &live, &HashSet::new()));
+        assert!(!menu_source_is_available(&popup, &live));
         state.prune_widget_links(&live);
         assert!(state.menu_popup.is_none());
         assert!(!protocol_state.borrow().visited(&link.action));
