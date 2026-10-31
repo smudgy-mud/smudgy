@@ -51,6 +51,9 @@ fn main() {
     built = subprocess.run([*command, f"-Cprofile-use={merged}", "-Cllvm-args=-pgo-warn-missing-function",
                             "-o", str(optimized)], env=env, capture_output=True, text=True)
     (output/"use.log").write_text(built.stdout + built.stderr, encoding="utf-8")
+    if built.returncode or built.stderr.strip():
+        print(built.stdout, end="")
+        print(built.stderr, end="", file=sys.stderr)
     pgo.require(built.returncode == 0 and not built.stderr.strip(), f"Inspect {output/'use.log'}")
     for count, expected in results.items():
         actual = subprocess.check_output([str(optimized), str(count)], env=env, text=True).strip()
