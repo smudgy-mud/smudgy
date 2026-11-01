@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import sys
 import tomllib
@@ -331,14 +332,56 @@ def main() -> None:
         "cargo build --profile release-full -p smudgy_ui -p smudgy_inspector "
         f"--features {RELEASE_FEATURE}"
     )
+    inspector_command = "cargo build --locked --profile release-full -p smudgy_inspector"
+    windows_lines = [
+        line.strip() for line in windows_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
     require(
         [
-            line.strip()
-            for line in windows_text.splitlines()
-            if line.strip().startswith(("cargo build ", "cargo bundle "))
+            line for line in windows_lines
+            if line.startswith(("cargo build ", "cargo bundle "))
         ]
-        == [windows_command],
+        == [inspector_command, windows_command],
         "Windows release cargo build/bundle command list drifted",
+    )
+    require(
+        "\n".join(["if ($pgo) {", inspector_command, "} else {", windows_command, "}"])
+        in "\n".join(windows_lines),
+        "Windows inspector-only build must remain confined to the verified PGO path",
+    )
+    pgo_tree = ast.parse((ROOT / "bin/pgo.py").read_text(encoding="utf-8"))
+    feature_assignments = [
+        node for node in pgo_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "FEATURES"
+                for target in node.targets)
+    ]
+    require(
+        len(feature_assignments) == 1
+        and ast.literal_eval(feature_assignments[0].value) == RELEASE_FEATURE,
+        "PGO must use the reviewed physical Web Audio feature",
+    )
+    build_functions = [
+        node for node in pgo_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build"
+    ]
+    require(len(build_functions) == 1, "PGO build function drifted")
+    build_commands = [
+        node.value for node in ast.walk(build_functions[0])
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "command"
+                for target in node.targets)
+    ]
+    expected_pgo_command = ast.parse(
+        '["cargo", "build", "--locked", "--profile", "release-full", "--target", TARGET, '
+        '"-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]',
+        mode="eval",
+    ).body
+    require(
+        len(build_commands) == 1
+        and ast.dump(build_commands[0]) == ast.dump(expected_pgo_command),
+        "PGO build must retain the reviewed application command and feature selection",
     )
     notice_command = (
         "cargo about generate --workspace "
