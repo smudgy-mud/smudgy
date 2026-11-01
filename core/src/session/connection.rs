@@ -200,6 +200,9 @@ mod ingest {
         }
 
         fn on_subnegotiation(&mut self, option: u8, payload: &[u8]) {
+            // Protocol messages share the line channel and must not overtake
+            // complete lines buffered earlier in this parser feed.
+            self.vt_processor.sink_mut().flush_lines();
             if option == telnet::option::TTYPE {
                 // RFC 1091 / MTTS: each `SEND` gets the next `IS` response in the cycle.
                 // The reply rides the same inline buffer negotiation answers use.
@@ -314,6 +317,7 @@ mod ingest {
         }
 
         fn on_option(&mut self, side: telnet::Side, option: u8, enabled: bool) {
+            self.vt_processor.sink_mut().flush_lines();
             if matches!(side, telnet::Side::Local) {
                 match option {
                     // Report the current window size the moment NAWS turns on (RFC 1073
@@ -414,7 +418,11 @@ mod ingest {
             protocol,
             transcode,
         };
-        telnet.receive(data, &mut bridge)
+        let consumed = telnet.receive(data, &mut bridge);
+        // Deliver the tail now, even when the read ended without a newline or
+        // at a compression boundary. Never await the next read to fill a batch.
+        bridge.vt_processor.sink_mut().flush_lines();
+        consumed
     }
 }
 
@@ -1280,8 +1288,10 @@ impl Connection {
 
         spawn_io_task(async move {
             let mut vt_parser = VTParser::new();
-            let mut vt_processor =
-                VtProcessor::with_connection_generation(runtime_tx.clone(), generation);
+            let mut vt_processor = VtProcessor::with_connection_generation(
+                vt_processor::NativeVtSink::batched(runtime_tx.clone()),
+                generation,
+            );
             vt_processor.set_raw_wanted_flag(raw_wanted);
             if let Some(marker_armed) = marker_armed {
                 vt_processor.set_marker_armed_flag(marker_armed);
@@ -1881,6 +1891,10 @@ impl Connection {
                 let tail = transcode.finish();
                 if !tail.is_empty() {
                     feed_utf8(&mut vt_parser, &mut vt_processor, tail.as_bytes());
+                    // Every parser feed ends in a flush. The finished tail cannot
+                    // complete a line today, but keep the batching contract explicit
+                    // rather than relying on the partial-line event below to flush.
+                    vt_processor.sink_mut().flush_lines();
                     vt_processor.notify_end_of_buffer();
                 }
 
@@ -2326,6 +2340,58 @@ mod tests {
             actions.push(action);
         }
         (replies, actions)
+    }
+
+    #[test]
+    fn batched_lines_do_not_cross_protocol_events_or_wait_for_another_feed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut processor = VtProcessor::new(vt_processor::NativeVtSink::batched(tx.clone()));
+        let mut parser = VTParser::new();
+        let mut telnet = telnet::TelnetParser::new();
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+        let mut replies = Vec::new();
+        let mut input = b"one\r\ntwo\r\n".to_vec();
+        telnet::frame_subnegotiation(telnet::option::GMCP, b"Test.Event {}", &mut input);
+        input.extend_from_slice(b"three\r\nfour\r\n");
+        input.extend_from_slice(&[
+            telnet::command::IAC,
+            telnet::command::WILL,
+            telnet::option::ECHO,
+        ]);
+        input.extend_from_slice(b"tail\r\n");
+        assert_eq!(
+            ingest::feed_inbound(
+                &input,
+                &mut telnet,
+                &mut parser,
+                &mut processor,
+                &mut replies,
+                &tx,
+                &mut protocol,
+                &mut transcode
+            ),
+            input.len()
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RuntimeAction::HandleIncomingLines(lines))
+            if lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>() == ["one", "two"])
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RuntimeAction::GmcpMessage { name, .. }) if &*name == "Test.Event")
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RuntimeAction::HandleIncomingLines(lines))
+            if lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>() == ["three", "four"])
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RuntimeAction::ServerEchoChanged { enabled: true })
+        ));
+        assert!(
+            matches!(rx.try_recv(), Ok(RuntimeAction::HandleIncomingLine(line)) if line.text == "tail")
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     /// The server-ECHO password signal end to end through the connection's

@@ -766,6 +766,9 @@ impl BufferLinkState {
     }
 
     pub(crate) fn line_concealed(&self, line_number: usize) -> bool {
+        if self.deleted_lines.is_empty() && self.visibility.is_empty() {
+            return false;
+        }
         self.deleted_lines.contains(&line_number)
             || self
                 .by_line

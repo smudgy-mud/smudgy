@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { test } from './calendar.mjs';
 import { fileURLToPath } from 'node:url';
 import {
   catalog, endpoint, mudState, pixel, profile, resetFixture, seedCatalog, server,
@@ -40,6 +41,20 @@ async function browserSettings(page) {
     }
   });
 }
+
+test.describe('Halloween', () => {
+  test.use({ calendarDate: '2026-10-31T12:00:00Z' });
+
+  test('Halloween empty-state action opens the shared Connect modal', async ({ page }) => {
+    await seedCatalog(page, [server('halloween', [profile('main')])]);
+    await page.goto('/');
+    await expect(page.locator('canvas')).toHaveCount(1);
+    // The 56-point taller witch hat moves the centered button down 28 points.
+    await waitForPurple(page, 500, 611);
+    await page.mouse.click(550, 611);
+    await waitForPurple(page, 500, 165);
+  });
+});
 
 test('empty state and shared Connect modal render with Smudgy accent', async ({ page }) => {
   await openWindow(page, [server('alpha', [profile('main')])]);

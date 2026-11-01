@@ -97,8 +97,11 @@ async fn new_synced_mapper(base_url: &str, api_key: &str, cache_dir: &Path) -> M
     mapper
 }
 
-/// Forces one full sync tick and waits for it to complete.
+/// Forces one full sync tick and waits for it to complete. A tick already in
+/// flight fetched its rows before the caller's latest change, so it would
+/// satisfy the wait with stale rows: let it finish before asking for ours.
 async fn tick(mapper: &Mapper) {
+    wait_until(|| mapper.sync_status().state != SyncState::Syncing).await;
     let before = mapper.sync_status().last_sync;
     mapper.sync_now();
     wait_until(|| mapper.sync_status().last_sync != before).await;
@@ -237,9 +240,14 @@ async fn a_full_load_beside_local_maps_resolves_an_empty_private() {
         Arc::new(smudgy_cloud::CompositeBackend::new(local, cloud)),
         cache.path().join("mapper"),
     );
+    // Both maps show before the startup tick finishes reconciling; settle it
+    // too, so the write below is not confirmed only by a tick after the one
+    // the test waits for.
     wait_until(|| {
         let atlas = mapper.get_current_atlas();
-        atlas.get_area(&map).is_some() && atlas.get_area(&local_map).is_some()
+        mapper.sync_status().last_sync.is_some()
+            && atlas.get_area(&map).is_some()
+            && atlas.get_area(&local_map).is_some()
     })
     .await;
     mapper.load_all_areas().await.expect("a full load");
