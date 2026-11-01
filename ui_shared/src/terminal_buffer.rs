@@ -326,6 +326,16 @@ pub struct BufferLinkState {
 #[derive(Debug, Default)]
 struct DetachedLinks(Vec<(LinkKey, LiveLink)>);
 
+/// State carried across a carriage-return replacement of the open line.
+#[derive(Debug, Default)]
+struct OpenLineReplacement {
+    links: DetachedLinks,
+    /// The popped line was irreversibly concealed. The tombstone follows the
+    /// replacement to its final number rather than staying on a number that
+    /// intervening committed output, or the next unrelated line, will reuse.
+    deleted: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MatchScore {
     matches: usize,
@@ -655,8 +665,7 @@ impl BufferLinkState {
     }
 
     fn remove_line(&mut self, line_number: usize) {
-        self.deleted_lines.remove(&line_number);
-        self.pending_deleted_line_retirement.remove(&line_number);
+        self.take_line_deletion(line_number);
         let detached = self.detach_line(line_number);
         self.discard_detached(detached);
     }
@@ -779,6 +788,13 @@ impl BufferLinkState {
             let detached = self.detach_line(line_number);
             self.discard_detached(detached);
         }
+    }
+
+    /// Lift a line's deletion tombstone, reporting whether one existed. The
+    /// caller is removing the line from the buffer or moving it to a new number.
+    fn take_line_deletion(&mut self, line_number: usize) -> bool {
+        self.pending_deleted_line_retirement.remove(&line_number);
+        self.deleted_lines.remove(&line_number)
     }
 
     fn mark_line_deleted(&mut self, line_number: usize) {
@@ -1599,7 +1615,7 @@ pub struct TerminalBuffer {
     /// Link-instance state detached by an explicit core-authored carriage-
     /// return replacement. It survives UI batch boundaries and unrelated
     /// trigger output until the matching finish update arrives.
-    open_line_replacement: Option<DetachedLinks>,
+    open_line_replacement: Option<OpenLineReplacement>,
     /// Line number of every system row this buffer still holds, so a
     /// replacement lands on the same row. Mirrors core's ledger.
     system_rows: HashMap<SystemRowId, usize>,
@@ -1751,6 +1767,9 @@ impl TerminalBuffer {
         self.decorated_lines.remove(&line_number);
         self.object_lines.remove(&line_number);
         if line.styled_line.links.is_empty() {
+            // An edit can strip a tombstoned line of its links; the tombstone
+            // leaves with the line so the set stays bounded.
+            self.link_state.borrow_mut().take_line_deletion(line_number);
             return;
         }
         self.lines_with_links -= 1;
@@ -1924,17 +1943,17 @@ impl TerminalBuffer {
             return;
         }
         if self.line_terminated {
-            self.open_line_replacement = Some(DetachedLinks::default());
+            self.open_line_replacement = Some(OpenLineReplacement::default());
             return;
         }
         let Some(old) = self.lines.pop_back() else {
-            self.open_line_replacement = Some(DetachedLinks::default());
+            self.open_line_replacement = Some(OpenLineReplacement::default());
             return;
         };
 
         self.decorated_lines.remove(&self.last_line_number);
         self.object_lines.remove(&self.last_line_number);
-        let detached = if old.styled_line.links.is_empty() {
+        let links = if old.styled_line.links.is_empty() {
             DetachedLinks::default()
         } else {
             self.lines_with_links -= 1;
@@ -1942,9 +1961,13 @@ impl TerminalBuffer {
                 .borrow_mut()
                 .detach_line(self.last_line_number)
         };
+        let deleted = self
+            .link_state
+            .borrow_mut()
+            .take_line_deletion(self.last_line_number);
         self.last_line_number -= 1;
         self.line_terminated = true;
-        self.open_line_replacement = Some(detached);
+        self.open_line_replacement = Some(OpenLineReplacement { links, deleted });
     }
 
     /// Finish a producer-identified carriage-return replacement. `None`
@@ -1952,14 +1975,16 @@ impl TerminalBuffer {
     /// from main; `Some` installs a fresh open line and order-preservingly
     /// remaps matching link instances onto it.
     pub fn finish_open_line_replacement(&mut self, replacement: Option<Arc<StyledLine>>) {
-        let Some(detached) = self.open_line_replacement.take() else {
+        let Some(OpenLineReplacement { links, deleted }) = self.open_line_replacement.take() else {
             if let Some(replacement) = replacement {
                 self.extend_line(replacement);
             }
             return;
         };
         let Some(replacement) = replacement else {
-            self.link_state.borrow_mut().discard_detached(detached);
+            // Routing removed the line from main. Its tombstone was lifted with
+            // it, so the number recycles clean for the next unrelated line.
+            self.link_state.borrow_mut().discard_detached(links);
             return;
         };
 
@@ -1971,11 +1996,13 @@ impl TerminalBuffer {
         if !replacement.styled_line.links.is_empty() {
             self.lines_with_links += 1;
         }
-        self.link_state.borrow_mut().install_line(
-            self.last_line_number,
-            detached,
-            Some(&replacement.styled_line),
-        );
+        {
+            let mut link_state = self.link_state.borrow_mut();
+            if deleted {
+                link_state.mark_line_deleted(self.last_line_number);
+            }
+            link_state.install_line(self.last_line_number, links, Some(&replacement.styled_line));
+        }
         self.note_decorations(self.last_line_number, &replacement.styled_line);
         self.lines.push_back(replacement);
         self.line_terminated = false;
@@ -2482,8 +2509,10 @@ impl TerminalBuffer {
     /// Clear the scrollback (`pane.clear()`), keeping the line numbering —
     /// numbers keep increasing across a clear so core/UI parity is untouched.
     pub fn clear_lines(&mut self) {
-        if let Some(detached) = self.open_line_replacement.take() {
-            self.link_state.borrow_mut().discard_detached(detached);
+        if let Some(replacement) = self.open_line_replacement.take() {
+            self.link_state
+                .borrow_mut()
+                .discard_detached(replacement.links);
         }
         self.link_state.borrow_mut().retire_all();
         self.lines.clear();
@@ -2716,8 +2745,10 @@ fn fold_grapheme_boundaries_into(
 
 impl Drop for TerminalBuffer {
     fn drop(&mut self) {
-        if let Some(detached) = self.open_line_replacement.take() {
-            self.link_state.borrow_mut().discard_detached(detached);
+        if let Some(replacement) = self.open_line_replacement.take() {
+            self.link_state
+                .borrow_mut()
+                .discard_detached(replacement.links);
         }
         self.link_state.borrow_mut().retire_all();
     }
@@ -4058,6 +4089,104 @@ mod tests {
         assert!(link_state.borrow().spoiler_revealed(moved));
         assert_eq!(buffer.last_line_number(), 2);
         assert_eq!(buffer.len(), 2);
+    }
+
+    fn whole_line_conceal_line() -> Arc<StyledLine> {
+        use smudgy_session_model::LinkVisibilityExpire;
+        let visibility = LinkVisibility {
+            action: LinkVisibilityAction::Conceal,
+            delay_ms: None,
+            expire: LinkVisibilityExpire {
+                input: false,
+                prompt: false,
+                output: false,
+                output_delay_ms: 0,
+            },
+            whole_line: true,
+        };
+        protocol_line(None, Some(visibility), false).0
+    }
+
+    /// Conceal the latest line through its whole-line link and retire the
+    /// registration, leaving only the deletion tombstone behind.
+    fn conceal_latest_line(buffer: &TerminalBuffer) {
+        let key = buffer.link_keys().next().expect("link key");
+        let link_state = buffer.link_state();
+        link_state
+            .borrow_mut()
+            .activate_visibility(key, Instant::now());
+        link_state.borrow_mut().retire_deleted_line_registrations();
+        assert!(
+            link_state
+                .borrow()
+                .line_concealed(buffer.last_line_number())
+        );
+    }
+
+    #[test]
+    fn routed_away_replacement_of_a_concealed_line_frees_its_number() {
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.push_line(sl("earlier"));
+        buffer.extend_line(whole_line_conceal_line());
+        let concealed = buffer.last_line_number();
+        conceal_latest_line(&buffer);
+        let link_state = buffer.link_state();
+
+        buffer.begin_open_line_replacement();
+        buffer.finish_open_line_replacement(None);
+        assert_eq!(buffer.last_line_number(), concealed - 1);
+
+        // The next unrelated line takes the recycled number and must not
+        // inherit the concealment or lose its links.
+        buffer.push_line(linked_line("unrelated output", 0, 9));
+        assert_eq!(buffer.last_line_number(), concealed);
+        assert!(!link_state.borrow().line_concealed(concealed));
+        assert_eq!(buffer.link_keys().count(), 1);
+    }
+
+    #[test]
+    fn concealed_line_replacement_carries_its_tombstone_past_intervening_output() {
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.extend_line(whole_line_conceal_line());
+        let concealed = buffer.last_line_number();
+        conceal_latest_line(&buffer);
+        let link_state = buffer.link_state();
+
+        buffer.begin_open_line_replacement();
+        buffer.push_line(linked_line("trigger output", 0, 7));
+        buffer.finish_open_line_replacement(Some(sl("rewritten prompt")));
+
+        // Trigger output reused the popped number and stays visible; the
+        // replacement landed on a fresh number and stays concealed.
+        assert_eq!(buffer.last_line_number(), concealed + 1);
+        assert!(!link_state.borrow().line_concealed(concealed));
+        assert_eq!(buffer.link_keys().count(), 1);
+        assert!(link_state.borrow().line_concealed(concealed + 1));
+    }
+
+    #[test]
+    fn evicting_a_tombstoned_line_stripped_of_links_drops_the_tombstone() {
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(2).unwrap());
+        buffer.push_line(whole_line_conceal_line());
+        let concealed = buffer.last_line_number();
+        conceal_latest_line(&buffer);
+        let link_state = buffer.link_state();
+
+        buffer.perform_line_operation(concealed, LineOperation::Remove { begin: 0, end: 4 });
+        assert!(
+            buffer
+                .lines
+                .back()
+                .expect("line")
+                .styled_line
+                .links
+                .is_empty()
+        );
+        assert!(link_state.borrow().line_concealed(concealed));
+
+        buffer.push_line(sl("one"));
+        buffer.push_line(sl("two"));
+        assert!(!link_state.borrow().line_concealed(concealed));
     }
 
     #[test]
