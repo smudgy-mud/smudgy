@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_palette"
-version = "0.5.9-ptb"
+version = "0.5.9-ptb.2"
 edition = "2024"
 
 [dependencies]
