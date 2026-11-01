@@ -32,7 +32,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 $pgo = $null
 if ($PgoManifest) {
-    $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest
+    $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'PGO artifact verification failed' }
     $pgo = $verified | ConvertFrom-Json
 }

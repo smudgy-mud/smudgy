@@ -374,7 +374,7 @@ def main() -> None:
                 for target in node.targets)
     ]
     expected_pgo_command = ast.parse(
-        '["cargo", "build", "--locked", "--profile", "release-full", "--target", TARGET, '
+        '["cargo", "build", "--locked", "--profile", "release-full", "--target", target, '
         '"-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]',
         mode="eval",
     ).body
@@ -433,9 +433,10 @@ def main() -> None:
         f"-p smudgy_ui -p smudgy_inspector --features {RELEASE_FEATURE}"
     )
     mac_bundle = (
-        '( cd ui && cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" '
+        'cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" '
         f"--format osx --features {RELEASE_FEATURE} )"
     )
+    mac_inspector = 'cargo build --locked --profile "$PROFILE" --target "$t" -p smudgy_inspector'
     require(
         [
             command
@@ -443,11 +444,29 @@ def main() -> None:
             if command.startswith(("cargo build ", "cargo bundle ", "( cd ui && cargo bundle "))
         ]
         == [
+            mac_inspector,
             mac_build,
             mac_bundle,
         ],
         "macOS release cargo build/bundle command list drifted",
     )
+    require(
+        '\n'.join(['if [[ -n "$PGO_ARM64" ]]; then', mac_inspector]) in '\n'.join(mac_commands)
+        and '\n'.join(['else', mac_build, 'fi']) in '\n'.join(mac_commands),
+        "macOS inspector-only build must remain confined to the verified PGO path",
+    )
+    require(
+        '\n'.join(['( cd ui', '[[ -z "$PGO_ARM64" ]] || export CARGO_BUNDLE_SKIP_BUILD=1',
+                    mac_bundle]) in '\n'.join(mac_commands),
+        "macOS bundle must skip rebuilding only in the PGO path",
+    )
+    for variable, target in (("PGO_ARM64", "aarch64-apple-darwin"),
+                             ("PGO_X86_64", "x86_64-apple-darwin")):
+        require(
+            f'python3 bin/pgo.py verify "${variable}" --portable --target {target} >/dev/null'
+            in mac_commands,
+            f"macOS PGO packaging must verify the {target} export",
+        )
     require(
         mac_text.count(
             '[[ "$(cargo bundle --version 2>/dev/null)" '
@@ -598,10 +617,21 @@ def main() -> None:
             for line in linux_release_text.splitlines()
             if line.strip().startswith("manifest=")
         ]
-        == ['manifest="packaging/linux/$APP_ID.yml"']
+        == ['manifest="packaging/linux/$APP_ID.yml"', 'manifest="target/pgo-package/$ARCH/flatpak.json"']
         and linux_release_text.count("APP_ID=org.smudgy.Smudgy") == 1
         and linux_release_text.count('"$build_dir" "$repo_root/$manifest"') == 1,
         "Flatpak release script must build the reviewed application manifest",
+    )
+    linux_commands = continued_shell_commands(linux_release_text)
+    require(
+        '\n'.join([
+            'if [[ -n "$PGO_MANIFEST" ]]; then',
+            'need python3 "install Python 3.11+ and bin/requirements-pgo.txt"',
+            'python3 bin/pgo_package.py flatpak "$PGO_MANIFEST" '
+            '"target/pgo-package/$ARCH/flatpak.json" --arch "$ARCH" --base "$manifest" --runtime-version "$RUNTIME_VERSION"',
+            'manifest="target/pgo-package/$ARCH/flatpak.json"', 'fi',
+        ]) in '\n'.join(linux_commands),
+        "Flatpak PGO overlay must derive from the reviewed manifest only in the PGO path",
     )
     require(
         windows_job.count("needs: verify-version") == 1

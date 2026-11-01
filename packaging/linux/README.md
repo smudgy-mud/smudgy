@@ -22,6 +22,10 @@ SMUDGY_GPG_KEYID=<your-gpg-key-id> bin/release-linux.sh
 
 Output: `dist/smudgy-v<version>-<arch>.flatpak`.
 
+For a validated profile-guided executable, use `--pgo-manifest` after training
+inside the matching release SDK. See [the PGO runbook](../../bin/PGO.md) for
+per-architecture training, verification and packaging prerequisites.
+
 Prerequisites: `flatpak` + **network access at build time** (see strategy below).
 The build tool (`org.flatpak.Builder`), the freedesktop `25.08` runtimes, and the
 `rust-stable` + `llvm20` extensions are installed automatically from Flathub on
