@@ -2081,8 +2081,10 @@ impl Runtime {
                 // into the rebuilt engine they would index a fresh registry and invoke an unrelated
                 // handler (or error). The reload re-runs every module, so nothing is lost by
                 // dropping them. Drain-and-requeue preserves the order of the surviving actions
-                // (external input: Connect, HandleIncomingLine, …); the channel is otherwise idle
-                // during the synchronous rebuild.
+                // (external input: Connect, HandleIncomingLine, …) relative to each other. The
+                // socket task keeps running on its own runtime, so input it sends between the
+                // drain and the requeue lands ahead of the re-sent survivors; that window is the
+                // same one per-line sends had, and batching does not widen it.
                 {
                     let mut kept = Vec::new();
                     while let Ok(action) = old_session_runtime_rx.try_recv() {
@@ -4580,6 +4582,7 @@ impl Inner<'_> {
                 // dense bursts can reuse their larger queues between lines.
                 spare_frame.shrink_to(1024);
                 spawned.shrink_to(1024);
+                self.spawned_actions.borrow_mut().shrink_to(1024);
                 // About to park: flush any still-buffered lines so they paint now instead of
                 // waiting for the next wake. Anything buffered at this point has already been
                 // fully drained of in-flight actions, so this can't split a coalesced batch — it

@@ -1073,6 +1073,12 @@ impl PendingActions {
         self.actions.drain(..)
     }
 
+    /// Release unusually large capacity at an idle drain point, matching the
+    /// dispatch loop's other reusable queues.
+    pub(crate) fn shrink_to(&mut self, min_capacity: usize) {
+        self.actions.shrink_to(min_capacity);
+    }
+
     /// Move one synchronous expansion into an empty reusable dispatch buffer.
     /// Exchanging storage avoids copying every action through a temporary vector.
     #[inline]

@@ -1891,6 +1891,10 @@ impl Connection {
                 let tail = transcode.finish();
                 if !tail.is_empty() {
                     feed_utf8(&mut vt_parser, &mut vt_processor, tail.as_bytes());
+                    // Every parser feed ends in a flush. The finished tail cannot
+                    // complete a line today, but keep the batching contract explicit
+                    // rather than relying on the partial-line event below to flush.
+                    vt_processor.sink_mut().flush_lines();
                     vt_processor.notify_end_of_buffer();
                 }
 
