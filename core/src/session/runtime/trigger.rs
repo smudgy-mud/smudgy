@@ -860,6 +860,7 @@ struct CompiledColorMatch {
     foreground: Option<CompiledMatcherColor>,
     background: Option<CompiledMatcherColor>,
     required_attributes: u16,
+    ansi_foreground_only: Option<u8>,
 }
 
 /// One displayed-text row supplied by the scripting facade. Unlike the
@@ -890,10 +891,22 @@ impl CompiledColorMatch {
         for attribute in &matcher.attributes {
             required_attributes |= matcher_attribute_bit(*attribute);
         }
+        let foreground = matcher.foreground.map(CompiledMatcherColor::compile);
+        // Compile this eligibility once; the empty-pattern path can compare
+        // foreground slots without evaluating the general color predicate.
+        let ansi_foreground_only = if matcher.background.is_none() && required_attributes == 0 {
+            match foreground {
+                Some(CompiledMatcherColor::Exact(color)) => ansi_slot(color),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Self {
-            foreground: matcher.foreground.map(CompiledMatcherColor::compile),
+            foreground,
             background: matcher.background.map(CompiledMatcherColor::compile),
             required_attributes,
+            ansi_foreground_only,
         }
     }
 
@@ -1042,7 +1055,70 @@ fn style_matches(style: Style, matcher: CompiledColorMatch, bold_is_bright: bool
 /// `base` is the subject's byte offset within `line`: zero for the line itself, the value's
 /// start when the subject is one of an outer trigger's matched values. The returned start is
 /// relative to the subject.
+#[inline]
 fn color_matched_start(
+    regex: &Regex,
+    subject: &str,
+    line: &StyledLine,
+    matcher: CompiledColorMatch,
+    bold_is_bright: bool,
+    base: usize,
+) -> Option<usize> {
+    if regex.as_str().is_empty()
+        && let Some(index) = matcher.ansi_foreground_only
+    {
+        return ansi_foreground_matched_start(subject, line, index, bold_is_bright, base);
+    }
+    color_matched_start_generic(regex, subject, line, matcher, bold_is_bright, base)
+}
+
+const fn ansi_slot(color: Color) -> Option<u8> {
+    use crate::session::connection::vt_processor::AnsiColor;
+    let Color::Ansi { color, bold } = color else {
+        return None;
+    };
+    let index = match color {
+        AnsiColor::Black => 0,
+        AnsiColor::Red => 1,
+        AnsiColor::Green => 2,
+        AnsiColor::Yellow => 3,
+        AnsiColor::Blue => 4,
+        AnsiColor::Magenta => 5,
+        AnsiColor::Cyan => 6,
+        AnsiColor::White => 7,
+    };
+    Some(index + if bold { 8 } else { 0 })
+}
+
+fn ansi_foreground_matched_start(
+    subject: &str,
+    line: &StyledLine,
+    index: u8,
+    bold_is_bright: bool,
+    base: usize,
+) -> Option<usize> {
+    if subject.is_empty() {
+        return line
+            .spans
+            .last()
+            .filter(|span| {
+                ansi_slot(effective_foreground(span.style, bold_is_bright)) == Some(index)
+            })
+            .map(|_| 0);
+    }
+    let end = base + subject.len();
+    line.spans
+        .iter()
+        .find(|span| {
+            span.begin_pos < span.end_pos
+                && span.end_pos > base
+                && span.begin_pos < end
+                && ansi_slot(effective_foreground(span.style, bold_is_bright)) == Some(index)
+        })
+        .map(|span| span.begin_pos.max(base).min(end) - base)
+}
+
+fn color_matched_start_generic(
     regex: &Regex,
     subject: &str,
     line: &StyledLine,
@@ -3851,6 +3927,80 @@ mod tests {
         use crate::session::styled_line::{Color, Style, StyledLine, TextAttributes, VtSpan};
         use tokio::sync::mpsc::unbounded_channel;
         use vtparse::VTParser;
+
+        #[test]
+        fn specialized_ansi_foreground_matches_generic_for_slices_and_cursor_styles() {
+            let empty = Regex::new("").unwrap();
+            for input in [
+                "",
+                "\u{1b}[31m",
+                "\u{1b}[31m\u{1b}[32m",
+                "\u{1b}[31mred\u{1b}[32m green\u{1b}[0m plain",
+                "\u{1b}[1;36mcafé\u{1b}[96m亮\u{1b}[0m!",
+                "\u{1b}[38;2;255;0;0mrgb\u{1b}[31mred\u{1b}[34m",
+                "\u{1b}[31;44;7mreverse\u{1b}[27m normal\u{1b}[1m bold",
+                "\u{1b}[38;5;14mxterm ANSI\u{1b}[38;5;196m palette\u{1b}[39m default",
+            ] {
+                let line = parse_ansi_fragment(input);
+                let boundaries: Vec<_> = line
+                    .text
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .chain(std::iter::once(line.text.len()))
+                    .collect();
+                for bright in [false, true] {
+                    for index in 0..16 {
+                        let color = CompiledColorMatch::compile(&MatcherColorMatch {
+                            foreground: Some(MatcherColor::Ansi { index }),
+                            ..Default::default()
+                        });
+                        assert_eq!(color.ansi_foreground_only, Some(index));
+                        for &base in &boundaries {
+                            for &end in boundaries.iter().filter(|&&at| at >= base) {
+                                let subject = &line.text[base..end];
+                                assert_eq!(
+                                    super::super::color_matched_start(
+                                        &empty, subject, &line, color, bright, base
+                                    ),
+                                    super::super::color_matched_start_generic(
+                                        &empty, subject, &line, color, bright, base
+                                    )
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn ansi_specialization_requires_a_foreground_only_predicate() {
+            let mut matcher = MatcherColorMatch {
+                foreground: Some(MatcherColor::Xterm { index: 14 }),
+                ..Default::default()
+            };
+            assert_eq!(
+                CompiledColorMatch::compile(&matcher).ansi_foreground_only,
+                Some(14)
+            );
+            matcher.background = Some(MatcherColor::Ansi { index: 0 });
+            assert_eq!(
+                CompiledColorMatch::compile(&matcher).ansi_foreground_only,
+                None
+            );
+            matcher.background = None;
+            matcher.attributes.push(MatcherTextAttribute::Bold);
+            assert_eq!(
+                CompiledColorMatch::compile(&matcher).ansi_foreground_only,
+                None
+            );
+            matcher.attributes.clear();
+            matcher.foreground = Some(MatcherColor::Xterm { index: 196 });
+            assert_eq!(
+                CompiledColorMatch::compile(&matcher).ansi_foreground_only,
+                None
+            );
+        }
 
         const RED: Color = Color::Ansi {
             color: AnsiColor::Red,
