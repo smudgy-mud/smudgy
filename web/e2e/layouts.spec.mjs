@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { test } from './calendar.mjs';
 import {
   lastWindow, profile, resetFixture, seedCatalog, server, waitForHighlight, waitForOpen, waitForPurple,
 } from './support.mjs';

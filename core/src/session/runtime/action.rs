@@ -196,6 +196,10 @@ pub enum RuntimeAction {
     /// has to disconnect it while it is still up.
     DisconnectRequested,
     HandleIncomingLine(Arc<StyledLine>),
+    /// Complete lines already parsed from one available transport chunk. The
+    /// input receiver expands these one at a time, with the usual event-loop
+    /// checks and full depth-first trigger drain between lines.
+    HandleIncomingLines(Vec<Arc<StyledLine>>),
     /// A newline completed a logical line whose prefix was already emitted as
     /// one or more transport-batch partials. `line` is the assembled whole
     /// used for normal triggers; `completion_fragment` is the not-yet-shown
@@ -1067,6 +1071,21 @@ impl PendingActions {
     ) -> std::collections::vec_deque::Drain<'_, RuntimeAction> {
         self.reset_script_send_usage();
         self.actions.drain(..)
+    }
+
+    /// Release unusually large capacity at an idle drain point, matching the
+    /// dispatch loop's other reusable queues.
+    pub(crate) fn shrink_to(&mut self, min_capacity: usize) {
+        self.actions.shrink_to(min_capacity);
+    }
+
+    /// Move one synchronous expansion into an empty reusable dispatch buffer.
+    /// Exchanging storage avoids copying every action through a temporary vector.
+    #[inline]
+    pub(crate) fn take_into(&mut self, empty: &mut VecDeque<RuntimeAction>) {
+        debug_assert!(empty.is_empty());
+        self.reset_script_send_usage();
+        std::mem::swap(&mut self.actions, empty);
     }
 
     pub(crate) fn reserve_script_send(&mut self, bytes: usize) -> Result<(), ScriptSendLimit> {

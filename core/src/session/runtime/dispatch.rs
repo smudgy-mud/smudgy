@@ -658,6 +658,24 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::None)
             }
+            RuntimeAction::HandleIncomingLines(lines) => {
+                // The input receiver expands transport batches before they reach
+                // dispatch, so this arm only runs if a future path injects a batch
+                // directly. Degrade to an ordered depth-first expansion rather than
+                // killing the session: each line's cascade still splices ahead of
+                // the lines queued behind it.
+                debug_assert!(
+                    false,
+                    "transport batches are expanded by the input receiver"
+                );
+                warn!("Transport batch reached dispatch unexpanded; expanding in place");
+                Ok(ActionResult::Run(
+                    lines
+                        .into_iter()
+                        .map(RuntimeAction::HandleIncomingLine)
+                        .collect(),
+                ))
+            }
             RuntimeAction::HandleIncomingFragmentedLine {
                 line,
                 completion_fragment,
