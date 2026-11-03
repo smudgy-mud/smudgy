@@ -58,7 +58,7 @@ def probe(run, target=None, rustflags=()):
     built = pgo.read(run/"use/manifest.json") if (run/"use/manifest.json").is_file() else {}
     result = dict(schema=1, stage="pgo-probe", target=config["target"], revision=config["revision"],
                   compiler=config["identity"]["compiler"], deployment_target=config["identity"].get("deployment_target"),
-                  host=platform.platform(), use_exit_code=built.get("exit_code"), use_seconds=built.get("seconds"),
+                  host=f"{platform.system()} {platform.release()} {platform.machine()}", use_exit_code=built.get("exit_code"), use_seconds=built.get("seconds"),
                   executable=built.get("executable"), executable_sha256=built.get("executable_sha256"),
                   reviewed_diagnostics=built.get("reviewed_diagnostics", []),
                   unreviewed_diagnostics=built.get("pgo_diagnostics", []), error=error)
