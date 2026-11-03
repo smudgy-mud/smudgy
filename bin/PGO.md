@@ -261,8 +261,8 @@ The generated Flatpak overlay retains the release assets and sandbox grants,
 installs the validated binary, disables debug extraction/stripping, and drops the
 module's build-time network grant since it compiles nothing. The installed binary
 is checked again after Flatpak Builder finishes, and the executable inside the
-exported ostree commit (what `build-bundle` ships) is hashed through `ostree cat`
-(`pgo_package.py committed`; the host `ostree`, else the Builder's). The original
+exported ostree commit (what `build-bundle` ships) is hashed through the host's
+`ostree cat` (`pgo_package.py committed`; install the `ostree` package). The original
 manifest remains unchanged. Neither Unix PGO path accepts `--skip-build`.
 
 Windows retains `bin/release.ps1 -PgoManifest <manifest>` and now explicitly

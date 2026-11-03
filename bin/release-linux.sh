@@ -193,10 +193,10 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
         python3 bin/pgo_package.py check "$PGO_MANIFEST" "$build_dir/files/bin/smudgy.bin" \
             --target "$ARCH-unknown-linux-gnu"
         # build-bundle ships the exported ostree commit, not the build directory, so
-        # hash the executable inside that commit too (host ostree, else the Builder's).
-        ostree_cmd="ostree"
-        command -v ostree >/dev/null 2>&1 || ostree_cmd="flatpak run --filesystem=host --command=ostree org.flatpak.Builder"
-        python3 bin/pgo_package.py committed "$PGO_MANIFEST" "$repo_dir" --arch "$ARCH" --ostree "$ostree_cmd"
+        # hash the executable inside that commit too. The Platform runtime carries no
+        # ostree CLI, so the host's is required (Debian/Ubuntu: apt install ostree).
+        need ostree "install ostree to verify the committed PGO executable"
+        python3 bin/pgo_package.py committed "$PGO_MANIFEST" "$repo_dir" --arch "$ARCH"
     fi
 else
     [[ -d "$repo_dir" ]] || { echo "error: --skip-build but $repo_dir is missing; run a full build first" >&2; exit 1; }
