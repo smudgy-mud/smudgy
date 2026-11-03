@@ -39,13 +39,12 @@ PGO_DIAGNOSTIC = re.compile(
     r"^\s*(?:\x1b\[[0-9;]*m\s*)*(?:warning|error)\b.*(?:instrumentation profile|no profile data available"
     r"|control flow change detected|hash mismatch|inconsistent number of counts|profile data may be out of date)", re.I)
 # Darwin's linker drops dead functions together with their profile records
-# (https://reviews.llvm.org/D25456). Under fat LTO the standalone `std::rt::lang_start`
-# helpers are inlined into `main`, dead-stripped, and then reported at profile use as
-# having no data. Only that diagnostic, for those helpers, on Apple targets is reviewed;
-# it is recorded in the build receipt, never silenced, and anything else still fails.
-REVIEWED_DIAGNOSTICS = {
-    "darwin": re.compile(r"no profile data available for function \S*3std2rt10lang_start\S* Hash = \d+ up to 0 count discarded$"),
-}
+# (https://reviews.llvm.org/D25456), so a dead-stripped training binary flushes a
+# profile that lacks a record for every function it dropped and the profile-use
+# compile reports each one as having no data. The training binary therefore links
+# through bin/pgo-apple-link.sh, which removes `-dead_strip` and nothing else; the
+# profile-use build keeps rustc's default link line.
+INSTRUMENTED_LINK_FLAGS = {"darwin": (f"-Clinker={ROOT/'bin/pgo-apple-link.sh'}",)}
 # Base flags that would hide or reconfigure those diagnostics, or override PGO itself.
 MANAGED_FLAG_PREFIXES = ("-A", "--cap-lints", "-Cllvm-args", "-Cprofile", "-Zprofile")
 RESERVED_SCENARIO_VARIABLES = {"LLVM_PROFILE_FILE", "PGO_SCENARIO_OUTPUT", "PGO_EXECUTABLE"}
@@ -82,11 +81,9 @@ def worktree_status():
     return capture("git", "status", "--porcelain")
 
 
-def review_diagnostics(diagnostics, target):
-    """Split profile diagnostics into those needing investigation and the reviewed lines."""
-    pattern = REVIEWED_DIAGNOSTICS.get(TARGETS.get(target, ("",))[0])
-    reviewed = [line for line in diagnostics if pattern and pattern.search(line)]
-    return [line for line in diagnostics if line not in reviewed], reviewed
+def instrumented_link_flags(target):
+    """Extra flags for the profile-generate build only: keep every record alive."""
+    return list(INSTRUMENTED_LINK_FLAGS.get(TARGETS[target][0], ()))
 
 
 def deployment_target(target):
@@ -229,6 +226,8 @@ def build(run, stage, rustflags=(), target=None, allow_dirty=False):
     if stage == "generate":
         require(not any(flag.startswith(MANAGED_FLAG_PREFIXES) or "pgo-" in flag for flag in rustflags),
                 "PGO flags, lint levels, lint caps and LLVM arguments are managed by this tool")
+        require(not (instrumented_link_flags(target) and any(flag.startswith("-Clinker") for flag in rustflags)),
+                "The instrumented link is managed by this tool on Apple targets; -Clinker base flags are unsupported")
         # The recorded revision must describe the compiled bytes. A modified checkout is
         # allowed only for experiments, which packaging refuses.
         status = worktree_status()
@@ -239,7 +238,7 @@ def build(run, stage, rustflags=(), target=None, allow_dirty=False):
                       target=target, features=FEATURES, base_flags=list(rustflags), identity=current)
         write(run/"run.json", config)
         (run/"raw-unassigned").mkdir()
-        flags = [*rustflags, f"-Cprofile-generate={run/'raw-unassigned'}"]
+        flags = [*rustflags, *instrumented_link_flags(target), f"-Cprofile-generate={run/'raw-unassigned'}"]
     else:
         config = read(run/"run.json")
         require(current == config["identity"], "Source, toolchain, configuration or local dependencies changed; start a new PGO run")
@@ -269,27 +268,20 @@ def build(run, stage, rustflags=(), target=None, allow_dirty=False):
     require(result.returncode == 0, f"Build failed; see {output/'build.log'}")
     require(identity(target) == current, "Inputs changed during compilation; discard this run")
     log = (output/"build.log").read_text(encoding="utf-8", errors="replace")
-    diagnostics, reviewed = review_diagnostics([line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)], target)
+    diagnostics = [line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)]
     exe = output/target/"release-full"/executable_name(target)
-    manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics,
-                    reviewed_diagnostics=reviewed, inputs_verified=True)
+    manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics, inputs_verified=True)
     pdb = exe.with_suffix(".pdb")
     if pdb.exists():
         manifest.update(pdb=str(pdb), pdb_sha256=sha(pdb))
     write(output/"manifest.json", manifest)
     require(not diagnostics, f"PGO coverage diagnostics require investigation: {output/'build.log'}")
-    if reviewed:
-        print(f"{stage}: {len(reviewed)} reviewed Darwin startup-helper diagnostics recorded in the receipt", flush=True)
     print(json.dumps({key: manifest[key] for key in ("stage", "seconds", "executable")}), flush=True)
 
 
 def check_build_receipt(build, target=None):
     require(build.get("exit_code") == 0 and build.get("inputs_verified") and not build.get("pgo_diagnostics"), "Build is incomplete or has unresolved PGO diagnostics")
     require(target is None or build.get("target") == target, "Build target differs from PGO run")
-    # Reviewed lines are re-checked wherever the receipt is consumed, so a receipt cannot
-    # carry an unreviewed diagnostic under the reviewed label.
-    unreviewed, _ = review_diagnostics(build.get("reviewed_diagnostics", []), build.get("target"))
-    require(not unreviewed, "Build receipt lists diagnostics that are not reviewed for its target")
 
 
 def check_build(path, target=None):

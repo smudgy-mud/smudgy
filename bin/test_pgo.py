@@ -1,7 +1,10 @@
 """Failure-path tests for the PGO artifact and workload gates; no Rust build."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -335,47 +338,52 @@ class PgoTests(unittest.TestCase):
                 with self.subTest(portable=portable), self.assertRaisesRegex(RuntimeError, "modified checkout"):
                     pgo.verify_artifact(self.run/"dist/manifest.json", self.target, portable=portable)
 
-    def test_darwin_startup_helpers_are_the_only_reviewed_diagnostics(self):
-        helpers = [
-            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 0 count discarded",
-            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-            "_RNSNvYNCINvNtCsa9BKTri5B3M_3std2rt10lang_startuE0INtNtNtCsgtPOCBgevO_4core3ops8function6FnOnceuE9call_once6vtable"
-            "Cs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 0 count discarded",
-            # Legacy mangling names the same helper.
-            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-            "_ZN3std2rt10lang_start17h0123456789abcdefE Hash = 742261418966908927 up to 0 count discarded",
-        ]
-        others = [
-            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-            "_RNvCs5JAvRntY6Pu_6smudgy4main Hash = 1 up to 0 count discarded",
-            "warning: Function control flow change detected (hash mismatch) "
-            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 2",
-            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 7 count discarded",
-            "warning: /run/merged.profdata: invalid instrumentation profile data (bad magic)",
-        ]
-        for line in helpers + others:
-            self.assertTrue(pgo.PGO_DIAGNOSTIC.search(line), line)
+    def test_instrumented_link_keeps_dead_code_on_apple_targets_only(self):
+        script = str(pgo.ROOT/"bin/pgo-apple-link.sh")
+        self.assertTrue(Path(script).is_file())
         for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
-            with self.subTest(target=target):
-                self.assertEqual(pgo.review_diagnostics(helpers + others, target), (others, helpers))
-        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", None):
-            with self.subTest(target=target):
-                self.assertEqual(pgo.review_diagnostics(helpers + others, target), (helpers + others, []))
+            self.assertEqual(pgo.instrumented_link_flags(target), [f"-Clinker={script}"])
+        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            self.assertEqual(pgo.instrumented_link_flags(target), [])
+        # The generate receipt carries the link flag; the use build keeps the base flags only.
+        with patch.object(pgo, "toolchain_rustc", return_value=(self.run, self.run/"rustc")), \
+             patch.object(pgo.subprocess, "run", return_value=Mock(returncode=1)):
+            for target, link in (("aarch64-apple-darwin", [f"-Clinker={script}"]), (self.target, [])):
+                with self.subTest(target=target):
+                    run = self.run/f"link-{target}"
+                    with self.assertRaisesRegex(RuntimeError, "Build failed"):
+                        pgo.build(run, "generate", ["-Cdebuginfo=1"], target)
+                    self.assertEqual(pgo.read(run/"generate/manifest.json")["flags"],
+                                     ["-Cdebuginfo=1", *link, f"-Cprofile-generate={run/'raw-unassigned'}"])
+                    self.assertEqual(pgo.read(run/"run.json")["base_flags"], ["-Cdebuginfo=1"])
+            pgo.write(self.run/"run.json", dict(pgo.read(self.run/"run.json"), base_flags=["-Cdebuginfo=1"]))
+            shutil.rmtree(self.run/"use")
+            with self.assertRaisesRegex(RuntimeError, "Build failed"):
+                pgo.build(self.run, "use")
+        self.assertEqual(pgo.read(self.run/"use/manifest.json")["flags"],
+                         ["-Cdebuginfo=1", f"-Cprofile-use={self.run/'merged.profdata'}", "-Cllvm-args=-pgo-warn-missing-function"])
+        with self.assertRaisesRegex(RuntimeError, "instrumented link is managed"):
+            pgo.build(self.run/"linker", "generate", ["-Clinker=/usr/bin/clang"], "aarch64-apple-darwin")
 
-    def test_receipts_cannot_relabel_diagnostics_as_reviewed(self):
-        helper = ("warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-                  "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 7 up to 0 count discarded")
-        receipt = dict(target="aarch64-apple-darwin", exit_code=0, inputs_verified=True, pgo_diagnostics=[],
-                       reviewed_diagnostics=[helper])
-        pgo.check_build_receipt(receipt, "aarch64-apple-darwin")
-        with self.assertRaisesRegex(RuntimeError, "not reviewed"):
-            pgo.check_build_receipt(dict(receipt, target="x86_64-unknown-linux-gnu"), "x86_64-unknown-linux-gnu")
-        with self.assertRaisesRegex(RuntimeError, "not reviewed"):
-            pgo.check_build_receipt(dict(receipt, reviewed_diagnostics=[helper, helper.replace("10lang_start", "4main")]))
-        with self.assertRaisesRegex(RuntimeError, "unresolved"):
-            pgo.check_build_receipt(dict(receipt, pgo_diagnostics=[helper]))
+    @unittest.skipIf(sys.platform == "win32", "the Apple link script is a POSIX shell script")
+    def test_apple_link_script_removes_dead_strip_and_nothing_else(self):
+        fake = self.run/"fake-cc"
+        fake.mkdir()
+        (fake/"cc").write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+        (fake/"cc").chmod(0o755)
+        env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ['PATH']}")
+        script = str(pgo.ROOT/"bin/pgo-apple-link.sh")
+        linked = subprocess.run([script, "-arch", "arm64", "a b.o", "-Wl,-dead_strip", "-o", "out",
+                                 "-Wl,-exported_symbols_list,/tmp/x y"], env=env, capture_output=True, text=True)
+        self.assertEqual((linked.returncode, linked.stdout.splitlines()),
+                         (0, ["-arch", "arm64", "a b.o", "-o", "out", "-Wl,-exported_symbols_list,/tmp/x y"]))
+        for arguments, message in (([script, "a.o", "-o", "out"], "no -Wl,-dead_strip"),
+                                   ([script, "-Wl,-dead_strip", "@args.txt"], "response file")):
+            with self.subTest(arguments=arguments):
+                failed = subprocess.run(arguments, env=env, capture_output=True, text=True)
+                self.assertEqual(failed.returncode, 1)
+                self.assertIn(message, failed.stderr)
+                self.assertEqual(failed.stdout, "")
 
     def test_deployment_target_is_recorded_for_apple_slices_only(self):
         def capture(*command):

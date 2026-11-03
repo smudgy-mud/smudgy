@@ -79,14 +79,16 @@ an explicit target. Build-time processes cannot contribute to the accepted
 training set. Only profiles from successful training scenarios are merged.
 `generate` and `use` use separate Cargo output directories. Keep both and their
 logs until the result is accepted. PGO coverage diagnostics fail the build gate;
-investigate them rather than silently carrying stale profiles forward. One class is
-reviewed rather than fatal: on Apple targets, Darwin's linker discards dead functions
-together with their profile records ([LLVM explanation](https://reviews.llvm.org/D25456)),
-and under fat LTO the standalone `std::rt::lang_start` helpers are inlined into
-`main` and then stripped, so the use build reports them as having no profile data.
-Those lines, and only those, are recorded in the build receipt as
-`reviewed_diagnostics`, re-checked wherever the receipt is consumed, and never
-accepted for another target or another function.
+investigate them rather than silently carrying stale profiles forward. On Apple
+targets the instrumented `generate` build links through `bin/pgo-apple-link.sh`,
+which removes `-dead_strip` from rustc's link line and nothing else: Darwin's linker
+discards dead functions together with their profile records
+([LLVM explanation](https://reviews.llvm.org/D25456)), and a dead-stripped training
+binary flushes a profile that has no record for any of them, which the use build
+then reports for every one of the tens of thousands of dead functions in the
+application. The training binary keeps its dead code, as it does on Linux and
+Windows, so every record survives; the `use` build keeps rustc's default link line
+and is dead-stripped as usual. `-Clinker` base flags are refused on Apple targets.
 
 A scenario is an external JSON file:
 
@@ -287,13 +289,10 @@ thins each slice back out and proves the digests match, and records
 `vtool -show-build` for both. Probe runs have no workload receipts and can never
 be merged, exported or packaged. The smoke test compiles
 a tiny Rust program, collects profiles, merges them, builds with profile use,
-and verifies exact profile counts and matching outputs. For Rust 1.97.1 on Mac,
-the probe records and reports two narrowly identified startup-helper warnings:
-Darwin's linker can discard dead helpers and their profile records
-([LLVM explanation](https://reviews.llvm.org/D25456)). Unknown diagnostics and
-incorrect counts still fail. `pgo.py` reviews the same helpers by name pattern on
-Apple targets only, as described above; every other diagnostic in a full
-application build still requires investigation and cannot be exported.
+and verifies exact profile counts and matching outputs. Its instrumented build
+links through the same `bin/pgo-apple-link.sh` on Apple targets, so any
+diagnostic from the profile-use compile, on any target, fails the smoke, just as
+it fails the application build.
 
 It checks the Rust PGO toolchain, not Smudgy performance,
 native V8, Flatpak runtime compatibility, both Mac slices or signing. Native

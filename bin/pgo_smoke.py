@@ -13,16 +13,6 @@ import sys
 import pgo
 
 
-REVIEWED_COMPILER = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
-# These exact startup helpers were emitted before linking but absent from the
-# Mac probe profiles. Darwin can remove dead functions and their profile data:
-# https://reviews.llvm.org/D25456 . This is not an application-wide exception.
-MAC_STARTUP_CRATES = {
-    "aarch64-apple-darwin": ("Csa9BKTri5B3M", "CsgtPOCBgevO"),
-    "x86_64-apple-darwin": ("CsgejaSCmAoRz", "CsbAqs9W1eE8G"),
-}
-
-
 def check_probe_counts(profile):
     records = {name: [int(n) for n in counts.split(", ")] for name, counts in re.findall(
         r"^  (.+):\n    Hash: 0x[0-9a-f]+\n    Counters: \d+\n    Block counts: \[([0-9, ]+)\]$",
@@ -30,28 +20,6 @@ def check_probe_counts(profile):
     work = [counts for name, counts in records.items() if name.endswith("5probe4work")]
     pgo.require(records.get("main") == [2] and work == [[21001, 3001]],
                 "Probe profile must contain both process entries and exact work/branch counts")
-
-
-def check_use_diagnostics(stderr, target, compiler):
-    if not stderr.strip():
-        return []
-    pgo.require(target in MAC_STARTUP_CRATES and compiler.splitlines()[:1] == [REVIEWED_COMPILER],
-                "Unexpected profile-use diagnostics; inspect use.log")
-    std, core = MAC_STARTUP_CRATES[target]
-    helpers = {
-        f"_RINvNt{std}_3std2rt10lang_startuECs5JAvRntY6Pu_5probe",
-        f"_RNSNvYNCINvNt{std}_3std2rt10lang_startuE0INtNtNt{core}_4core3ops8function"
-        "6FnOnceuE9call_once6vtableCs5JAvRntY6Pu_5probe",
-    }
-    expected = {f"warning: probe.42cd7a695e74b762-cgu.0: no profile data available for function {name} "
-                "Hash = 742261418966908927 up to 0 count discarded" for name in helpers}
-    lines = [line for line in stderr.splitlines() if line.strip()]
-    diagnostics = lines[:-1]
-    pgo.require(diagnostics and len(diagnostics) == len(set(diagnostics))
-                and set(diagnostics) <= expected
-                and lines[-1] == f"warning: {len(diagnostics)} warning{'s' if len(diagnostics) != 1 else ''} emitted",
-                "Unexpected profile-use diagnostics; inspect use.log")
-    return diagnostics
 
 
 def smoke(output, target=None):
@@ -80,10 +48,12 @@ fn main() {
     env = dict(os.environ)
     env.pop("LLVM_PROFILE_FILE", None)
     # Exercise the same optimization pipeline as Cargo's release-full profile.
-    # LTO and partitioning affect which functions survive to instrumentation.
+    # LTO and partitioning affect which functions survive to instrumentation, and the
+    # instrumented link keeps dead code on Apple targets exactly as pgo.py does.
     command = ["rustc", str(source), "--target", target, "-Copt-level=3",
                "-Clto=fat", "-Ccodegen-units=1"]
-    subprocess.run([*command, f"-Cprofile-generate={raw}", "-o", str(generated)], env=env, check=True)
+    subprocess.run([*command, *pgo.instrumented_link_flags(target), f"-Cprofile-generate={raw}",
+                    "-o", str(generated)], env=env, check=True)
     results = {}
     for count in (2000, 19001):
         results[count] = subprocess.check_output([str(generated), str(count)], text=True,
@@ -103,14 +73,11 @@ fn main() {
         print(built.stdout, end="")
         print(built.stderr, end="", file=sys.stderr)
     pgo.require(built.returncode == 0, f"Inspect {output/'use.log'}")
-    reviewed = check_use_diagnostics(built.stderr, target, compiler)
-    if reviewed:
-        print(f"Reviewed {len(reviewed)} known Mac startup-helper diagnostics for this probe only; see use.log")
+    pgo.require(not built.stderr.strip(), f"Unexpected profile-use diagnostics; inspect {output/'use.log'}")
     for count, expected in results.items():
         actual = subprocess.check_output([str(optimized), str(count)], env=env, text=True).strip()
         pgo.require(actual == expected, "Optimized output differs from instrumented output")
-    pgo.write(output/"result.json", dict(target=target, compiler=compiler, reviewed_smoke_diagnostics=reviewed,
-        tool=str(tool), command=command, profile_sha256=pgo.sha(merged), summary=summary, outputs=results,
+    pgo.write(output/"result.json", dict(target=target, compiler=compiler, tool=str(tool), command=command, profile_sha256=pgo.sha(merged), summary=summary, outputs=results,
         executable_sha256=pgo.sha(optimized), passed=True))
     print(f"PASS: {target}; flushed {len(profiles)} profiles, merged, used, and verified both outputs")
 

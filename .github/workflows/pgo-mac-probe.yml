@@ -20,6 +20,8 @@ on:
     paths:
       - .github/workflows/pgo-mac-probe.yml
       - bin/pgo_probe.py
+      - bin/pgo.py
+      - bin/pgo-apple-link.sh
 
 concurrency:
   group: pgo-mac-probe-${{ github.ref }}
@@ -94,6 +96,7 @@ jobs:
             ${{ runner.temp }}/pgo-probe/merge.json
             ${{ runner.temp }}/pgo-probe/profile-summary.txt
             ${{ runner.temp }}/pgo-probe/generate/manifest.json
+            ${{ runner.temp }}/pgo-probe/generate/build.log
             ${{ runner.temp }}/pgo-probe/use/manifest.json
             ${{ runner.temp }}/pgo-probe/use/build.log
             ${{ runner.temp }}/pgo-probe/probe/result.json

@@ -1,4 +1,4 @@
-"""Probe coverage must remain strict outside reviewed Mac startup helpers."""
+"""The smoke exercises the same instrumented link as the application build and stays strict."""
 import ast
 import inspect
 import unittest
@@ -6,16 +6,19 @@ import unittest
 import pgo_smoke as smoke
 
 
-ARM_WARNING = (
-    "warning: probe.42cd7a695e74b762-cgu.0: no profile data available for function "
-    "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_5probe "
-    "Hash = 742261418966908927 up to 0 count discarded\nwarning: 1 warning emitted\n"
-)
-INTEL_WARNING = ARM_WARNING.replace("Csa9BKTri5B3M", "CsgejaSCmAoRz")
-
-
 def record(name, counts):
     return f"  {name}:\n    Hash: 0x123\n    Counters: {len(counts)}\n    Block counts: {counts}\n"
+
+
+def rustc_calls():
+    """The smoke's compiler invocations, keyed by the output they produce."""
+    calls = {}
+    for node in ast.walk(ast.parse(inspect.getsource(smoke))):
+        if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("subprocess.") \
+                and node.args and ast.unparse(node.args[0]).startswith("[*command"):
+            arguments = ast.unparse(node.args[0])
+            calls["generate" if "profile-generate" in arguments else "use"] = arguments
+    return calls
 
 
 class SmokeTests(unittest.TestCase):
@@ -35,47 +38,24 @@ class SmokeTests(unittest.TestCase):
             with self.subTest(profile=changed), self.assertRaises(RuntimeError):
                 smoke.check_probe_counts(changed)
 
-    def test_clean_compiler_output_needs_no_exception(self):
-        self.assertEqual(smoke.check_use_diagnostics("", "x86_64-pc-windows-msvc", "any compiler"), [])
+    def test_only_the_instrumented_build_links_through_the_apple_script(self):
+        # pgo.py adds the link flag to its generate stage alone; the smoke must mirror
+        # that, or a dead-stripped smoke probe would report Darwin's missing records
+        # that the application build no longer sees (or the reverse).
+        calls = rustc_calls()
+        self.assertEqual(sorted(calls), ["generate", "use"])
+        self.assertIn("*pgo.instrumented_link_flags(target)", calls["generate"])
+        self.assertNotIn("instrumented_link_flags", calls["use"])
+        self.assertIn("-Cllvm-args=-pgo-warn-missing-function", calls["use"])
+        self.assertNotIn("instrumented_link_flags", ast.unparse(ast.parse(inspect.getsource(smoke)))
+                         .split("profile-use", 1)[1])
 
-    def test_reviewed_helpers_are_target_specific(self):
-        for target, warning in (("aarch64-apple-darwin", ARM_WARNING),
-                                ("x86_64-apple-darwin", INTEL_WARNING)):
-            with self.subTest(target=target):
-                self.assertEqual(len(smoke.check_use_diagnostics(warning, target, smoke.REVIEWED_COMPILER)), 1)
-        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"):
-            with self.subTest(target=target), self.assertRaises(RuntimeError):
-                smoke.check_use_diagnostics(ARM_WARNING, target, smoke.REVIEWED_COMPILER)
-
-    def test_application_gate_reviews_exactly_the_helpers_the_smoke_reviews(self):
-        # The smoke pins exact names; pgo.py matches the helpers by pattern. Both must
-        # agree, on Apple targets only, or the application build would reject a line the
-        # probe accepted (or the reverse).
-        for target, warning in (("aarch64-apple-darwin", ARM_WARNING), ("x86_64-apple-darwin", INTEL_WARNING)):
-            lines = [line for line in warning.splitlines() if "no profile data" in line]
-            self.assertEqual(smoke.pgo.review_diagnostics(lines, target), ([], lines))
-        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"):
-            lines = ARM_WARNING.splitlines()[:1]
-            self.assertEqual(smoke.pgo.review_diagnostics(lines, target), (lines, []))
-        self.assertEqual(smoke.pgo.review_diagnostics([ARM_WARNING.splitlines()[0].replace("10lang_startuE", "4work")],
-                                                      "aarch64-apple-darwin")[1], [])
-
-    def test_changed_compiler_requires_new_review(self):
-        with self.assertRaises(RuntimeError):
-            smoke.check_use_diagnostics(ARM_WARNING, "aarch64-apple-darwin", "rustc 1.98.0")
-
-    def test_missing_application_function_is_not_reviewed(self):
-        with self.assertRaises(RuntimeError):
-            smoke.check_use_diagnostics(ARM_WARNING.replace("10lang_startuE", "4work"),
-                                        "aarch64-apple-darwin", smoke.REVIEWED_COMPILER)
-
-    def test_changed_hash_counts_or_additional_diagnostics_are_rejected(self):
-        for changed in (ARM_WARNING.replace("742261418966908927", "42"),
-                        ARM_WARNING.replace("up to 0", "up to 1"),
-                        ARM_WARNING + "warning: profile hash mismatch\n",
-                        ARM_WARNING + "warning: unrelated linker diagnostic\n"):
-            with self.subTest(diagnostic=changed), self.assertRaises(RuntimeError):
-                smoke.check_use_diagnostics(changed, "aarch64-apple-darwin", smoke.REVIEWED_COMPILER)
+    def test_any_profile_use_diagnostic_fails_the_smoke(self):
+        # No compiler, target or helper name is exempt: the smoke has no review list.
+        source = inspect.getsource(smoke)
+        for forbidden in ("REVIEWED", "lang_start", "MAC_STARTUP", "reviewed"):
+            self.assertNotIn(forbidden, source)
+        self.assertIn('pgo.require(not built.stderr.strip(), f"Unexpected profile-use diagnostics', source)
 
 
 if __name__ == "__main__":

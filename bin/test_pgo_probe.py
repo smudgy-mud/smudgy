@@ -35,11 +35,12 @@ class ProbeTests(unittest.TestCase):
             exe = output/self.target/"release-full"/"smudgy"
             exe.parent.mkdir(parents=True)
             exe.write_bytes(stage.encode())
-            unreviewed, reviewed = pgo.review_diagnostics(use_diagnostics if stage == "use" else [], self.target)
+            diagnostics = use_diagnostics if stage == "use" else []
+            flags = [*rustflags, *pgo.instrumented_link_flags(self.target)] if stage == "generate" else []
             pgo.write(output/"manifest.json", dict(stage=stage, target=self.target, exit_code=0, inputs_verified=True,
-                executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=unreviewed,
-                reviewed_diagnostics=reviewed, profile_sha256=pgo.sha(run/"merged.profdata") if stage == "use" else None))
-            pgo.require(not unreviewed, "PGO coverage diagnostics require investigation")
+                flags=flags, executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=diagnostics,
+                profile_sha256=pgo.sha(run/"merged.profdata") if stage == "use" else None))
+            pgo.require(not diagnostics, "PGO coverage diagnostics require investigation")
         return build
 
     def flushing_application(self, code=pgo_probe.USAGE_ERROR):
@@ -60,12 +61,11 @@ class ProbeTests(unittest.TestCase):
              patch.object(pgo_probe.subprocess, "check_output", return_value="Total functions: 1\n"):
             pgo_probe.probe(self.run, self.target)
 
-    def test_probe_records_reviewed_diagnostics_and_cannot_feed_a_release(self):
-        helper = ("warning: smudgy-cgu.0: no profile data available for function "
-                  "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 7 up to 0 count discarded")
-        self.probe([helper])
+    def test_probe_records_the_instrumented_link_and_cannot_feed_a_release(self):
+        self.probe([])
         result = pgo.read(self.run/"probe/result.json")
-        self.assertEqual((result["reviewed_diagnostics"], result["unreviewed_diagnostics"], result["error"]), ([helper], [], None))
+        self.assertEqual((result["diagnostics"], result["error"]), ([], None))
+        self.assertEqual(result["generate_flags"], [f"-Clinker={pgo.ROOT/'bin/pgo-apple-link.sh'}"])
         self.assertEqual(result["deployment_target"], "deployment_target=11.0")
         merge = pgo.read(self.run/"merge.json")
         self.assertEqual((merge["workloads"], merge["probe"]), ([], True))
@@ -74,13 +74,13 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No verified validation workloads"):
             pgo.export(self.run)
 
-    def test_probe_fails_on_unreviewed_diagnostics_but_keeps_the_evidence(self):
+    def test_probe_fails_on_diagnostics_but_keeps_the_evidence(self):
         missing = ("warning: smudgy-cgu.0: no profile data available for function "
-                   "_RNvCs5JAvRntY6Pu_6smudgy4main Hash = 1 up to 0 count discarded")
+                   "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 1 up to 0 count discarded")
         with self.assertRaisesRegex(RuntimeError, "require investigation"):
             self.probe([missing])
         result = pgo.read(self.run/"probe/result.json")
-        self.assertEqual(result["unreviewed_diagnostics"], [missing])
+        self.assertEqual(result["diagnostics"], [missing])
         self.assertIn("require investigation", result["error"])
 
     def test_probe_requires_the_usage_error_exit(self):

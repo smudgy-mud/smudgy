@@ -11,10 +11,6 @@ import pgo
 import pgo_package
 
 
-HELPER_WARNING = ("warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
-                  "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 7 up to 0 count discarded")
-
-
 # /.flatpak-info as flatpak 1.16 writes it inside `flatpak run <runtime>` (a [Runtime]
 # section) and inside `flatpak build` (an [Application] section naming both refs).
 # Refs carry their kind prefix; ephemeral paths and IDs are omitted here.
@@ -89,8 +85,7 @@ class PackageTests(unittest.TestCase):
                         build=dict(target=target, exit_code=0, inputs_verified=True,
                                    executable_sha256=digest, profile_sha256="profile digest",
                                    flags=["-Cdebuginfo=1", f"-Cprofile-use=/runs/{target}/merged.profdata",
-                                          "-Cllvm-args=-pgo-warn-missing-function"],
-                                   reviewed_diagnostics=[HELPER_WARNING] if darwin else []),
+                                          "-Cllvm-args=-pgo-warn-missing-function"]),
                         training=[dict(scenario_sha256="trained scenario", inputs={"/corpus.log": "trained corpus"})],
                         validation=[dict(exit_code=0, verification_exit_code=0,
                                          executable_sha256=digest, scenario_sha256="held-out scenario",

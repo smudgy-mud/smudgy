@@ -4,10 +4,11 @@ report which functions the profile-use compile found no data for.
 This never trains a release profile. The only workload is a usage error (`--data-dir`
 without a value): the application exits through the C runtime before opening a window,
 which still runs the instrumentation's atexit writer, so one profile is flushed that
-holds a record for every function that survived linking. The use build therefore reports
-exactly the structural gaps, such as Darwin's dead-stripped startup helpers, that
-`pgo.py` must either review or reject. A probe run has no training or validation
-receipts: `merge`, `export`, `verify` and packaging refuse it.
+holds a record for every function the instrumented link kept. The use build therefore
+reports exactly the structural gaps, if any, that `pgo.py` would reject in a release
+build; on Apple targets it is the evidence that linking the training binary without
+`-dead_strip` (bin/pgo-apple-link.sh) leaves none. A probe run has no training or
+validation receipts: `merge`, `export`, `verify` and packaging refuse it.
 """
 import argparse
 import json
@@ -60,13 +61,12 @@ def probe(run, target=None, rustflags=()):
                   compiler=config["identity"]["compiler"], deployment_target=config["identity"].get("deployment_target"),
                   host=f"{platform.system()} {platform.release()} {platform.machine()}", use_exit_code=built.get("exit_code"), use_seconds=built.get("seconds"),
                   executable=built.get("executable"), executable_sha256=built.get("executable_sha256"),
-                  reviewed_diagnostics=built.get("reviewed_diagnostics", []),
-                  unreviewed_diagnostics=built.get("pgo_diagnostics", []), error=error)
+                  generate_flags=pgo.read(run/"generate/manifest.json")["flags"],
+                  diagnostics=built.get("pgo_diagnostics", []), error=error)
     pgo.write(output/"result.json", result)
-    print(json.dumps({key: result[key] for key in ("target", "use_exit_code", "reviewed_diagnostics",
-                                                   "unreviewed_diagnostics", "error")}, indent=2), flush=True)
+    print(json.dumps({key: result[key] for key in ("target", "use_exit_code", "diagnostics", "error")}, indent=2), flush=True)
     pgo.require(error is None, error)
-    print(f"PASS: {config['target']} profile-use build reports only reviewed diagnostics")
+    print(f"PASS: {config['target']} profile-use build reports no diagnostics")
 
 
 if __name__ == "__main__":
