@@ -110,9 +110,8 @@ def source_files():
             if name and (ROOT/name).is_file()}
 
 
-def flatpak_environment():
+def flatpak_environment(path=Path("/.flatpak-info")):
     """Keep stable SDK identity, excluding ephemeral sandbox instance IDs."""
-    path = Path("/.flatpak-info")
     if not path.is_file():
         return None
     info = configparser.ConfigParser(interpolation=None)

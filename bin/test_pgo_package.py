@@ -10,7 +10,46 @@ import pgo
 import pgo_package
 
 
+# /.flatpak-info as flatpak 1.16 writes it inside `flatpak run <runtime>` (a [Runtime]
+# section) and inside `flatpak build` (an [Application] section naming both refs).
+# Refs carry their kind prefix; ephemeral paths and IDs are omitted here.
+RUNTIME_INFO = """[Runtime]
+name={name}
+runtime=runtime/{name}/{arch}/{branch}
+
+[Instance]
+runtime-commit=b7aba340fd291e08bf26442d43a0e4adb6733da5a06d47ff4296a964af40cc8a
+branch={branch}
+arch={arch}
+flatpak-version=1.16.6
+session-bus-proxy=true
+system-bus-proxy=true
+extra-args=--usb-list=;--usb-list=;
+
+[Environment]
+ALSA_CONFIG_PATH=/usr/share/alsa/alsa-flatpak.conf
+XDG_DATA_DIRS=/app/share:/usr/share:/usr/share/runtime/share:/run/host/user-share:/run/host/share
+PYTHONUSERBASE=/var/data/python
+"""
+BUILD_INFO = """[Application]
+name=org.smudgy.Smudgy
+runtime=runtime/org.freedesktop.Platform/{arch}/{branch}
+sdk=runtime/org.freedesktop.Sdk/{arch}/{branch}
+
+[Instance]
+branch={branch}
+arch={arch}
+flatpak-version=1.16.6
+"""
+
+
 class PackageTests(unittest.TestCase):
+    def flatpak_info(self, template, **fields):
+        """Parse a real-format /.flatpak-info through the helper's own reader."""
+        path = self.root/"flatpak-info"
+        path.write_text(template.format(**fields), encoding="utf-8")
+        return pgo.flatpak_environment(path)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -70,7 +109,8 @@ class PackageTests(unittest.TestCase):
         original = yaml.safe_load(self.base.read_text(encoding="utf-8"))
         for arch in ("x86_64", "aarch64"):
             with self.subTest(arch=arch):
-                sdk = {"Runtime": {"runtime": f"org.freedesktop.Sdk/{arch}/25.08"}}
+                sdk = self.flatpak_info(RUNTIME_INFO, name="org.freedesktop.Sdk", arch=arch, branch="25.08")
+                self.assertEqual(sdk["Runtime"]["runtime"], f"runtime/org.freedesktop.Sdk/{arch}/25.08")
                 path = self.artifact(f"{arch}-unknown-linux-gnu", sdk)
                 output = self.root/"overlays"/arch/"manifest.json"
                 pgo_package.flatpak(path, arch, self.base, output, "25.08")
@@ -88,14 +128,27 @@ class PackageTests(unittest.TestCase):
                 self.assertFalse(overlay["build-options"]["strip"])
                 self.assertTrue(overlay["build-options"]["no-debuginfo"])
 
+    def test_flatpak_build_sandbox_identity_is_accepted(self):
+        sdk = self.flatpak_info(BUILD_INFO, arch="x86_64", branch="25.08")
+        self.assertEqual(sdk["Application"]["sdk"], "runtime/org.freedesktop.Sdk/x86_64/25.08")
+        path = self.artifact("x86_64-unknown-linux-gnu", sdk)
+        pgo_package.flatpak(path, "x86_64", self.base, self.root/"overlay.json")
+        self.assertTrue((self.root/"overlay.json").exists())
+
     def test_flatpak_rejects_host_or_wrong_sdk(self):
         path = self.artifact("x86_64-unknown-linux-gnu")
         original = pgo.read(path)
-        for sdk in (None, {"Runtime": {"runtime": "org.freedesktop.Sdk/x86_64/24.08"}},
-                    {"Runtime": {"runtime": "org.freedesktop.Sdk/aarch64/25.08"}}):
+        cases = [
+            ("host", None),
+            ("platform not sdk", self.flatpak_info(RUNTIME_INFO, name="org.freedesktop.Platform", arch="x86_64", branch="25.08")),
+            ("old branch", self.flatpak_info(RUNTIME_INFO, name="org.freedesktop.Sdk", arch="x86_64", branch="24.08")),
+            ("other arch", self.flatpak_info(RUNTIME_INFO, name="org.freedesktop.Sdk", arch="aarch64", branch="25.08")),
+            ("build on old branch", self.flatpak_info(BUILD_INFO, arch="x86_64", branch="24.08")),
+        ]
+        for label, sdk in cases:
             original["build_identity"]["flatpak"] = sdk
             pgo.write(path, original)
-            with self.subTest(sdk=sdk), self.assertRaisesRegex(RuntimeError, "release SDK"):
+            with self.subTest(case=label), self.assertRaisesRegex(RuntimeError, "release SDK"):
                 pgo_package.flatpak(path, "x86_64", self.base, self.root/"overlay.json")
         self.assertFalse((self.root/"overlay.json").exists())
 

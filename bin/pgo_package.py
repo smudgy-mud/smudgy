@@ -34,8 +34,9 @@ def flatpak(manifest_path, arch, base_path, output, runtime_version=None):
                 "Runtime override differs from the Flatpak manifest")
     expected_sdk = f"{base['sdk']}/{arch}/{base['runtime-version']}"
     sdk = manifest["build_identity"].get("flatpak") or {}
-    refs = [value for section in ("Application", "Runtime") for key, value in sdk.get(section, {}).items()
-            if key in {"runtime", "sdk"}]
+    # /.flatpak-info records refs with their kind prefix: runtime/<id>/<arch>/<branch>.
+    refs = [value.removeprefix("runtime/") for section in ("Application", "Runtime")
+            for key, value in sdk.get(section, {}).items() if key in {"runtime", "sdk"}]
     pgo.require(expected_sdk in refs, f"Train/build Linux PGO inside the release SDK: {expected_sdk}")
     pgo.require(len(base["modules"]) == 1 and base["modules"][0]["name"] == "smudgy",
                 "Review the PGO overlay after changing Flatpak modules")
