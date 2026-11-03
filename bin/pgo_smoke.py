@@ -57,8 +57,7 @@ def check_use_diagnostics(stderr, target, compiler):
 def smoke(output, target=None):
     target = pgo.native_target(target)
     compiler = pgo.capture("rustc", "-vV")
-    tool = pgo.profdata_tool()
-    pgo.require(tool.is_file(), "Install llvm-tools-preview for the repository toolchain")
+    tool = pgo.profdata_tool(compiler)
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     source = output/"probe.rs"

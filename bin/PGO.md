@@ -91,8 +91,12 @@ List immutable inputs using absolute paths. The verifier runs from the scenario
 file's directory after a normal application exit, with `PGO_SCENARIO_OUTPUT` and
 `PGO_EXECUTABLE` in its environment. It must fail on incomplete work, wrong trigger
 counts, wrong results or ordering. Training profiles are flushed on normal exit;
-force-killing the application is not an accepted training run. The helper owns
-`LLVM_PROFILE_FILE` and uses process/module-specific profile filenames.
+force-killing the application is not an accepted training run, and neither is a
+run that flushes no profile. The helper owns `LLVM_PROFILE_FILE` and uses
+process/module-specific profile filenames. It seals the collected profile before
+the verifier starts and runs the verifier without `LLVM_PROFILE_FILE`, so nothing
+the verifier launches can add to or alter the profile; a changed raw profile
+directory fails the run.
 
 Training should cover more than a counter callback benchmark:
 
@@ -123,8 +127,13 @@ python3 bin/pgo.py export /path/to/run
 ```
 
 Export requires successful verification and all four categories: `replay`,
-`captures`, `interactive`, `heldout`. It preserves the executable and its mode,
-and copies a PDB if present. Keep the original build directories for other debug
+`captures`, `interactive`, `heldout`. Every `heldout` scenario must differ from
+all training scenarios and declare at least one input file whose hash never
+appeared in training, and every training scenario must declare its inputs. Inputs
+are declared by the scenario author, so this gate checks the declarations for
+consistency rather than proving data separation. The training evidence is
+recorded in the export so packaging can re-check it. Export preserves the executable and its mode, and
+copies and hashes a PDB if present. Keep the original build directories for other debug
 artifacts, including macOS object files/dSYMs; export does not generate dSYMs.
 Measure the optimized executable against an ordinary build of the same source,
 features and native archive. Do not benchmark during compilation. Compare exact
@@ -132,7 +141,17 @@ results, latency distributions, CPU and memory on both training and held-out
 workloads. No fixed performance gain is assumed across platforms.
 
 Schema 2 exports contain target, source hashes, build identity, profile digest,
-and validation receipts. Local `verify` also rechecks the original build/run.
+validation receipts, training evidence and the source revision. Every `verify`,
+portable or not, requires the packaging checkout to be at that revision; local
+`verify` also rechecks the original build/run.
+
+The helper pins Cargo to the PATH-selected toolchain's own `rustc` and requires
+the toolchain's `llvm-profdata` to report the same LLVM release (rustup's tools
+add a `-rust-<version>-<channel>` suffix, which is ignored). Builds run with
+`cargo -vv` and plain output, which lifts Cargo's lint cap on dependency crates
+so their profile diagnostics are reported too; expect a verbose build log. Base
+flags that set lint levels, cap lints, pass LLVM arguments or select profiles are
+rejected because they could hide or redirect those diagnostics.
 `verify --portable --target TARGET` permits moving the complete `dist` directory
 between **trusted** build/package runners. It checks binary hashes, consistent
 target/build/validation receipts and byte-identical checkout files without

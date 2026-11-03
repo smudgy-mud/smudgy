@@ -374,7 +374,7 @@ def main() -> None:
                 for target in node.targets)
     ]
     expected_pgo_command = ast.parse(
-        '["cargo", "build", "--locked", "--profile", "release-full", "--target", target, '
+        '["cargo", "build", "-vv", "--locked", "--profile", "release-full", "--target", target, '
         '"-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]',
         mode="eval",
     ).body

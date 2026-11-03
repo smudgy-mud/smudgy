@@ -1,4 +1,6 @@
 """Probe coverage must remain strict outside reviewed Mac startup helpers."""
+import ast
+import inspect
 import unittest
 
 import pgo_smoke as smoke
@@ -17,6 +19,14 @@ def record(name, counts):
 
 
 class SmokeTests(unittest.TestCase):
+    def test_smoke_resolves_profdata_with_the_compiler_it_records(self):
+        # The helper gates llvm-profdata on rustc's LLVM release; the smoke must hand it
+        # the same `rustc -vV` text it records, or every CI probe job fails before building.
+        calls = [node for node in ast.walk(ast.parse(inspect.getsource(smoke)))
+                 if isinstance(node, ast.Call) and ast.unparse(node.func) == "pgo.profdata_tool"]
+        self.assertEqual([ast.unparse(arg) for call in calls for arg in call.args], ["compiler"])
+        self.assertEqual(len(inspect.signature(smoke.pgo.profdata_tool).parameters), 1)
+
     def test_exact_counts_from_both_training_processes(self):
         profile = record("main", [2]) + record("module;_RNvCs5JAvRntY6Pu_5probe4work", [21001, 3001])
         smoke.check_probe_counts(profile)

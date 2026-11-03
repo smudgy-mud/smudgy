@@ -29,6 +29,9 @@ class PgoTests(unittest.TestCase):
         self.patch_target = patch.object(pgo, "native_target", side_effect=lambda target=None: target or self.target)
         self.patch_target.start()
         self.addCleanup(self.patch_target.stop)
+        self.patch_revision = patch.object(pgo, "head_revision", return_value="test")
+        self.patch_revision.start()
+        self.addCleanup(self.patch_revision.stop)
         (self.run/"merged.profdata").write_bytes(b"profile")
         self.training_record = dict(exit_code=0, verification_exit_code=0, scenario_sha256="trained-scenario",
                                     inputs={"C:/workloads/corpus.log": "trained-corpus"},
@@ -240,22 +243,30 @@ class PgoTests(unittest.TestCase):
         record = pgo.read(self.run/"training/tampered/manifest.json")
         self.assertEqual(len(record["raw"]), 1)
 
-    def test_profdata_must_come_from_the_rustc_llvm(self):
+    def fake_toolchain(self, host, platform):
+        """A sysroot holding the host's rustc and llvm-profdata, with capture answering for both."""
         sysroot = self.run/"sysroot"
-        tool = sysroot/f"lib/rustlib/{pgo.TARGET}/bin/llvm-profdata.exe"
-        tool.parent.mkdir(parents=True)
+        suffix = ".exe" if platform == "win32" else ""
+        tool = sysroot/"lib/rustlib"/host/"bin"/f"llvm-profdata{suffix}"
+        tool.parent.mkdir(parents=True, exist_ok=True)
         tool.write_bytes(b"")
-        (sysroot/"bin").mkdir()
-        (sysroot/"bin"/("rustc.exe" if sys.platform == "win32" else "rustc")).write_bytes(b"")
+        (sysroot/"bin").mkdir(exist_ok=True)
+        (sysroot/"bin"/f"rustc{suffix}").write_bytes(b"")
 
         def capture(*command):
             if command == ("rustc", "--print", "sysroot"):
                 return str(sysroot)
+            if command == ("rustc", "-vV"):
+                return f"rustc 1.97.1 (abc 2026-10-01)\nhost: {host}\nLLVM version: 22.1.6"
             if command == (str(tool), "--version"):
                 # rustup's llvm-tools carry the Rust release suffix; rustc -vV does not.
                 return "LLVM (http://llvm.org/):\n  LLVM version 22.1.6-rust-1.97.1-stable\n  Optimized build."
             raise AssertionError(command)
 
+        return tool, capture
+
+    def test_profdata_must_come_from_the_rustc_llvm(self):
+        tool, capture = self.fake_toolchain(self.target, sys.platform)
         with patch.object(pgo, "capture", capture):
             with self.assertRaisesRegex(RuntimeError, "same LLVM release"):
                 pgo.profdata_tool("rustc 1.97.1 (abc 2026-10-01)\nhost: x86_64-pc-windows-msvc\nLLVM version: 22.1.5")
@@ -369,8 +380,10 @@ class PgoTests(unittest.TestCase):
 
     def test_profdata_uses_host_tool_and_platform_suffix(self):
         for target, (platform, _) in pgo.TARGETS.items():
-            with self.subTest(target=target), patch.object(pgo, "host_target", return_value=target), patch.object(pgo.sys, "platform", platform), patch.object(pgo, "capture", return_value=str(self.run)):
-                tool = pgo.profdata_tool()
+            expected, capture = self.fake_toolchain(target, platform)
+            with self.subTest(target=target), patch.object(pgo.sys, "platform", platform), patch.object(pgo, "capture", capture):
+                tool = pgo.profdata_tool(capture("rustc", "-vV"))
+                self.assertEqual(tool, expected)
                 self.assertEqual(tool.parent.parent.name, target)
                 self.assertEqual(tool.name, "llvm-profdata.exe" if platform == "win32" else "llvm-profdata")
 

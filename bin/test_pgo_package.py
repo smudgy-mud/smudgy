@@ -20,6 +20,9 @@ class PackageTests(unittest.TestCase):
         self.source_patch = patch.object(pgo, "source_files", return_value=self.sources)
         self.source_patch.start()
         self.addCleanup(self.source_patch.stop)
+        self.revision_patch = patch.object(pgo, "head_revision", return_value="validated-commit")
+        self.revision_patch.start()
+        self.addCleanup(self.revision_patch.stop)
 
     def artifact(self, target, sdk=None):
         directory = self.root/target
@@ -28,14 +31,16 @@ class PackageTests(unittest.TestCase):
         exe.write_bytes(b"validated executable")
         exe.chmod(0o755)
         digest = pgo.sha(exe)
-        manifest = dict(schema=2, stage="validated-pgo", target=target,
+        manifest = dict(schema=2, stage="validated-pgo", target=target, revision="validated-commit",
                         executable_name=exe.name, executable_sha256=digest,
                         profile_sha256="profile digest",
                         build_identity=dict(files=self.sources, target=target, flatpak=sdk),
                         build=dict(target=target, exit_code=0, inputs_verified=True,
                                    executable_sha256=digest, profile_sha256="profile digest"),
+                        training=[dict(scenario_sha256="trained scenario", inputs={"/corpus.log": "trained corpus"})],
                         validation=[dict(exit_code=0, verification_exit_code=0,
-                                         executable_sha256=digest,
+                                         executable_sha256=digest, scenario_sha256="held-out scenario",
+                                         inputs={"/heldout.log": "unseen corpus"},
                                          scenario=dict(categories=["replay", "captures", "heldout", "interactive"]))])
         path = directory/"manifest.json"
         pgo.write(path, manifest)
