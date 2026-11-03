@@ -80,6 +80,9 @@ repo_root="$(pwd)"
 if [[ -n "$PGO_ARM64" ]]; then
     python3 bin/pgo.py verify "$PGO_ARM64" --portable --target aarch64-apple-darwin >/dev/null
     python3 bin/pgo.py verify "$PGO_X86_64" --portable --target x86_64-apple-darwin >/dev/null
+    # Both slices must come from one frozen checkout, toolchain, flag set and SDK
+    # environment, and each must record the deployment target it was linked for.
+    python3 bin/pgo_package.py pair "$PGO_ARM64" "$PGO_X86_64"
 fi
 
 # --- prerequisite checks ----------------------------------------------------
@@ -155,11 +158,28 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> cargo patch-crate --force"
     cargo patch-crate --force
 
-    if [[ -z "$PGO_ARM64" ]]; then
-        echo "==> Generating embedded third-party notices"
-        cargo about generate --workspace --features smudgy_ui/web-audio-cpal \
-            --locked about.hbs -o THIRD-PARTY-NOTICES.md
-        python3 bin/normalize-third-party-notices.py
+    # The validated exports compiled the committed notices in, so in PGO mode the
+    # regeneration must reproduce them byte for byte; the original bytes are restored
+    # on any failure (mirrors release.ps1).
+    pgo_notice_backup=""
+    if [[ -n "$PGO_ARM64" ]]; then
+        pgo_notice_backup="$out_dir/THIRD-PARTY-NOTICES.validated.md"
+        cp THIRD-PARTY-NOTICES.md "$pgo_notice_backup"
+        trap 'cp "$pgo_notice_backup" THIRD-PARTY-NOTICES.md' EXIT
+    fi
+    echo "==> Generating embedded third-party notices"
+    cargo about generate --workspace --features smudgy_ui/web-audio-cpal \
+        --locked about.hbs -o THIRD-PARTY-NOTICES.md
+    python3 bin/normalize-third-party-notices.py
+    if [[ -n "$pgo_notice_backup" ]]; then
+        cmp -s THIRD-PARTY-NOTICES.md "$pgo_notice_backup" || {
+            echo "error: regenerated third-party notices differ from the ones compiled into the validated PGO exports;" >&2
+            echo "       commit the regenerated notices and run a fresh PGO cycle" >&2
+            exit 1
+        }
+        trap - EXIT
+        rm -f "$pgo_notice_backup"
+        echo "==> Third-party notices match the validated PGO exports"
     fi
 
     # Make sure both darwin targets are installed (no-op if already present).
@@ -252,6 +272,12 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
         chmod +x "$macos_dir/$bin"
         assert_universal "$macos_dir/$bin"
     done
+    if [[ -n "$PGO_ARM64" ]]; then
+        # Thin each slice back out of the fused binary and compare it with its export,
+        # recording the pre-signature universal digest (signing changes the bytes later).
+        python3 bin/pgo_package.py universal "$macos_dir/smudgy" --arm64 "$PGO_ARM64" --x86_64 "$PGO_X86_64" \
+            --receipt "$out_dir/pgo-universal.json"
+    fi
 else
     for bin in smudgy smudgy_inspector; do
         [[ -f "$macos_dir/$bin" ]] || { echo "error: --skip-build but $macos_dir/$bin is missing; run a full build first" >&2; exit 1; }

@@ -24,7 +24,10 @@ Use Python 3.11+ and the repository's pinned Rust toolchain. Install its matchin
 merger with `rustup component add llvm-tools-preview`. Install the normal native
 build dependencies. Materialize dependency patches with `cargo patch-crate
 --force`, and generate/normalize the shipping third-party notices **before** the
-first instrumented build. Notices are compiled into the executable.
+first instrumented build. Notices are compiled into the executable, so commit them:
+`generate` refuses a modified checkout, because the commit it records must describe
+the bytes that ship. `--allow-dirty` starts an experiment whose export records the
+modification and is refused by every packaging path.
 
 Freeze source, Cargo.lock, generated patches, Cargo configuration, compiler,
 native archives, and build flags for the whole cycle. Local dependency contents
@@ -43,7 +46,10 @@ and command arguments are recorded: do not put secrets in them. Use isolated
 test data homes instead of a personal profile directory.
 
 On macOS, pin Xcode/SDK and `MACOSX_DEPLOYMENT_TARGET` before training. Both slices
-must satisfy the deployment target promised by the final bundle. On Linux,
+must satisfy the deployment target promised by the final bundle; each export records
+`rustc --print deployment-target` for its slice, and packaging requires both
+exports to share one revision, toolchain, flag set, Cargo configuration, local
+dependency contents and SDK environment before fusing them. On Linux,
 perform the complete cycle **inside the matching release Flatpak SDK**, with the
 required Rust toolchain and llvm-tools installed there. A host-built Ubuntu
 binary is not a substitute: it can link against a newer glibc. `/.flatpak-info`
@@ -73,7 +79,14 @@ an explicit target. Build-time processes cannot contribute to the accepted
 training set. Only profiles from successful training scenarios are merged.
 `generate` and `use` use separate Cargo output directories. Keep both and their
 logs until the result is accepted. PGO coverage diagnostics fail the build gate;
-investigate them rather than silently carrying stale profiles forward.
+investigate them rather than silently carrying stale profiles forward. One class is
+reviewed rather than fatal: on Apple targets, Darwin's linker discards dead functions
+together with their profile records ([LLVM explanation](https://reviews.llvm.org/D25456)),
+and under fat LTO the standalone `std::rt::lang_start` helpers are inlined into
+`main` and then stripped, so the use build reports them as having no profile data.
+Those lines, and only those, are recorded in the build receipt as
+`reviewed_diagnostics`, re-checked wherever the receipt is consumed, and never
+accepted for another target or another function.
 
 A scenario is an external JSON file:
 
@@ -157,7 +170,9 @@ between **trusted** build/package runners. It checks binary hashes, consistent
 target/build/validation receipts and byte-identical checkout files without
 requiring the original absolute build paths. This is an integrity check, not an
 artifact signature or proof that an untrusted runner executed the stated tests.
-Preserve executable permissions when transferring Unix artifacts.
+A packaging runner compiles nothing, so its own toolchain and Cargo configuration
+are deliberately not compared: the bytes are pinned by hash and the source by file
+hashes. Preserve executable permissions when transferring Unix artifacts.
 
 Existing schema 1 Windows exports remain usable with their original helper.
 They cannot be relabeled schema 2: create a fresh run for the new portable format.
@@ -221,9 +236,16 @@ bin/release-mac.sh --pgo-arm64 /path/to/arm/dist/manifest.json \
   --pgo-x86_64 /path/to/intel/dist/manifest.json
 ```
 
-Both exports are required. The inspector is built normally. Cargo-bundle's
-verified `CARGO_BUNDLE_SKIP_BUILD` support prevents rebuilding the app. Both thin
-binaries are checked again before `lipo` combines them. Signing changes the
+Both exports are required and must pair (`pgo_package.py pair`): one revision,
+compiler, Cargo, helper, base flags, Cargo configuration and local dependency
+contents, and the same `MACOSX_DEPLOYMENT_TARGET`/`SDKROOT`/compiler environment.
+The third-party notices are regenerated and must reproduce the committed bytes the
+exports compiled in; on a mismatch the originals are restored and packaging stops.
+The inspector is built normally. Cargo-bundle's verified `CARGO_BUNDLE_SKIP_BUILD`
+support prevents rebuilding the app. Both thin binaries are checked again before
+`lipo` combines them, and each slice is thinned back out of the fused binary and
+compared with its export; `target/release-mac/pgo-universal.json` records the
+pre-signature universal digest and both deployment targets. Signing changes the
 staged bundle; the validated exports remain intact. Smoke-test the resulting
 universal app on **both** architectures, including package loading and JIT use.
 
@@ -236,8 +258,11 @@ bin/release-linux.sh --arch aarch64 --pgo-manifest /path/to/arm/dist/manifest.js
 ```
 
 The generated Flatpak overlay retains the release assets and sandbox grants,
-installs the validated binary, and disables debug extraction/stripping. The
-installed binary is checked again after Flatpak Builder finishes. The original
+installs the validated binary, disables debug extraction/stripping, and drops the
+module's build-time network grant since it compiles nothing. The installed binary
+is checked again after Flatpak Builder finishes, and the executable inside the
+exported ostree commit (what `build-bundle` ships) is hashed through `ostree cat`
+(`pgo_package.py committed`; the host `ostree`, else the Builder's). The original
 manifest remains unchanged. Neither Unix PGO path accepts `--skip-build`.
 
 Windows retains `bin/release.ps1 -PgoManifest <manifest>` and now explicitly
@@ -253,15 +278,22 @@ python3 bin/pgo_smoke.py --output /path/to/fresh-smoke-run
 ```
 
 The CI tooling matrix covers all five targets, with separate native Intel/ARM
-Mac and Linux jobs. The smoke test compiles
+Mac and Linux jobs. The `PGO Mac probe` workflow (`workflow_dispatch`) goes further
+on GitHub's native Apple Silicon and Intel runners: `bin/pgo_probe.py` builds the
+real application with profile generation, flushes one profile through the
+`--data-dir` usage-error exit (no window, no training), builds with profile use,
+and reports every diagnostic; a second job fuses the two use builds with `lipo`,
+thins each slice back out and proves the digests match, and records
+`vtool -show-build` for both. Probe runs have no workload receipts and can never
+be merged, exported or packaged. The smoke test compiles
 a tiny Rust program, collects profiles, merges them, builds with profile use,
 and verifies exact profile counts and matching outputs. For Rust 1.97.1 on Mac,
 the probe records and reports two narrowly identified startup-helper warnings:
 Darwin's linker can discard dead helpers and their profile records
 ([LLVM explanation](https://reviews.llvm.org/D25456)). Unknown diagnostics and
-incorrect counts still fail. This probe-only exception does not relax `pgo.py`:
-full application builds with any PGO coverage diagnostics still require
-investigation and cannot be exported by this helper.
+incorrect counts still fail. `pgo.py` reviews the same helpers by name pattern on
+Apple targets only, as described above; every other diagnostic in a full
+application build still requires investigation and cannot be exported.
 
 It checks the Rust PGO toolchain, not Smudgy performance,
 native V8, Flatpak runtime compatibility, both Mac slices or signing. Native

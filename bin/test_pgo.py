@@ -22,7 +22,8 @@ class PgoTests(unittest.TestCase):
         self.run = Path(self.temp.name)
         self.target = "x86_64-pc-windows-msvc"
         self.identity = {"source": "same", "target": self.target, "files": {"source.rs": "digest"}}
-        pgo.write(self.run/"run.json", {"identity": self.identity, "revision": "test", "target": self.target})
+        pgo.write(self.run/"run.json", {"identity": self.identity, "revision": "test", "target": self.target,
+                                        "worktree_status": ""})
         self.patch_identity = patch.object(pgo, "identity", return_value=self.identity)
         self.patch_identity.start()
         self.addCleanup(self.patch_identity.stop)
@@ -32,6 +33,9 @@ class PgoTests(unittest.TestCase):
         self.patch_revision = patch.object(pgo, "head_revision", return_value="test")
         self.patch_revision.start()
         self.addCleanup(self.patch_revision.stop)
+        self.patch_status = patch.object(pgo, "worktree_status", return_value="")
+        self.patch_status.start()
+        self.addCleanup(self.patch_status.stop)
         (self.run/"merged.profdata").write_bytes(b"profile")
         self.training_record = dict(exit_code=0, verification_exit_code=0, scenario_sha256="trained-scenario",
                                     inputs={"C:/workloads/corpus.log": "trained-corpus"},
@@ -306,6 +310,82 @@ class PgoTests(unittest.TestCase):
         with patch.object(pgo, "toolchain_rustc", side_effect=RuntimeError("stop before cargo")):
             with self.assertRaisesRegex(RuntimeError, "stop before cargo"):
                 pgo.build(self.run/"fresh-ok", "generate", ["-Cdebuginfo=1", "-Ctarget-cpu=x86-64-v3"])
+
+    def test_modified_checkout_cannot_start_a_run_unless_marked_as_an_experiment(self):
+        with patch.object(pgo, "worktree_status", return_value=" M ui/src/lib.rs"):
+            with self.assertRaisesRegex(RuntimeError, "Commit or stash"):
+                pgo.build(self.run/"fresh-dirty", "generate", [])
+            self.assertFalse((self.run/"fresh-dirty").exists())
+            with patch.object(pgo, "toolchain_rustc", side_effect=RuntimeError("stop before cargo")):
+                with self.assertRaisesRegex(RuntimeError, "stop before cargo"):
+                    pgo.build(self.run/"fresh-experiment", "generate", [], allow_dirty=True)
+        config = pgo.read(self.run/"fresh-experiment/run.json")
+        self.assertEqual((config["worktree_status"], config["allow_dirty"]), (" M ui/src/lib.rs", True))
+
+    def test_experiment_exports_cannot_be_packaged(self):
+        self.validation()
+        pgo.export(self.run)
+        manifest = pgo.read(self.run/"dist/manifest.json")
+        self.assertEqual(manifest["worktree_status"], "")
+        with patch.object(pgo, "source_files", return_value=self.identity["files"]):
+            pgo.verify_artifact(self.run/"dist/manifest.json", self.target, portable=True)
+            manifest["worktree_status"] = " M ui/src/lib.rs"
+            pgo.write(self.run/"dist/manifest.json", manifest)
+            for portable in (True, False):
+                with self.subTest(portable=portable), self.assertRaisesRegex(RuntimeError, "modified checkout"):
+                    pgo.verify_artifact(self.run/"dist/manifest.json", self.target, portable=portable)
+
+    def test_darwin_startup_helpers_are_the_only_reviewed_diagnostics(self):
+        helpers = [
+            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 0 count discarded",
+            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+            "_RNSNvYNCINvNtCsa9BKTri5B3M_3std2rt10lang_startuE0INtNtNtCsgtPOCBgevO_4core3ops8function6FnOnceuE9call_once6vtable"
+            "Cs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 0 count discarded",
+            # Legacy mangling names the same helper.
+            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+            "_ZN3std2rt10lang_start17h0123456789abcdefE Hash = 742261418966908927 up to 0 count discarded",
+        ]
+        others = [
+            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+            "_RNvCs5JAvRntY6Pu_6smudgy4main Hash = 1 up to 0 count discarded",
+            "warning: Function control flow change detected (hash mismatch) "
+            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 2",
+            "warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+            "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 742261418966908927 up to 7 count discarded",
+            "warning: /run/merged.profdata: invalid instrumentation profile data (bad magic)",
+        ]
+        for line in helpers + others:
+            self.assertTrue(pgo.PGO_DIAGNOSTIC.search(line), line)
+        for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+            with self.subTest(target=target):
+                self.assertEqual(pgo.review_diagnostics(helpers + others, target), (others, helpers))
+        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", None):
+            with self.subTest(target=target):
+                self.assertEqual(pgo.review_diagnostics(helpers + others, target), (helpers + others, []))
+
+    def test_receipts_cannot_relabel_diagnostics_as_reviewed(self):
+        helper = ("warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+                  "_RINvNtCsa9BKTri5B3M_3std2rt10lang_startuECs5JAvRntY6Pu_6smudgy Hash = 7 up to 0 count discarded")
+        receipt = dict(target="aarch64-apple-darwin", exit_code=0, inputs_verified=True, pgo_diagnostics=[],
+                       reviewed_diagnostics=[helper])
+        pgo.check_build_receipt(receipt, "aarch64-apple-darwin")
+        with self.assertRaisesRegex(RuntimeError, "not reviewed"):
+            pgo.check_build_receipt(dict(receipt, target="x86_64-unknown-linux-gnu"), "x86_64-unknown-linux-gnu")
+        with self.assertRaisesRegex(RuntimeError, "not reviewed"):
+            pgo.check_build_receipt(dict(receipt, reviewed_diagnostics=[helper, helper.replace("10lang_start", "4main")]))
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            pgo.check_build_receipt(dict(receipt, pgo_diagnostics=[helper]))
+
+    def test_deployment_target_is_recorded_for_apple_slices_only(self):
+        def capture(*command):
+            self.assertEqual(command[:4], ("rustc", "--print", "deployment-target", "--target"))
+            return {"aarch64-apple-darwin": "deployment_target=11.0", "x86_64-apple-darwin": "deployment_target=10.12"}[command[4]]
+        with patch.object(pgo, "capture", capture):
+            self.assertEqual(pgo.deployment_target("aarch64-apple-darwin"), "deployment_target=11.0")
+            self.assertEqual(pgo.deployment_target("x86_64-apple-darwin"), "deployment_target=10.12")
+            self.assertIsNone(pgo.deployment_target("x86_64-pc-windows-msvc"))
+            self.assertIsNone(pgo.deployment_target("aarch64-unknown-linux-gnu"))
 
     def test_training_without_declared_inputs_cannot_anchor_heldout_evidence(self):
         merge = pgo.read(self.run/"merge.json")

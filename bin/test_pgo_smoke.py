@@ -47,6 +47,19 @@ class SmokeTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaises(RuntimeError):
                 smoke.check_use_diagnostics(ARM_WARNING, target, smoke.REVIEWED_COMPILER)
 
+    def test_application_gate_reviews_exactly_the_helpers_the_smoke_reviews(self):
+        # The smoke pins exact names; pgo.py matches the helpers by pattern. Both must
+        # agree, on Apple targets only, or the application build would reject a line the
+        # probe accepted (or the reverse).
+        for target, warning in (("aarch64-apple-darwin", ARM_WARNING), ("x86_64-apple-darwin", INTEL_WARNING)):
+            lines = [line for line in warning.splitlines() if "no profile data" in line]
+            self.assertEqual(smoke.pgo.review_diagnostics(lines, target), ([], lines))
+        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"):
+            lines = ARM_WARNING.splitlines()[:1]
+            self.assertEqual(smoke.pgo.review_diagnostics(lines, target), (lines, []))
+        self.assertEqual(smoke.pgo.review_diagnostics([ARM_WARNING.splitlines()[0].replace("10lang_startuE", "4work")],
+                                                      "aarch64-apple-darwin")[1], [])
+
     def test_changed_compiler_requires_new_review(self):
         with self.assertRaises(RuntimeError):
             smoke.check_use_diagnostics(ARM_WARNING, "aarch64-apple-darwin", "rustc 1.98.0")

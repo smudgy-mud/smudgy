@@ -24,6 +24,7 @@ they could hide or redirect those diagnostics.
 rustup component add llvm-tools-preview
 cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
 python bin/normalize-third-party-notices.py
+git commit -m "Regenerate third-party notices" THIRD-PARTY-NOTICES.md
 python bin/pgo.py generate C:/pgo/run-001 --rustflag=-Cdebuginfo=1
 python bin/pgo.py train C:/pgo/run-001 --label replay --scenario C:/workloads/replay.json
 python bin/pgo.py train C:/pgo/run-001 --label captures --scenario C:/workloads/captures.json
@@ -78,7 +79,9 @@ latency, exact callback vectors, total CPU and multi-session behavior distinct.
 Generation and use share `release-full`, the Windows x64 target, audio feature
 graph and explicit base flags. Keep source, toolchain, local patches, configuration
 and symbol settings unchanged. The generated notices are embedded in the app;
-prepare them before generation and keep them unchanged through packaging. The helper checks these inputs, records every stage,
+prepare and commit them before generation and keep them unchanged through packaging:
+`generate` refuses a modified checkout so the recorded commit describes the shipped
+bytes (`--allow-dirty` starts an experiment that packaging refuses). The helper checks these inputs, records every stage,
 merges dense profiles with the toolchain's LLVM tool and rejects unresolved profile
 diagnostics. Use a new run directory after a failure or input change; do not clean
 the checkout or silently reuse old profile data. `-Cdebuginfo=1` retains a PDB for

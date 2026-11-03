@@ -38,6 +38,14 @@ EMBEDDED_COMMIT_VARIABLES = ("SMUDGY_GIT_COMMIT", "GITHUB_SHA", "CI_COMMIT_SHA")
 PGO_DIAGNOSTIC = re.compile(
     r"^\s*(?:\x1b\[[0-9;]*m\s*)*(?:warning|error)\b.*(?:instrumentation profile|no profile data available"
     r"|control flow change detected|hash mismatch|inconsistent number of counts|profile data may be out of date)", re.I)
+# Darwin's linker drops dead functions together with their profile records
+# (https://reviews.llvm.org/D25456). Under fat LTO the standalone `std::rt::lang_start`
+# helpers are inlined into `main`, dead-stripped, and then reported at profile use as
+# having no data. Only that diagnostic, for those helpers, on Apple targets is reviewed;
+# it is recorded in the build receipt, never silenced, and anything else still fails.
+REVIEWED_DIAGNOSTICS = {
+    "darwin": re.compile(r"no profile data available for function \S*3std2rt10lang_start\S* Hash = \d+ up to 0 count discarded$"),
+}
 # Base flags that would hide or reconfigure those diagnostics, or override PGO itself.
 MANAGED_FLAG_PREFIXES = ("-A", "--cap-lints", "-Cllvm-args", "-Cprofile", "-Zprofile")
 RESERVED_SCENARIO_VARIABLES = {"LLVM_PROFILE_FILE", "PGO_SCENARIO_OUTPUT", "PGO_EXECUTABLE"}
@@ -72,6 +80,20 @@ def head_revision():
 
 def worktree_status():
     return capture("git", "status", "--porcelain")
+
+
+def review_diagnostics(diagnostics, target):
+    """Split profile diagnostics into those needing investigation and the reviewed lines."""
+    pattern = REVIEWED_DIAGNOSTICS.get(TARGETS.get(target, ("",))[0])
+    reviewed = [line for line in diagnostics if pattern and pattern.search(line)]
+    return [line for line in diagnostics if line not in reviewed], reviewed
+
+
+def deployment_target(target):
+    """The minimum OS version rustc links Apple slices for, honouring MACOSX_DEPLOYMENT_TARGET."""
+    if TARGETS[target][0] != "darwin":
+        return None
+    return capture("rustc", "--print", "deployment-target", "--target", target)
 
 
 def toolchain_rustc():
@@ -195,19 +217,25 @@ def identity(target=None):
         "CC", "CXX", "CL", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LIB", "INCLUDE",
         "MACOSX_DEPLOYMENT_TARGET", "SDKROOT", *EMBEDDED_COMMIT_VARIABLES)}
     return dict(compiler=capture("rustc", "-vV"), cargo=capture("cargo", "-V"),
-                target=target, files=files, configs=configs, local_dependencies=local_dependencies,
+                target=target, deployment_target=deployment_target(target),
+                files=files, configs=configs, local_dependencies=local_dependencies,
                 native_inputs=native_inputs(target), flatpak=flatpak_environment(),
                 native_environment=native_environment, helper_sha256=sha(__file__))
 
 
-def build(run, stage, rustflags=(), target=None):
+def build(run, stage, rustflags=(), target=None, allow_dirty=False):
     target = native_target(target if stage == "generate" else read(run/"run.json")["target"])
     current = identity(target)
     if stage == "generate":
-        run.mkdir(parents=True, exist_ok=False)
         require(not any(flag.startswith(MANAGED_FLAG_PREFIXES) or "pgo-" in flag for flag in rustflags),
                 "PGO flags, lint levels, lint caps and LLVM arguments are managed by this tool")
-        config = dict(source=str(ROOT), revision=head_revision(), worktree_status=worktree_status(),
+        # The recorded revision must describe the compiled bytes. A modified checkout is
+        # allowed only for experiments, which packaging refuses.
+        status = worktree_status()
+        require(allow_dirty or not status,
+                "Commit or stash local changes before PGO; --allow-dirty starts an experiment that cannot be packaged")
+        run.mkdir(parents=True, exist_ok=False)
+        config = dict(source=str(ROOT), revision=head_revision(), worktree_status=status, allow_dirty=allow_dirty,
                       target=target, features=FEATURES, base_flags=list(rustflags), identity=current)
         write(run/"run.json", config)
         (run/"raw-unassigned").mkdir()
@@ -241,21 +269,27 @@ def build(run, stage, rustflags=(), target=None):
     require(result.returncode == 0, f"Build failed; see {output/'build.log'}")
     require(identity(target) == current, "Inputs changed during compilation; discard this run")
     log = (output/"build.log").read_text(encoding="utf-8", errors="replace")
-    diagnostics = [line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)]
+    diagnostics, reviewed = review_diagnostics([line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)], target)
     exe = output/target/"release-full"/executable_name(target)
     manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics,
-                    inputs_verified=True)
+                    reviewed_diagnostics=reviewed, inputs_verified=True)
     pdb = exe.with_suffix(".pdb")
     if pdb.exists():
         manifest.update(pdb=str(pdb), pdb_sha256=sha(pdb))
     write(output/"manifest.json", manifest)
     require(not diagnostics, f"PGO coverage diagnostics require investigation: {output/'build.log'}")
+    if reviewed:
+        print(f"{stage}: {len(reviewed)} reviewed Darwin startup-helper diagnostics recorded in the receipt", flush=True)
     print(json.dumps({key: manifest[key] for key in ("stage", "seconds", "executable")}), flush=True)
 
 
 def check_build_receipt(build, target=None):
     require(build.get("exit_code") == 0 and build.get("inputs_verified") and not build.get("pgo_diagnostics"), "Build is incomplete or has unresolved PGO diagnostics")
     require(target is None or build.get("target") == target, "Build target differs from PGO run")
+    # Reviewed lines are re-checked wherever the receipt is consumed, so a receipt cannot
+    # carry an unreviewed diagnostic under the reviewed label.
+    unreviewed, _ = review_diagnostics(build.get("reviewed_diagnostics", []), build.get("target"))
+    require(not unreviewed, "Build receipt lists diagnostics that are not reviewed for its target")
 
 
 def check_build(path, target=None):
@@ -446,6 +480,7 @@ def verify_artifact(path, target=None, portable=False):
     require("training" in manifest, "Export predates held-out training evidence; export again with this helper")
     # Packaging must happen at the validated commit, whether or not the run directory is present.
     require(head_revision() == manifest["revision"], "Packaging checkout revision differs from the validated PGO run")
+    require(not manifest.get("worktree_status"), "Export was built from a modified checkout (--allow-dirty) and cannot be packaged")
     if portable:
         require(target is not None, "Portable verification requires an explicit target")
         require(source_files() == manifest["build_identity"]["files"], "Packaging source differs from validated PGO inputs")
@@ -488,13 +523,15 @@ def main():
     parser.add_argument("--scenario", type=Path)
     parser.add_argument("--target", choices=sorted(TARGETS), help="Generation target (defaults to native host), or expected export target")
     parser.add_argument("--portable", action="store_true", help="Verify a trusted runner export without its original build directory; requires --target and identical source files")
+    parser.add_argument("--allow-dirty", action="store_true", help="Generate from a modified checkout for an experiment; such exports cannot be packaged")
     args = parser.parse_args()
     require(not args.portable or args.stage == "verify", "--portable is only for verification")
     require(args.target is None or args.stage in {"generate", "verify"}, "Later stages inherit the generation target")
+    require(not args.allow_dirty or args.stage == "generate", "--allow-dirty is decided when the run is generated")
     run = args.path.resolve()
     if args.stage in {"generate", "use"}:
         require(args.stage == "generate" or not args.rustflag, "Use inherits the generation flags")
-        build(run, args.stage, args.rustflag, args.target)
+        build(run, args.stage, args.rustflag, args.target, args.allow_dirty)
     elif args.stage in {"train", "validate"}:
         require(args.label and args.scenario, "Supply --label and --scenario")
         workload(run, args.label, args.scenario.resolve(), args.stage == "train")
