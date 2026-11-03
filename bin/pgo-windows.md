@@ -8,8 +8,11 @@ source tree or under its ignored `target/` directory.
 
 Cargo must use the same PATH-selected rustc that supplies the profile merger.
 Compiler/wrapper overrides (including Cargo configuration equivalents) are
-rejected. Flatten configuration includes before starting a new run so all
-configuration inputs are fingerprinted.
+rejected; the helper pins Cargo to that toolchain's own `rustc` and requires
+`llvm-profdata` to report the same LLVM version. Flatten configuration includes
+before starting a new run so all configuration inputs are fingerprinted. Builds
+run with `cargo -vv` so dependency crates report profile diagnostics too; the
+build log is correspondingly verbose.
 
 ```powershell
 rustup component add llvm-tools-preview
@@ -44,16 +47,21 @@ command. For example:
 
 Use fresh output locations for each scenario. The collector launches the shipping
 desktop executable; a workload driver or a human performs the scenario and closes
-the application normally. Forced termination is a failed run. The verifier runs
-after exit, receives `PGO_SCENARIO_OUTPUT` and `PGO_EXECUTABLE`, and must return
-nonzero for incomplete runs, incorrect callback counts or other failed assertions.
+the application normally. Forced termination is a failed run, and so is a training
+run that flushes no profile. The verifier runs after exit, receives
+`PGO_SCENARIO_OUTPUT` and `PGO_EXECUTABLE`, and must return nonzero for incomplete
+runs, incorrect callback counts or other failed assertions. The collected profile
+is sealed before the verifier starts and the verifier runs without
+`LLVM_PROFILE_FILE`, so nothing it launches can add to or alter the profile.
 It should retain its detailed results under that output directory. Scenarios and
 verifiers are trusted executable inputs, not a sandbox. Keep private data outside
 the public checkout. The helper does not provide an unattended UI driver.
 
 Training must cover replay, capture delivery and representative interactive use
 (startup, settings, terminal interaction and mapper activity). Validation must also
-cover a held-out workload absent from training. Categories attest to the supplied
+cover a held-out workload absent from training: export requires every `heldout`
+scenario to differ from all training scenarios and to declare at least one input
+file whose hash never appeared in training. Categories attest to the supplied
 scenario; review the verifier and evidence, rather than relying on the label alone.
 Measure foreground replay in balanced blocks after compilation finishes; keep
 latency, exact callback vectors, total CPU and multi-session behavior distinct.
@@ -74,10 +82,13 @@ To package a validated export, pass its manifest explicitly in **both** phases:
 ./bin/release.ps1 -SkipBuild -PgoManifest C:/pgo/run-001/dist/manifest.json
 ```
 
-Packaging checks identity and hashes, signs a staging copy, and passes that exact
-executable path to Inno Setup. The PGO lane packages the fingerprinted notices
-without regenerating them, matching the text embedded in the validated app. The validated unsigned executable and symbols stay
-intact. The inspector sidecar uses its ordinary release build. Signing and release
+Packaging checks identity, hashes and the checkout revision, signs a staging copy,
+and passes that exact executable path to Inno Setup. The build phase records the
+manifest it staged under `target/pgo-package/`; a later `-SkipBuild` without
+`-PgoManifest`, or with a different manifest, is refused until that marker is
+removed. The PGO lane regenerates the notices and requires them to be
+byte-identical to the fingerprinted file embedded in the validated app. The
+validated unsigned executable and symbols stay intact. The inspector sidecar uses its ordinary release build. Signing and release
 publication remain separate from PGO training and validation. Other architectures
 and operating systems need independent training and validation before adoption.
 

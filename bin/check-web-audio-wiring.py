@@ -374,7 +374,7 @@ def main() -> None:
                 for target in node.targets)
     ]
     expected_pgo_command = ast.parse(
-        '["cargo", "build", "--locked", "--profile", "release-full", "--target", TARGET, '
+        '["cargo", "build", "-vv", "--locked", "--profile", "release-full", "--target", TARGET, '
         '"-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]',
         mode="eval",
     ).body
@@ -383,6 +383,14 @@ def main() -> None:
         and ast.dump(build_commands[0]) == ast.dump(expected_pgo_command),
         "PGO build must retain the reviewed application command and feature selection",
     )
+    command_mutations = [
+        node for node in ast.walk(build_functions[0])
+        if (isinstance(node, (ast.AugAssign, ast.AnnAssign))
+            and isinstance(node.target, ast.Name) and node.target.id == "command")
+        or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "command")
+    ]
+    require(not command_mutations, "PGO build command must not be modified after its reviewed assignment")
     notice_command = (
         "cargo about generate --workspace "
         f"--features {RELEASE_FEATURE} --locked about.hbs "

@@ -31,10 +31,20 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 $pgo = $null
+# A PGO -BuildOnly phase records the manifest it staged, so the -SkipBuild phase
+# cannot silently fall back to whatever ordinary binary sits in target/.
+$pgoPending = Join-Path $repoRoot 'target\pgo-package\pending-manifest.txt'
 if ($PgoManifest) {
+    $PgoManifest = (Resolve-Path -LiteralPath $PgoManifest).Path
     $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest
     if ($LASTEXITCODE -ne 0) { throw 'PGO artifact verification failed' }
     $pgo = $verified | ConvertFrom-Json
+    if ($SkipBuild -and (Test-Path -LiteralPath $pgoPending)) {
+        $pending = (Get-Content -LiteralPath $pgoPending -Raw).Trim()
+        if ($pending -ne $PgoManifest) { throw "A PGO build phase is pending for $pending; pass that manifest or delete $pgoPending" }
+    }
+} elseif ($SkipBuild -and (Test-Path -LiteralPath $pgoPending)) {
+    throw "A PGO build phase is pending for $((Get-Content -LiteralPath $pgoPending -Raw).Trim()); pass -PgoManifest, or delete $pgoPending to package an ordinary build"
 }
 
 $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
@@ -95,14 +105,25 @@ if (-not $SkipBuild) {
     cargo patch-crate --force
     if ($LASTEXITCODE -ne 0) { throw "cargo patch-crate failed" }
 
-    # The PGO app embeds the notice used during training. Its input fingerprint
-    # verifies that same file, so package it without regenerating it here.
-    if (-not $pgo) {
-        Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
-        cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
-        if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
-        python bin/normalize-third-party-notices.py
-        if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    # The PGO app embeds the notice used during training, and its input
+    # fingerprint pins that text. Regenerate anyway and require the result to be
+    # byte-identical: a stale committed notice must not ride a validated build.
+    $notice = Join-Path $repoRoot 'THIRD-PARTY-NOTICES.md'
+    $pgoNotice = $null
+    if ($pgo) {
+        $pgoNotice = [System.IO.File]::ReadAllBytes($notice)
+        $pgoNoticeHash = (Get-FileHash -LiteralPath $notice -Algorithm SHA256).Hash
+    }
+    Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
+    cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
+    if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
+    python bin/normalize-third-party-notices.py
+    if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
+    if ($pgo) {
+        if ((Get-FileHash -LiteralPath $notice -Algorithm SHA256).Hash -ne $pgoNoticeHash) {
+            [System.IO.File]::WriteAllBytes($notice, $pgoNotice)
+            throw 'THIRD-PARTY-NOTICES.md is stale for the current Cargo.lock and release features; regenerate it and start a new PGO run'
+        }
     }
     Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
     # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
@@ -133,6 +154,10 @@ foreach ($f in @($exe, $inspector)) {
 }
 
 if ($BuildOnly) {
+    if ($pgo) {
+        New-Item -ItemType Directory -Force (Split-Path -Parent $pgoPending) | Out-Null
+        Set-Content -LiteralPath $pgoPending -Value $PgoManifest -Encoding utf8
+    }
     Write-Host "==> Build complete (-BuildOnly); signing/packaging deferred" -ForegroundColor Green
     exit 0
 }
@@ -188,4 +213,5 @@ foreach ($f in @($exe, $inspector, $setup)) {
     if ($sig.Status -ne 'Valid') { throw "signature on $f is $($sig.Status)" }
 }
 
+if ($pgo -and (Test-Path -LiteralPath $pgoPending)) { Remove-Item -LiteralPath $pgoPending }
 Write-Host "==> Done: $setup" -ForegroundColor Green

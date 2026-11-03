@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("pgo", Path(__file__).with_name("pgo.py"))
 pgo = importlib.util.module_from_spec(spec)
@@ -24,7 +24,16 @@ class PgoTests(unittest.TestCase):
         self.patch_identity = patch.object(pgo, "identity", return_value={"source": "same"})
         self.patch_identity.start()
         self.addCleanup(self.patch_identity.stop)
+        self.patch_revision = patch.object(pgo, "head_revision", return_value="test")
+        self.patch_revision.start()
+        self.addCleanup(self.patch_revision.stop)
         (self.run/"merged.profdata").write_bytes(b"profile")
+        self.training_record = dict(exit_code=0, verification_exit_code=0, scenario_sha256="trained-scenario",
+                                    inputs={"C:/workloads/corpus.log": "trained-corpus"},
+                                    scenario={"categories": ["replay", "captures", "interactive"]},
+                                    raw={"smudgy-1-1.profraw": "counts"})
+        pgo.write(self.run/"merge.json", dict(sha256=pgo.sha(self.run/"merged.profdata"), raw={},
+                                              workloads=[self.training_record]))
         for stage in ("generate", "use"):
             directory = self.run/stage
             directory.mkdir()
@@ -34,11 +43,12 @@ class PgoTests(unittest.TestCase):
                 executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=[],
                 profile_sha256=pgo.sha(self.run/"merged.profdata") if stage == "use" else None))
 
-    def validation(self, categories=None):
+    def validation(self, categories=None, scenario_sha256="heldout-scenario", inputs=None):
         output = self.run/"validation/test"
         output.mkdir(parents=True)
         pgo.write(output/"manifest.json", dict(exit_code=0, verification_exit_code=0,
-            executable_sha256=pgo.sha(self.run/"use/smudgy.exe"),
+            executable_sha256=pgo.sha(self.run/"use/smudgy.exe"), scenario_sha256=scenario_sha256,
+            inputs={"C:/workloads/heldout.log": "unseen-corpus"} if inputs is None else inputs,
             scenario={"categories": categories or ["replay", "captures", "heldout", "interactive"]}))
 
     def test_export_verifies_and_preserves_exact_artifact(self):
@@ -112,9 +122,138 @@ class PgoTests(unittest.TestCase):
         output.mkdir(parents=True)
         pgo.write(output/"manifest.json", dict(exit_code=0, verification_exit_code=0,
             executable_sha256=pgo.sha(self.run/"generate/smudgy.exe"),
-            scenario={"categories": ["replay"]}, raw={}))
+            scenario={"categories": ["replay"]}, raw={"smudgy-1-1.profraw": "counts"}))
+        (self.run/"merge.json").unlink()
         with self.assertRaisesRegex(RuntimeError, "interactive coverage"):
             pgo.merge(self.run)
+
+    def test_training_run_without_a_profile_cannot_count_toward_coverage(self):
+        output = self.run/"training/silent"
+        output.mkdir(parents=True)
+        pgo.write(output/"manifest.json", dict(exit_code=0, verification_exit_code=0,
+            executable_sha256=pgo.sha(self.run/"generate/smudgy.exe"),
+            scenario={"categories": ["replay", "captures", "interactive"]}, raw={}))
+        (self.run/"merge.json").unlink()
+        with self.assertRaisesRegex(RuntimeError, "No profile was collected"):
+            pgo.merge(self.run)
+
+    def test_heldout_scenario_reused_from_training_cannot_export(self):
+        self.validation(scenario_sha256=self.training_record["scenario_sha256"])
+        with self.assertRaisesRegex(RuntimeError, "Held-out scenario was used in training"):
+            pgo.export(self.run)
+        self.assertFalse((self.run/"dist").exists())
+
+    def test_heldout_scenario_without_unseen_inputs_cannot_export(self):
+        for inputs in ({}, dict(self.training_record["inputs"])):
+            with self.subTest(inputs=inputs):
+                self.validation(inputs=inputs)
+                with self.assertRaisesRegex(RuntimeError, "input file absent from training"):
+                    pgo.export(self.run)
+                (self.run/"validation/test/manifest.json").unlink()
+                (self.run/"validation/test").rmdir()
+
+    def test_packaging_from_another_revision_is_rejected(self):
+        self.validation()
+        pgo.export(self.run)
+        with patch.object(pgo, "head_revision", return_value="another-commit"):
+            with self.assertRaisesRegex(RuntimeError, "revision differs"):
+                pgo.verify_artifact(self.run/"dist/manifest.json")
+
+    def test_export_records_and_verifies_symbols(self):
+        pdb = self.run/"use/smudgy.pdb"
+        pdb.write_bytes(b"symbols")
+        manifest = pgo.read(self.run/"use/manifest.json")
+        manifest.update(pdb=str(pdb), pdb_sha256=pgo.sha(pdb))
+        pgo.write(self.run/"use/manifest.json", manifest)
+        self.validation()
+        pgo.export(self.run)
+        exported = pgo.read(self.run/"dist/manifest.json")
+        self.assertEqual(exported["pdb_sha256"], pgo.sha(pdb))
+        pgo.verify_artifact(self.run/"dist/manifest.json")
+        (self.run/"dist/smudgy.pdb").write_bytes(b"other symbols")
+        with self.assertRaisesRegex(RuntimeError, "symbols hash mismatch"):
+            pgo.verify_artifact(self.run/"dist/manifest.json")
+
+    def collected_workload(self, label, verifier):
+        scenario = self.run/"scenario.json"
+        pgo.write(scenario, {"verify": ["verifier"], "categories": ["replay"]})
+        output = self.run/"training"/label
+
+        def launch(command, cwd, env, stdout, stderr):
+            self.assertTrue(env["LLVM_PROFILE_FILE"].startswith(str(output/"raw")))
+            (output/"raw/smudgy-1-1.profraw").write_bytes(b"counts")
+            return Mock(pid=1, wait=Mock(return_value=0))
+
+        with patch.object(pgo.subprocess, "Popen", side_effect=launch), \
+             patch.object(pgo.subprocess, "run", side_effect=verifier):
+            pgo.workload(self.run, label, scenario, True)
+        return output
+
+    def test_verifier_runs_without_profile_collection(self):
+        seen = {}
+
+        def verifier(command, cwd, env, stdout, stderr):
+            seen["env"] = env
+            return Mock(returncode=0)
+
+        output = self.collected_workload("clean", verifier)
+        self.assertNotIn("LLVM_PROFILE_FILE", seen["env"])
+        self.assertEqual(seen["env"]["PGO_SCENARIO_OUTPUT"], str(output))
+        record = pgo.read(output/"manifest.json")
+        self.assertEqual(list(record["raw"]), [str(output/"raw/smudgy-1-1.profraw")])
+        self.assertEqual(record["verification_exit_code"], 0)
+
+    def test_verifier_that_alters_the_profile_fails_the_run(self):
+        def verifier(command, cwd, env, stdout, stderr):
+            (self.run/"training/tampered/raw/smudgy-2-2.profraw").write_bytes(b"verifier counts")
+            return Mock(returncode=0)
+
+        with self.assertRaisesRegex(RuntimeError, "Verifier altered the collected profile"):
+            self.collected_workload("tampered", verifier)
+        record = pgo.read(self.run/"training/tampered/manifest.json")
+        self.assertEqual(len(record["raw"]), 1)
+
+    def test_profdata_must_come_from_the_rustc_llvm(self):
+        sysroot = self.run/"sysroot"
+        tool = sysroot/f"lib/rustlib/{pgo.TARGET}/bin/llvm-profdata.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"")
+        (sysroot/"bin").mkdir()
+        (sysroot/"bin"/("rustc.exe" if sys.platform == "win32" else "rustc")).write_bytes(b"")
+
+        def capture(*command):
+            if command == ("rustc", "--print", "sysroot"):
+                return str(sysroot)
+            if command == (str(tool), "--version"):
+                return "LLVM (http://llvm.org/):\n  LLVM version 18.1.8\n  Optimized build."
+            raise AssertionError(command)
+
+        with patch.object(pgo, "capture", capture):
+            with self.assertRaisesRegex(RuntimeError, "same LLVM"):
+                pgo.profdata_tool("rustc 1.97.1\nLLVM version: 19.1.7")
+            self.assertEqual(pgo.profdata_tool("rustc 1.97.1\nLLVM version: 18.1.8"), tool)
+
+    def test_pgo_diagnostics_match_llvm_warnings_not_the_command_echo(self):
+        diagnostics = [
+            "warning: C:\\src\\lib.rs: no profile data available for function _ZN3foo3bar Hash = 1",
+            "warning: Function control flow change detected (hash mismatch) _ZN3foo3baz Hash = 2",
+            "warning: Inconsistent number of counts in _ZN3foo3qux: the profile may be stale",
+            "  warning: profile data may be out of date for function _ZN3foo3fin",
+        ]
+        noise = [
+            "     Running `rustc --crate-name smudgy -Cprofile-use=C:/pgo/run/merged.profdata -Cllvm-args=-pgo-warn-missing-function`",
+            "[smudgy_ui 0.5.9] cargo:rerun-if-changed=THIRD-PARTY-NOTICES.md",
+            "   Compiling profile-missing-crate v0.1.0",
+        ]
+        for line in diagnostics:
+            self.assertTrue(pgo.PGO_DIAGNOSTIC.search(line), line)
+        for line in noise:
+            self.assertFalse(pgo.PGO_DIAGNOSTIC.search(line), line)
+
+    def test_command_output_requests_utf8_decoding(self):
+        with patch.object(pgo.subprocess, "check_output", return_value="ok\n") as run:
+            self.assertEqual(pgo.capture("tool", "--version"), "ok")
+        self.assertEqual(run.call_args.kwargs.get("encoding"), "utf-8")
 
     def test_abnormal_exit_is_not_verified_or_accepted(self):
         scenario = self.run/"scenario.json"
