@@ -1,5 +1,7 @@
 //! Small, host-independent Connect policies. Persistence remains host-owned.
 
+use std::collections::BTreeSet;
+
 /// Shared quick-connect profile identity. Both hosts persist it as an
 /// ordinary, editable profile, while server-wide automation remains shared.
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
@@ -31,6 +33,41 @@ pub fn preferred_index<'a>(
     first
 }
 
+/// The server/profile pairs that currently have an open session, connected
+/// or offline. Connect refuses to delete a server or profile in this set: the
+/// live session still runs on its directory, automations, map, and
+/// credentials, so deleting them would pull state out from under it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenSessions(BTreeSet<(String, String)>);
+
+impl OpenSessions {
+    #[must_use]
+    pub fn from_pairs<S: Into<String>, P: Into<String>>(
+        pairs: impl IntoIterator<Item = (S, P)>,
+    ) -> Self {
+        Self(
+            pairs
+                .into_iter()
+                .map(|(server, profile)| (server.into(), profile.into()))
+                .collect(),
+        )
+    }
+
+    /// Whether any session is open on `server`, under any profile.
+    #[must_use]
+    pub fn has_server(&self, server: &str) -> bool {
+        self.0.iter().any(|(open, _)| open == server)
+    }
+
+    /// Whether a session is open on exactly this server and profile.
+    #[must_use]
+    pub fn has_profile(&self, server: &str, profile: &str) -> bool {
+        self.0
+            .iter()
+            .any(|(open_server, open_profile)| open_server == server && open_profile == profile)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +81,17 @@ mod tests {
         assert_eq!(preferred_index(names, Some("second")), Some(1));
         assert_eq!(preferred_index(names, Some("removed")), Some(0));
         assert_eq!(preferred_index([], None), None);
+    }
+
+    #[test]
+    fn open_sessions_match_exact_server_and_profile() {
+        let open = OpenSessions::from_pairs([("Aardwolf", "Mage"), ("Aardwolf", "Thief")]);
+        assert!(open.has_server("Aardwolf"));
+        assert!(!open.has_server("aardwolf"));
+        assert!(!open.has_server("Discworld"));
+        assert!(open.has_profile("Aardwolf", "Mage"));
+        assert!(!open.has_profile("Aardwolf", "Cleric"));
+        assert!(!open.has_profile("Discworld", "Mage"));
+        assert!(!OpenSessions::default().has_server("Aardwolf"));
     }
 }

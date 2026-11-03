@@ -857,6 +857,7 @@ impl SmudgyWeb {
                 }
                 let _ = self.ui.close_session(id);
                 self.session_definitions.remove(&id);
+                self.sync_open_sessions();
                 self.save_window();
                 self.update_restore_count();
                 Task::none()
@@ -909,6 +910,7 @@ impl SmudgyWeb {
             Err(error) => self.ui.set_session_error(id, error),
         }
         self.session_definitions.insert(id, definition);
+        self.sync_open_sessions();
         self.ui.manager.set_restore_count(0);
         self.save_window();
     }
@@ -1037,6 +1039,7 @@ impl SmudgyWeb {
             self.session_definitions.insert(id, definition);
             slot_to_session.insert(slot.id, id);
         }
+        self.sync_open_sessions();
         let clusters = window
             .clusters
             .iter()
@@ -1078,6 +1081,19 @@ impl SmudgyWeb {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Tell the connect manager which server/profile pairs have an open
+    /// session, so it refuses to delete them. Called after every change to
+    /// `session_definitions`.
+    fn sync_open_sessions(&mut self) {
+        self.ui
+            .manager
+            .set_open_sessions(smudgy_session_model::connect::OpenSessions::from_pairs(
+                self.session_definitions
+                    .values()
+                    .map(|definition| (definition.server.as_str(), definition.profile.as_str())),
+            ));
     }
 
     fn save_window(&mut self) {

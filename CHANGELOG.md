@@ -136,6 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A server or profile with an open session can't be deleted.** Its delete
+  button is disabled, with a note to close the open sessions first, in both the
+  desktop and browser Connect windows. Offline sessions count too, since they
+  still run the server's automations and maps. Other profiles on the same
+  server can still be deleted.
 - **Command aliases no longer miss on an unterminated quote or brace.** A
   quote or brace that nothing closes is kept as text and the alias fires with
   the rest of the line intact; before, `say don't` went to the game untouched.

@@ -4,6 +4,7 @@ pub use self::connect::Message as ConnectMessage;
 
 use iced::Task;
 
+use crate::session_store::SessionStore;
 use crate::theme::Element;
 // Import modal implementation modules
 pub mod connect;
@@ -40,10 +41,17 @@ pub enum Event {
 impl Modal {
     /// Update the state of the active modal.
     /// Returns a Task for the modal and optionally an Event to be handled by the main app.
-    pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Event>) {
+    /// `sessions` is read fresh for every message so the connect modal's
+    /// delete guards see sessions opened or closed in any window.
+    pub fn update(
+        &mut self,
+        message: Message,
+        sessions: &SessionStore,
+    ) -> (Task<Message>, Option<Event>) {
         match (self, message) {
             // Route Connect messages to the connect modal's update
             (Modal::Connect(state), Message::Connect(msg)) => {
+                state.set_open_sessions(sessions.open_sessions());
                 let (task, event) = connect::update(state, msg);
                 // Map the task's message type and the event type
                 (task.map(Message::Connect), event.map(Event::Connect))
@@ -65,14 +73,15 @@ impl Modal {
         }
     }
 
-    /// Get the view for the active modal.
-    pub fn view(&self) -> Element<'_, Message> {
+    /// Get the view for the active modal. The connect modal renders its
+    /// delete actions against the live `sessions`, not a stored snapshot.
+    pub fn view(&self, sessions: &SessionStore) -> Element<'_, Message> {
         let (title, width, height, inner) = match self {
             Modal::Connect(state) => (
                 crate::i18n::t!("toolbar-connect"),
                 800.0,
                 600.0,
-                connect::view(state).map(Message::Connect),
+                connect::view(state, &sessions.open_sessions()).map(Message::Connect),
             ),
             Modal::Layouts(state) => (
                 crate::i18n::t!("layouts-manage-title"),

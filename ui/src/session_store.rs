@@ -289,6 +289,16 @@ impl SessionStore {
         self.sessions.iter().map(|(id, session)| (*id, session))
     }
 
+    /// Every server/profile pair with a session in the store, connected or
+    /// offline. Connect uses it to refuse deleting what a session runs on.
+    pub fn open_sessions(&self) -> smudgy_session_model::connect::OpenSessions {
+        smudgy_session_model::connect::OpenSessions::from_pairs(
+            self.sessions
+                .values()
+                .map(|session| (session.server_name.as_str(), session.profile_name.as_str())),
+        )
+    }
+
     #[cfg(feature = "web-audio-cpal")]
     pub fn set_master_linear(
         &self,

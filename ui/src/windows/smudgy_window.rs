@@ -3075,7 +3075,8 @@ impl SmudgyWindow {
                     // `opening()` loads servers + the first server's profiles
                     // synchronously so the modal renders fully populated (no
                     // loading-state flash).
-                    let connect_state = modal::connect::State::opening();
+                    let mut connect_state = modal::connect::State::opening();
+                    connect_state.set_open_sessions(sessions.open_sessions());
                     let new_modal = modal::Modal::Connect(connect_state);
                     let modal_init_task: Task<modal::Message> = new_modal.initial_task();
                     self.modal = Some(new_modal);
@@ -3140,7 +3141,7 @@ impl SmudgyWindow {
             },
             Message::ModalMessage(msg) => {
                 if let Some(m) = self.modal.as_mut() {
-                    let (task, event) = m.update(msg);
+                    let (task, event) = m.update(msg, sessions);
                     if let Some(evt) = event {
                         // The modal's own follow-up (a profile load after a
                         // server is created, say) still runs.
@@ -4186,7 +4187,7 @@ impl SmudgyWindow {
         };
 
         let main_layout: ThemedElement<Message> = if let Some(modal) = &self.modal {
-            let modal_view = modal.view().map(Message::ModalMessage);
+            let modal_view = modal.view(sessions).map(Message::ModalMessage);
             stack(vec![
                 main_layout,
                 opaque(
