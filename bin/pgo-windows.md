@@ -9,10 +9,13 @@ source tree or under its ignored `target/` directory.
 Cargo must use the same PATH-selected rustc that supplies the profile merger.
 Compiler/wrapper overrides (including Cargo configuration equivalents) are
 rejected; the helper pins Cargo to that toolchain's own `rustc` and requires
-`llvm-profdata` to report the same LLVM version. Flatten configuration includes
-before starting a new run so all configuration inputs are fingerprinted. Builds
-run with `cargo -vv` so dependency crates report profile diagnostics too; the
-build log is correspondingly verbose.
+`llvm-profdata` to report the same LLVM release (rustup's tools add a
+`-rust-<version>-<channel>` suffix, which is ignored). Flatten configuration
+includes before starting a new run so all configuration inputs are fingerprinted.
+Builds run with `cargo -vv` and plain output so dependency crates report profile
+diagnostics too; the build log is correspondingly verbose. Base flags that set
+lint levels, cap lints, pass LLVM arguments or select profiles are rejected, since
+they could hide or redirect those diagnostics.
 
 ```powershell
 rustup component add llvm-tools-preview
@@ -61,8 +64,11 @@ Training must cover replay, capture delivery and representative interactive use
 (startup, settings, terminal interaction and mapper activity). Validation must also
 cover a held-out workload absent from training: export requires every `heldout`
 scenario to differ from all training scenarios and to declare at least one input
-file whose hash never appeared in training. Categories attest to the supplied
-scenario; review the verifier and evidence, rather than relying on the label alone.
+file whose hash never appeared in training, and every training scenario to declare
+its inputs. Inputs are declared by the scenario author, so this gate checks the
+declarations for consistency; it does not prove data separation on its own.
+Categories attest to the supplied scenario; review the verifier and evidence,
+rather than relying on the label alone.
 Measure foreground replay in balanced blocks after compilation finishes; keep
 latency, exact callback vectors, total CPU and multi-session behavior distinct.
 
@@ -84,11 +90,12 @@ To package a validated export, pass its manifest explicitly in **both** phases:
 
 Packaging checks identity, hashes and the checkout revision, signs a staging copy,
 and passes that exact executable path to Inno Setup. The build phase records the
-manifest it staged under `target/pgo-package/`; a later `-SkipBuild` without
-`-PgoManifest`, or with a different manifest, is refused until that marker is
-removed. The PGO lane regenerates the notices and requires them to be
-byte-identical to the fingerprinted file embedded in the validated app. The
-validated unsigned executable and symbols stay intact. The inspector sidecar uses its ordinary release build. Signing and release
+manifest it staged under `target/pgo-package/`; a PGO `-SkipBuild` requires that
+marker to name the same manifest, and an ordinary `-SkipBuild` is refused while
+it exists. The PGO build phase regenerates the notices and requires them to be
+byte-identical to the fingerprinted file embedded in the validated app, restoring
+that file if they differ. The validated unsigned executable and symbols stay
+intact. The inspector sidecar uses its ordinary release build. Signing and release
 publication remain separate from PGO training and validation. Other architectures
 and operating systems need independent training and validation before adoption.
 

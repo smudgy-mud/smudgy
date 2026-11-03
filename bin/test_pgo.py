@@ -225,13 +225,14 @@ class PgoTests(unittest.TestCase):
             if command == ("rustc", "--print", "sysroot"):
                 return str(sysroot)
             if command == (str(tool), "--version"):
-                return "LLVM (http://llvm.org/):\n  LLVM version 18.1.8\n  Optimized build."
+                # rustup's llvm-tools carry the Rust release suffix; rustc -vV does not.
+                return "LLVM (http://llvm.org/):\n  LLVM version 22.1.6-rust-1.97.1-stable\n  Optimized build."
             raise AssertionError(command)
 
         with patch.object(pgo, "capture", capture):
-            with self.assertRaisesRegex(RuntimeError, "same LLVM"):
-                pgo.profdata_tool("rustc 1.97.1\nLLVM version: 19.1.7")
-            self.assertEqual(pgo.profdata_tool("rustc 1.97.1\nLLVM version: 18.1.8"), tool)
+            with self.assertRaisesRegex(RuntimeError, "same LLVM release"):
+                pgo.profdata_tool("rustc 1.97.1 (abc 2026-10-01)\nhost: x86_64-pc-windows-msvc\nLLVM version: 22.1.5")
+            self.assertEqual(pgo.profdata_tool("rustc 1.97.1 (abc 2026-10-01)\nhost: x86_64-pc-windows-msvc\nLLVM version: 22.1.6"), tool)
 
     def test_pgo_diagnostics_match_llvm_warnings_not_the_command_echo(self):
         diagnostics = [
@@ -239,16 +240,77 @@ class PgoTests(unittest.TestCase):
             "warning: Function control flow change detected (hash mismatch) _ZN3foo3baz Hash = 2",
             "warning: Inconsistent number of counts in _ZN3foo3qux: the profile may be stale",
             "  warning: profile data may be out of date for function _ZN3foo3fin",
+            # An unreadable or foreign profile compiles without PGO; rustc only warns.
+            "warning: C:\\pgo\\run\\merged.profdata: invalid instrumentation profile data (bad magic)",
+            "warning: C:\\pgo\\run\\merged.profdata: unsupported instrumentation profile format version",
+            "warning: C:\\pgo\\run\\merged.profdata: Not an IR level instrumentation profile",
+            # Colour escapes from an inherited CARGO_TERM_COLOR must not hide a diagnostic.
+            "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: C:\\src\\lib.rs: no profile data available for function _ZN3foo3bar",
         ]
         noise = [
             "     Running `rustc --crate-name smudgy -Cprofile-use=C:/pgo/run/merged.profdata -Cllvm-args=-pgo-warn-missing-function`",
             "[smudgy_ui 0.5.9] cargo:rerun-if-changed=THIRD-PARTY-NOTICES.md",
             "   Compiling profile-missing-crate v0.1.0",
+            "warning: unused variable: `profile_missing`",
+            "warning: unused import: `stale_profile_reader`",
         ]
         for line in diagnostics:
             self.assertTrue(pgo.PGO_DIAGNOSTIC.search(line), line)
         for line in noise:
             self.assertFalse(pgo.PGO_DIAGNOSTIC.search(line), line)
+
+    def test_flags_that_hide_or_redirect_diagnostics_are_rejected(self):
+        for index, flag in enumerate(["-Awarnings", "--cap-lints=allow", "-Cllvm-args=-no-pgo-warn-mismatch",
+                                      "-Cprofile-use=C:/elsewhere.profdata", "-Zprofile", "-Cllvm-args=-pgo-warn-missing-function"]):
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(RuntimeError, "managed by this tool"):
+                    pgo.build(self.run/f"fresh-{index}", "generate", [flag])
+        with patch.object(pgo, "toolchain_rustc", side_effect=RuntimeError("stop before cargo")):
+            with self.assertRaisesRegex(RuntimeError, "stop before cargo"):
+                pgo.build(self.run/"fresh-ok", "generate", ["-Cdebuginfo=1", "-Ctarget-cpu=x86-64-v3"])
+
+    def test_training_without_declared_inputs_cannot_anchor_heldout_evidence(self):
+        merge = pgo.read(self.run/"merge.json")
+        merge["workloads"][0]["inputs"] = {}
+        pgo.write(self.run/"merge.json", merge)
+        self.validation()
+        with self.assertRaisesRegex(RuntimeError, "Training scenarios must declare"):
+            pgo.export(self.run)
+        self.assertFalse((self.run/"dist").exists())
+
+    def test_scenarios_are_validated_before_launch(self):
+        scenario = self.run/"scenario.json"
+        cases = [
+            ({"verify": ["v"], "categories": ["replay"], "env": {"PGO_EXECUTABLE": "x"}}, "collector owns"),
+            ({"verify": ["v"], "categories": ["replay"], "env": {"LLVM_PROFILE_FILE": "x"}}, "collector owns"),
+            ({"verify": ["v"], "categories": ["replay"], "args": ["--data-dir", 7]}, "must be strings"),
+            ({"verify": ["v"], "categories": ["replay"], "env": {"HOME": None}}, "must be strings"),
+            ({"verify": ["v"], "categories": ["replay"], "inputs": [["corpus.log"]]}, "must be strings"),
+        ]
+        for index, (content, message) in enumerate(cases):
+            with self.subTest(content=content), patch.object(pgo.subprocess, "Popen") as launch:
+                pgo.write(scenario, content)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    pgo.workload(self.run, f"invalid-{index}", scenario, True)
+                launch.assert_not_called()
+
+    def test_relative_inputs_resolve_against_the_scenario_file(self):
+        directory = self.run/"workloads"
+        directory.mkdir()
+        corpus = directory/"corpus.log"
+        corpus.write_bytes(b"lines")
+        scenario = directory/"replay.json"
+        pgo.write(scenario, {"verify": ["v"], "categories": ["replay"], "inputs": ["corpus.log"]})
+        output = self.run/"training/relative"
+
+        def launch(command, cwd, env, stdout, stderr):
+            (output/"raw/smudgy-1-1.profraw").write_bytes(b"counts")
+            return Mock(pid=1, wait=Mock(return_value=0))
+
+        with patch.object(pgo.subprocess, "Popen", side_effect=launch), \
+             patch.object(pgo.subprocess, "run", return_value=Mock(returncode=0)):
+            pgo.workload(self.run, "relative", scenario, True)
+        self.assertEqual(pgo.read(output/"manifest.json")["inputs"], {str(corpus.resolve()): pgo.sha(corpus)})
 
     def test_command_output_requests_utf8_decoding(self):
         with patch.object(pgo.subprocess, "check_output", return_value="ok\n") as run:

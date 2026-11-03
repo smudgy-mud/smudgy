@@ -24,11 +24,17 @@ COMPILER_OVERRIDES = {
 }
 # The build stamps one of these into the binary (core/build.rs), so they are inputs.
 EMBEDDED_COMMIT_VARIABLES = ("SMUDGY_GIT_COMMIT", "GITHUB_SHA", "CI_COMMIT_SHA")
-# LLVM profile diagnostics as rustc reports them. Only diagnostic lines match, so the
-# `-vv` command echo of `-Cprofile-use`/`-pgo-warn-missing-function` cannot.
+# LLVM profile diagnostics as rustc reports them: unreadable or unapplied profiles
+# ("invalid/unsupported/malformed instrumentation profile"), stale or mismatched
+# functions, and functions without data. Only diagnostic lines match, even when a
+# colour escape precedes them, so the `-vv` command echo never does.
 PGO_DIAGNOSTIC = re.compile(
-    r"^\s*(?:warning|error)\b.*(?:no profile data|control flow change|hash mismatch"
-    r"|inconsistent number of counts|profile.*(?:out.of.date|stale|missing))", re.I)
+    r"^\s*(?:\x1b\[[0-9;]*m\s*)*(?:warning|error)\b.*(?:instrumentation profile|no profile data available"
+    r"|control flow change detected|hash mismatch|inconsistent number of counts|profile data may be out of date)", re.I)
+# Base flags that would hide or reconfigure those diagnostics, or override PGO itself.
+MANAGED_FLAG_PREFIXES = ("-A", "--cap-lints", "-Cllvm-args", "-Cprofile", "-Zprofile")
+RESERVED_SCENARIO_VARIABLES = {"LLVM_PROFILE_FILE", "PGO_SCENARIO_OUTPUT", "PGO_EXECUTABLE"}
+LLVM_RELEASE = re.compile(r"LLVM version:? (\d+\.\d+\.\d+)")
 
 
 def require(condition, message):
@@ -75,10 +81,12 @@ def profdata_tool(compiler):
     sysroot, _ = toolchain_rustc()
     tool = sysroot/f"lib/rustlib/{TARGET}/bin/llvm-profdata.exe"
     require(tool.is_file(), "Install llvm-tools-preview for the repository toolchain")
-    rustc_llvm = re.search(r"^LLVM version: (\S+)", compiler, re.M)
-    tool_llvm = re.search(r"LLVM version (\S+)", capture(str(tool), "--version"))
+    # rustup's tools print the release with a `-rust-<version>-<channel>` suffix that
+    # `rustc -vV` omits, so compare the numeric release only.
+    rustc_llvm = LLVM_RELEASE.search(compiler)
+    tool_llvm = LLVM_RELEASE.search(capture(str(tool), "--version"))
     require(rustc_llvm and tool_llvm and rustc_llvm.group(1) == tool_llvm.group(1),
-            "llvm-profdata must come from the same LLVM as rustc; install llvm-tools-preview for this toolchain")
+            "llvm-profdata must come from the same LLVM release as rustc; install llvm-tools-preview for this toolchain")
     return tool
 
 
@@ -128,7 +136,8 @@ def identity():
         "RUSTC", "RUSTY_V8_ARCHIVE", "V8_FROM_SOURCE", "V8_FORCE_DEBUG",
         "CC", "CXX", "CL", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LIB", "INCLUDE",
         *EMBEDDED_COMMIT_VARIABLES)}
-    return dict(compiler=capture("rustc", "-vV"), cargo=capture("cargo", "-V"),
+    # HEAD is stamped into the binary when no commit variable is set, so it is an input too.
+    return dict(compiler=capture("rustc", "-vV"), cargo=capture("cargo", "-V"), revision=head_revision(),
                 files=files, configs=configs, local_dependencies=local_dependencies,
                 native_environment=native_environment, helper_sha256=sha(__file__))
 
@@ -137,7 +146,8 @@ def build(run, stage, rustflags=()):
     current = identity()
     if stage == "generate":
         run.mkdir(parents=True, exist_ok=False)
-        require(not any("profile-" in flag or "pgo-" in flag for flag in rustflags), "PGO flags are managed by this tool")
+        require(not any(flag.startswith(MANAGED_FLAG_PREFIXES) or "pgo-" in flag for flag in rustflags),
+                "PGO flags, lint levels, lint caps and LLVM arguments are managed by this tool")
         config = dict(source=str(ROOT), revision=head_revision(), worktree_status=worktree_status(),
                       target=TARGET, features=FEATURES, base_flags=list(rustflags), identity=current)
         write(run/"run.json", config)
@@ -153,7 +163,9 @@ def build(run, stage, rustflags=()):
     output = run/stage
     output.mkdir()
     _, rustc = toolchain_rustc()
-    env = dict(os.environ, CARGO_TARGET_DIR=str(output), CARGO_ENCODED_RUSTFLAGS="\x1f".join(flags), RUSTC=str(rustc))
+    # Plain output keeps diagnostics matchable regardless of the operator's colour setting.
+    env = dict(os.environ, CARGO_TARGET_DIR=str(output), CARGO_ENCODED_RUSTFLAGS="\x1f".join(flags), RUSTC=str(rustc),
+               CARGO_TERM_COLOR="never")
     env.pop("LLVM_PROFILE_FILE", None)
     # `-vv` lifts Cargo's `--cap-lints allow` on dependency crates, which would otherwise
     # silence their profile diagnostics along with every other warning.
@@ -198,7 +210,11 @@ def workload(run, label, scenario_path, training):
     scenario = read(scenario_path)
     require(scenario.get("verify") and scenario.get("categories"), "Scenario needs a verification command and workload categories")
     extra_env = scenario.get("env", {})
-    require("LLVM_PROFILE_FILE" not in extra_env, "The collector owns LLVM_PROFILE_FILE")
+    strings = lambda values: all(isinstance(value, str) for value in values)
+    require(isinstance(extra_env, dict) and strings(extra_env) and strings(extra_env.values())
+            and strings(scenario.get("args", [])) and strings(scenario["verify"]) and strings(scenario.get("inputs", [])),
+            "Scenario args, verify, inputs and env entries must be strings")
+    require(not RESERVED_SCENARIO_VARIABLES & extra_env.keys(), "The collector owns LLVM_PROFILE_FILE, PGO_SCENARIO_OUTPUT and PGO_EXECUTABLE")
     output = run/("training" if training else "validation")/label
     output.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, **extra_env, PGO_SCENARIO_OUTPUT=str(output), PGO_EXECUTABLE=built["executable"])
@@ -207,7 +223,8 @@ def workload(run, label, scenario_path, training):
         env["LLVM_PROFILE_FILE"] = str(output/"raw/smudgy-%p-%m.profraw")
     else:
         env.pop("LLVM_PROFILE_FILE", None)
-    inputs = {str(Path(p).resolve()): sha(p) for p in scenario.get("inputs", [])}
+    # Relative inputs are relative to the scenario file, like the verifier's working directory.
+    inputs = {str(path): sha(path) for path in ((scenario_path.parent/p).resolve() for p in scenario.get("inputs", []))}
     command = [built["executable"], *scenario.get("args", [])]
     manifest = dict(stage=stage, executable_sha256=built["executable_sha256"], scenario=scenario,
                     scenario_sha256=sha(scenario_path), inputs=inputs, command=command, started=time.time())
@@ -258,6 +275,8 @@ def accepted(run, directory, executable_hash):
 def check_heldout(records, training):
     """Held-out evidence must be absent from training: a scenario training never ran
     that hashes at least one input file training never hashed."""
+    require(training and all(record["inputs"] for record in training),
+            "Training scenarios must declare their input files so held-out evidence can be compared")
     trained_scenarios = {record["scenario_sha256"] for record in training}
     trained_inputs = {digest for record in training for digest in record["inputs"].values()}
     for record in records:

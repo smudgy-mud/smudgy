@@ -383,14 +383,49 @@ def main() -> None:
         and ast.dump(build_commands[0]) == ast.dump(expected_pgo_command),
         "PGO build must retain the reviewed application command and feature selection",
     )
-    command_mutations = [
-        node for node in ast.walk(build_functions[0])
-        if (isinstance(node, (ast.AugAssign, ast.AnnAssign))
-            and isinstance(node.target, ast.Name) and node.target.id == "command")
-        or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name) and node.func.value.id == "command")
-    ]
-    require(not command_mutations, "PGO build command must not be modified after its reviewed assignment")
+    # The reviewed command and environment may only flow into the recorded manifest and
+    # the single Cargo invocation; any other read, write, slice or call is drift.
+    build_function = build_functions[0]
+    parents = {child: node for node in ast.walk(build_function) for child in ast.iter_child_nodes(node)}
+
+    def is_call_to(node, *names):
+        return isinstance(node, ast.Call) and ast.unparse(node.func) in names
+
+    def allowed_command_use(name):
+        parent = parents.get(name)
+        if isinstance(name.ctx, ast.Store):
+            return isinstance(parent, ast.Assign) and parent.value is build_commands[0]
+        if is_call_to(parent, "subprocess.run") and parent.args and parent.args[0] is name:
+            return True
+        return (isinstance(parent, ast.keyword) and parent.arg == "command"
+                and is_call_to(parents.get(parent), "dict"))
+
+    def allowed_env_use(name):
+        parent = parents.get(name)
+        if isinstance(name.ctx, ast.Store):
+            return (isinstance(parent, ast.Assign) and is_call_to(parent.value, "dict")
+                    and parent.value.args and ast.unparse(parent.value.args[0]) == "os.environ"
+                    and {keyword.arg for keyword in parent.value.keywords}
+                    == {"CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "CARGO_TERM_COLOR"})
+        if isinstance(parent, ast.Attribute) and parent.attr == "pop" and is_call_to(parents.get(parent), "env.pop"):
+            return True
+        return isinstance(parent, ast.keyword) and parent.arg == "env" and is_call_to(parents.get(parent), "subprocess.run")
+
+    names = [node for node in ast.walk(build_function) if isinstance(node, ast.Name)]
+    require(
+        all(allowed_command_use(name) for name in names if name.id == "command"),
+        "PGO build command must flow unchanged from its reviewed assignment into the single Cargo invocation",
+    )
+    require(
+        all(allowed_env_use(name) for name in names if name.id == "env"),
+        "PGO build environment must be the reviewed dict(os.environ, ...) with no later changes",
+    )
+    require(
+        sum(isinstance(node, ast.Constant) and node.value == "cargo" for node in ast.walk(build_function)) == 1
+        and sum(is_call_to(node, "subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "subprocess.check_call")
+                for node in ast.walk(build_function)) == 1,
+        "PGO build must invoke Cargo exactly once",
+    )
     notice_command = (
         "cargo about generate --workspace "
         f"--features {RELEASE_FEATURE} --locked about.hbs "

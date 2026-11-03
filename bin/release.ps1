@@ -39,7 +39,9 @@ if ($PgoManifest) {
     $verified = & python (Join-Path $PSScriptRoot 'pgo.py') verify $PgoManifest
     if ($LASTEXITCODE -ne 0) { throw 'PGO artifact verification failed' }
     $pgo = $verified | ConvertFrom-Json
-    if ($SkipBuild -and (Test-Path -LiteralPath $pgoPending)) {
+    if ($SkipBuild) {
+        # The build phase is where the notices are checked; it must have run for this manifest.
+        if (-not (Test-Path -LiteralPath $pgoPending)) { throw "No PGO build phase is pending; run -BuildOnly -PgoManifest first" }
         $pending = (Get-Content -LiteralPath $pgoPending -Raw).Trim()
         if ($pending -ne $PgoManifest) { throw "A PGO build phase is pending for $pending; pass that manifest or delete $pgoPending" }
     }
@@ -116,16 +118,25 @@ if (-not $SkipBuild) {
     }
     Write-Host "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md" -ForegroundColor Cyan
     cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md
-    if ($LASTEXITCODE -ne 0) { throw "cargo about generate failed" }
-    python bin/normalize-third-party-notices.py
-    if ($LASTEXITCODE -ne 0) { throw "third-party notice normalization failed" }
-    if ($pgo) {
-        if ((Get-FileHash -LiteralPath $notice -Algorithm SHA256).Hash -ne $pgoNoticeHash) {
-            [System.IO.File]::WriteAllBytes($notice, $pgoNotice)
-            throw 'THIRD-PARTY-NOTICES.md is stale for the current Cargo.lock and release features; regenerate it and start a new PGO run'
-        }
+    $noticeExit = $LASTEXITCODE
+    if ($noticeExit -eq 0) {
+        python bin/normalize-third-party-notices.py
+        $noticeExit = $LASTEXITCODE
     }
-    Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
+    if ($pgo) {
+        # Whatever happened, leave the fingerprinted notice in place so later verification still passes.
+        $stale = $noticeExit -ne 0 -or (Get-FileHash -LiteralPath $notice -Algorithm SHA256).Hash -ne $pgoNoticeHash
+        if ($stale) { [System.IO.File]::WriteAllBytes($notice, $pgoNotice) }
+        if ($noticeExit -ne 0) { throw "third-party notice generation failed" }
+        if ($stale) { throw 'THIRD-PARTY-NOTICES.md is stale for the current Cargo.lock and release features; regenerate it and start a new PGO run' }
+    } elseif ($noticeExit -ne 0) {
+        throw "third-party notice generation failed"
+    }
+    if ($pgo) {
+        Write-Host "==> cargo build --locked --profile release-full -p smudgy_inspector" -ForegroundColor Cyan
+    } else {
+        Write-Host "==> cargo build --profile release-full -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal" -ForegroundColor Cyan
+    }
     # smudgy_inspector (the bundled DevTools sidecar) is not in the workspace
     # default-members, so name it explicitly alongside the app.
     if ($pgo) {
@@ -157,6 +168,9 @@ if ($BuildOnly) {
     if ($pgo) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $pgoPending) | Out-Null
         Set-Content -LiteralPath $pgoPending -Value $PgoManifest -Encoding utf8
+    } elseif (Test-Path -LiteralPath $pgoPending) {
+        # An ordinary build supersedes a staged PGO phase that was never packaged.
+        Remove-Item -LiteralPath $pgoPending
     }
     Write-Host "==> Build complete (-BuildOnly); signing/packaging deferred" -ForegroundColor Green
     exit 0
@@ -213,5 +227,7 @@ foreach ($f in @($exe, $inspector, $setup)) {
     if ($sig.Status -ne 'Valid') { throw "signature on $f is $($sig.Status)" }
 }
 
-if ($pgo -and (Test-Path -LiteralPath $pgoPending)) { Remove-Item -LiteralPath $pgoPending }
+if ($pgo -and (Test-Path -LiteralPath $pgoPending) -and ((Get-Content -LiteralPath $pgoPending -Raw).Trim() -eq $PgoManifest)) {
+    Remove-Item -LiteralPath $pgoPending
+}
 Write-Host "==> Done: $setup" -ForegroundColor Green
