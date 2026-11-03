@@ -365,6 +365,70 @@ class PgoTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "instrumented link is managed"):
             pgo.build(self.run/"linker", "generate", ["-Clinker=/usr/bin/clang"], "aarch64-apple-darwin")
 
+    def test_missing_records_are_structural_only_for_crates_the_profile_never_saw(self):
+        def missing(unit, function):
+            return f"warning: {unit}: no profile data available for function {function} Hash = 7 up to 0 count discarded"
+        syn, logger, app = "syn.e314352a13b1d352-cgu.0", "env_logger.32919bcdb6693f4f-cgu.0", "smudgy.1a2b3c-cgu.0"
+        unlinked = [
+            missing(syn, "_RNvCsabc123_3syn4item"),
+            # A local copy of an upstream inline function carries no syn token; the unit does.
+            missing(syn, "_RNvXsK_NtCsgtPOCBgevO_4core3fmtNtB5_5ErrorNtB5_5Debug3fmt"),
+            missing(logger, "_RINvNtCsgtPOCBgevO_4core3ptr9drop_glueNtCsdef456_10env_logger6LoggerECsdef456_10env_logger"),
+        ]
+        standing = [
+            missing(app, "_RNvCs5JAvRntY6Pu_6smudgy4main"),
+            "warning: Function control flow change detected (hash mismatch) _RNvCsabc123_3syn4parse Hash = 2",
+            "warning: C:\\src\\lib.rs: no profile data available for function _ZN3syn3bar Hash = 1 up to 0 count discarded",
+            missing(syn, "_RNvCsabc123_3syn5other Hash = 1 up to 3"),
+        ]
+        names = f"  main:\n  {app};_RNvCs5JAvRntY6Pu_6smudgy7closure:\n  _RNvCs5JAvRntY6Pu_6smudgy4main:\n"
+        remaining, units = pgo.unlinked_crate_diagnostics(unlinked + standing, names)
+        self.assertEqual(remaining, standing)
+        self.assertEqual(units, {logger: 1, syn: 2})
+        # One record from the unit, internal or by crate token, means rustc linked it.
+        for evidence in (f"  {syn};_RNvXsK_core3fmt5Debug3fmt:\n", "  _RNvCsabc123_3syn9other_fn:\n"):
+            with self.subTest(evidence=evidence):
+                remaining, units = pgo.unlinked_crate_diagnostics(unlinked, names + evidence)
+                self.assertEqual((remaining, units), (unlinked[:2], {logger: 1}))
+        # A longer crate name that merely contains the token's name is not evidence.
+        remaining, units = pgo.unlinked_crate_diagnostics(unlinked, names + "  _RNvCsabc123_7syn_ext4item:\n")
+        self.assertEqual(units, {logger: 1, syn: 2})
+
+    def test_use_build_records_unlinked_crates_and_still_fails_on_other_diagnostics(self):
+        unlinked = ("warning: syn.e314352a13b1d352-cgu.0: no profile data available for function "
+                    "_RNvCsabc123_3syn4item Hash = 7 up to 0 count discarded")
+        standing = ("warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+                    "_RNvCs5JAvRntY6Pu_6smudgy4main Hash = 7 up to 0 count discarded")
+
+        log = [f"   Compiling syn\n{unlinked}\n"]
+
+        def cargo(command, cwd, env, stdout, stderr):
+            exe = Path(env["CARGO_TARGET_DIR"])/self.target/"release-full"/"smudgy.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"built")
+            stdout.write("".join(log))
+            return Mock(returncode=0)
+
+        pgo.write(self.run/"run.json", dict(pgo.read(self.run/"run.json"), base_flags=[]))
+        # The profile records smudgy's unit and nothing from syn's.
+        with patch.object(pgo, "toolchain_rustc", return_value=(self.run, self.run/"rustc")), \
+             patch.object(pgo, "profile_function_names", return_value="  main:\n  _RNvCs5JAvRntY6Pu_6smudgy4main:\n"), \
+             patch.object(pgo.subprocess, "run", cargo):
+            shutil.rmtree(self.run/"use")
+            pgo.build(self.run, "use")
+            manifest = pgo.read(self.run/"use/manifest.json")
+            self.assertEqual((manifest["pgo_diagnostics"], manifest["unlinked_crates"]),
+                             ([], {"syn.e314352a13b1d352-cgu.0": 1}))
+            pgo.check_build_receipt(manifest, self.target)
+            shutil.rmtree(self.run/"use")
+            log.append(f"{standing}\n")
+            with self.assertRaisesRegex(RuntimeError, "require investigation"):
+                pgo.build(self.run, "use")
+        manifest = pgo.read(self.run/"use/manifest.json")
+        self.assertEqual((manifest["pgo_diagnostics"], manifest["unlinked_crates"]), ([standing], {"syn.e314352a13b1d352-cgu.0": 1}))
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            pgo.check_build_receipt(manifest, self.target)
+
     @unittest.skipIf(sys.platform == "win32", "the Apple link script is a POSIX shell script")
     def test_apple_link_script_removes_dead_strip_and_nothing_else(self):
         fake = self.run/"fake-cc"

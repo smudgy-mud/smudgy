@@ -62,11 +62,12 @@ def probe(run, target=None, rustflags=()):
                   host=f"{platform.system()} {platform.release()} {platform.machine()}", use_exit_code=built.get("exit_code"), use_seconds=built.get("seconds"),
                   executable=built.get("executable"), executable_sha256=built.get("executable_sha256"),
                   generate_flags=pgo.read(run/"generate/manifest.json")["flags"],
-                  diagnostics=built.get("pgo_diagnostics", []), error=error)
+                  diagnostics=built.get("pgo_diagnostics", []), unlinked_crates=built.get("unlinked_crates", {}), error=error)
     pgo.write(output/"result.json", result)
-    print(json.dumps({key: result[key] for key in ("target", "use_exit_code", "diagnostics", "error")}, indent=2), flush=True)
+    print(json.dumps({key: result[key] for key in ("target", "use_exit_code", "diagnostics", "unlinked_crates", "error")},
+                     indent=2), flush=True)
     pgo.require(error is None, error)
-    print(f"PASS: {config['target']} profile-use build reports no diagnostics")
+    print(f"PASS: {config['target']} profile-use build reports no diagnostics beyond crates rustc did not link")
 
 
 if __name__ == "__main__":

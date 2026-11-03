@@ -39,6 +39,7 @@ class ProbeTests(unittest.TestCase):
             flags = [*rustflags, *pgo.instrumented_link_flags(self.target)] if stage == "generate" else []
             pgo.write(output/"manifest.json", dict(stage=stage, target=self.target, exit_code=0, inputs_verified=True,
                 flags=flags, executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=diagnostics,
+                unlinked_crates={"syn.e314352a13b1d352-cgu.0": 3} if stage == "use" else {},
                 profile_sha256=pgo.sha(run/"merged.profdata") if stage == "use" else None))
             pgo.require(not diagnostics, "PGO coverage diagnostics require investigation")
         return build
@@ -64,7 +65,8 @@ class ProbeTests(unittest.TestCase):
     def test_probe_records_the_instrumented_link_and_cannot_feed_a_release(self):
         self.probe([])
         result = pgo.read(self.run/"probe/result.json")
-        self.assertEqual((result["diagnostics"], result["error"]), ([], None))
+        self.assertEqual((result["diagnostics"], result["unlinked_crates"], result["error"]),
+                         ([], {"syn.e314352a13b1d352-cgu.0": 3}, None))
         self.assertEqual(result["generate_flags"], [f"-Clinker={pgo.ROOT/'bin/pgo-apple-link.sh'}"])
         self.assertEqual(result["deployment_target"], "deployment_target=11.0")
         merge = pgo.read(self.run/"merge.json")

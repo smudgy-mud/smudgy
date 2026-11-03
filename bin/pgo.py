@@ -45,6 +45,18 @@ PGO_DIAGNOSTIC = re.compile(
 # through bin/pgo-apple-link.sh, which removes `-dead_strip` and nothing else; the
 # profile-use build keeps rustc's default link line.
 INSTRUMENTED_LINK_FLAGS = {"darwin": (f"-Clinker={ROOT/'bin/pgo-apple-link.sh'}",)}
+# Cargo compiles and instruments every crate in the resolved graph, but rustc links
+# only the crates that some linked crate's code names, so a dependency nothing
+# references (syn behind a proc-macro helper, a logger behind an unused feature) never
+# enters the instrumented executable, flushes no record, and is reported at profile
+# use as having no data for each function compiled in its codegen unit. The merged
+# profile is the evidence: a codegen unit with no record at all, neither one of its
+# internal functions (recorded under the unit's name) nor one of its crate's own
+# functions (named with the crate's disambiguator), was not linked. A unit with any
+# record was linked, and every diagnostic from it still stands.
+MISSING_RECORD = re.compile(
+    r"^\s*warning: (?P<unit>(?P<crate>[A-Za-z0-9_]+)\.[0-9a-f]+-cgu\.\d+): no profile data available for function "
+    r"(?P<function>\S+) Hash = \d+ up to 0 count discarded$")
 # Base flags that would hide or reconfigure those diagnostics, or override PGO itself.
 MANAGED_FLAG_PREFIXES = ("-A", "--cap-lints", "-Cllvm-args", "-Cprofile", "-Zprofile")
 RESERVED_SCENARIO_VARIABLES = {"LLVM_PROFILE_FILE", "PGO_SCENARIO_OUTPUT", "PGO_EXECUTABLE"}
@@ -84,6 +96,35 @@ def worktree_status():
 def instrumented_link_flags(target):
     """Extra flags for the profile-generate build only: keep every record alive."""
     return list(INSTRUMENTED_LINK_FLAGS.get(TARGETS[target][0], ()))
+
+
+def profile_function_names(run, identity):
+    """Every record name in the merged profile, as llvm-profdata lists them."""
+    return capture(str(profdata_tool(identity["compiler"])), "show", "--all-functions", str(run/"merged.profdata"))
+
+
+def unlinked_crate_diagnostics(diagnostics, names):
+    """Split missing-record diagnostics from codegen units the profile never saw
+    (crates rustc did not link) from the diagnostics that stand."""
+    units = {}
+    for line in diagnostics:
+        match = MISSING_RECORD.match(line)
+        if match:
+            tokens = units.setdefault(match["unit"], set())
+            # v0 names length-prefix every element, so the crate name is exact.
+            token = re.search(rf"Cs[0-9A-Za-z]+_{len(match['crate'])}{match['crate']}", match["function"])
+            if token:
+                tokens.add(token.group(0))
+    unlinked = {unit: 0 for unit, tokens in units.items()
+                if f"  {unit};" not in names and not any(token in names for token in tokens)}
+    remaining = []
+    for line in diagnostics:
+        match = MISSING_RECORD.match(line)
+        if match and match["unit"] in unlinked:
+            unlinked[match["unit"]] += 1
+        else:
+            remaining.append(line)
+    return remaining, dict(sorted(unlinked.items()))
 
 
 def deployment_target(target):
@@ -269,13 +310,20 @@ def build(run, stage, rustflags=(), target=None, allow_dirty=False):
     require(identity(target) == current, "Inputs changed during compilation; discard this run")
     log = (output/"build.log").read_text(encoding="utf-8", errors="replace")
     diagnostics = [line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)]
+    unlinked = {}
+    if diagnostics and stage == "use":
+        diagnostics, unlinked = unlinked_crate_diagnostics(diagnostics, profile_function_names(run, current))
     exe = output/target/"release-full"/executable_name(target)
-    manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics, inputs_verified=True)
+    manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics,
+                    unlinked_crates=unlinked, inputs_verified=True)
     pdb = exe.with_suffix(".pdb")
     if pdb.exists():
         manifest.update(pdb=str(pdb), pdb_sha256=sha(pdb))
     write(output/"manifest.json", manifest)
     require(not diagnostics, f"PGO coverage diagnostics require investigation: {output/'build.log'}")
+    if unlinked:
+        print(f"{stage}: {sum(unlinked.values())} missing-record diagnostics from {len(unlinked)} codegen units "
+              "rustc did not link are recorded in the receipt", flush=True)
     print(json.dumps({key: manifest[key] for key in ("stage", "seconds", "executable")}), flush=True)
 
 

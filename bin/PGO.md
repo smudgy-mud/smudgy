@@ -90,6 +90,19 @@ application. The training binary keeps its dead code, as it does on Linux and
 Windows, so every record survives; the `use` build keeps rustc's default link line
 and is dead-stripped as usual. `-Clinker` base flags are refused on Apple targets.
 
+One class of missing-record diagnostic is structural on every platform and is
+recorded rather than fatal. Cargo compiles and instruments every crate in the
+resolved graph, but rustc links only the crates that some linked crate's code
+names, so a dependency nothing references (`syn` behind a proc-macro helper, a
+logger behind an unused feature) never enters the instrumented executable,
+flushes no record, and the use build reports every function compiled in its
+codegen unit. The merged profile decides: a codegen unit with no record at all,
+neither an internal function recorded under the unit's name nor one of the
+crate's own functions, was not linked, and its diagnostics are counted in the
+build receipt as `unlinked_crates`. A unit with any record was linked, and every
+diagnostic from it still fails the gate. The application has about twenty such
+unlinked crates on each target.
+
 A scenario is an external JSON file:
 
 ```json
