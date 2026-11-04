@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import sys
 import tomllib
@@ -331,14 +332,99 @@ def main() -> None:
         "cargo build --profile release-full -p smudgy_ui -p smudgy_inspector "
         f"--features {RELEASE_FEATURE}"
     )
+    inspector_command = "cargo build --locked --profile release-full -p smudgy_inspector"
+    windows_lines = [
+        line.strip() for line in windows_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
     require(
         [
-            line.strip()
-            for line in windows_text.splitlines()
-            if line.strip().startswith(("cargo build ", "cargo bundle "))
+            line for line in windows_lines
+            if line.startswith(("cargo build ", "cargo bundle "))
         ]
-        == [windows_command],
+        == [inspector_command, windows_command],
         "Windows release cargo build/bundle command list drifted",
+    )
+    require(
+        "\n".join(["if ($pgo) {", inspector_command, "} else {", windows_command, "}"])
+        in "\n".join(windows_lines),
+        "Windows inspector-only build must remain confined to the verified PGO path",
+    )
+    pgo_tree = ast.parse((ROOT / "bin/pgo.py").read_text(encoding="utf-8"))
+    feature_assignments = [
+        node for node in pgo_tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "FEATURES"
+                for target in node.targets)
+    ]
+    require(
+        len(feature_assignments) == 1
+        and ast.literal_eval(feature_assignments[0].value) == RELEASE_FEATURE,
+        "PGO must use the reviewed physical Web Audio feature",
+    )
+    build_functions = [
+        node for node in pgo_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build"
+    ]
+    require(len(build_functions) == 1, "PGO build function drifted")
+    build_commands = [
+        node.value for node in ast.walk(build_functions[0])
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "command"
+                for target in node.targets)
+    ]
+    expected_pgo_command = ast.parse(
+        '["cargo", "build", "-vv", "--locked", "--profile", "release-full", "--target", TARGET, '
+        '"-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]',
+        mode="eval",
+    ).body
+    require(
+        len(build_commands) == 1
+        and ast.dump(build_commands[0]) == ast.dump(expected_pgo_command),
+        "PGO build must retain the reviewed application command and feature selection",
+    )
+    # The reviewed command and environment may only flow into the recorded manifest and
+    # the single Cargo invocation; any other read, write, slice or call is drift.
+    build_function = build_functions[0]
+    parents = {child: node for node in ast.walk(build_function) for child in ast.iter_child_nodes(node)}
+
+    def is_call_to(node, *names):
+        return isinstance(node, ast.Call) and ast.unparse(node.func) in names
+
+    def allowed_command_use(name):
+        parent = parents.get(name)
+        if isinstance(name.ctx, ast.Store):
+            return isinstance(parent, ast.Assign) and parent.value is build_commands[0]
+        if is_call_to(parent, "subprocess.run") and parent.args and parent.args[0] is name:
+            return True
+        return (isinstance(parent, ast.keyword) and parent.arg == "command"
+                and is_call_to(parents.get(parent), "dict"))
+
+    def allowed_env_use(name):
+        parent = parents.get(name)
+        if isinstance(name.ctx, ast.Store):
+            return (isinstance(parent, ast.Assign) and is_call_to(parent.value, "dict")
+                    and parent.value.args and ast.unparse(parent.value.args[0]) == "os.environ"
+                    and {keyword.arg for keyword in parent.value.keywords}
+                    == {"CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "CARGO_TERM_COLOR"})
+        if isinstance(parent, ast.Attribute) and parent.attr == "pop" and is_call_to(parents.get(parent), "env.pop"):
+            return True
+        return isinstance(parent, ast.keyword) and parent.arg == "env" and is_call_to(parents.get(parent), "subprocess.run")
+
+    names = [node for node in ast.walk(build_function) if isinstance(node, ast.Name)]
+    require(
+        all(allowed_command_use(name) for name in names if name.id == "command"),
+        "PGO build command must flow unchanged from its reviewed assignment into the single Cargo invocation",
+    )
+    require(
+        all(allowed_env_use(name) for name in names if name.id == "env"),
+        "PGO build environment must be the reviewed dict(os.environ, ...) with no later changes",
+    )
+    require(
+        sum(isinstance(node, ast.Constant) and node.value == "cargo" for node in ast.walk(build_function)) == 1
+        and sum(is_call_to(node, "subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "subprocess.check_call")
+                for node in ast.walk(build_function)) == 1,
+        "PGO build must invoke Cargo exactly once",
     )
     notice_command = (
         "cargo about generate --workspace "

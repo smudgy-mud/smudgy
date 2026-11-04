@@ -105,7 +105,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "updatecheck"; Description: "Allow smudgy to automatically check for updates"
 
 [Files]
-Source: "..\target\release-full\smudgy.exe"; DestDir: "{app}"; Flags: ignoreversion
+#ifndef SmudgyAppExe
+  #define SmudgyAppExe "..\target\release-full\smudgy.exe"
+#endif
+Source: "{#SmudgyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; The bundled v8-inspector DevTools sidecar, spawned by the app's "Show Inspector"
 ; button. Must sit next to smudgy.exe (the app resolves it relative to its own exe).
 Source: "..\target\release-full\smudgy_inspector.exe"; DestDir: "{app}"; Flags: ignoreversion
