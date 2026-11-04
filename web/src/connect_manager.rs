@@ -10,7 +10,7 @@ use iced::widget::{button, column, container, row, text, text_editor, text_input
 use iced::{Element, Fill, Length, Pixels};
 use serde::{Deserialize, Serialize};
 use smudgy_session_model::automation::{AutomationDefinition, AutomationPlan, PlaintextRule};
-use smudgy_session_model::connect::DEFAULT_PROFILE_NAME;
+use smudgy_session_model::connect::{DEFAULT_PROFILE_NAME, OpenSessions};
 use smudgy_session_model::profile_activation::ProfileActivation;
 use smudgy_theme::{Theme, builtins};
 
@@ -298,7 +298,13 @@ pub struct State {
     pending_connect: Option<(String, String)>,
     profile_form_nonce: u64,
     form: Form,
+    /// Server/profile pairs with an open session; their deletes are refused.
+    /// The host replaces it whenever a session opens or closes.
+    open_sessions: OpenSessions,
 }
+
+const SERVER_DELETE_BLOCKED: &str = "Close this server's open sessions to delete it.";
+const PROFILE_DELETE_BLOCKED: &str = "Close this profile's open session to delete it.";
 
 impl Default for State {
     fn default() -> Self {
@@ -312,6 +318,7 @@ impl Default for State {
             pending_connect: None,
             profile_form_nonce: 0,
             form: Form::None,
+            open_sessions: OpenSessions::default(),
         }
     }
 }
@@ -319,6 +326,18 @@ impl Default for State {
 impl State {
     pub fn set_restore_count(&mut self, count: usize) {
         self.restore_count = count;
+    }
+
+    /// Replace the set of open sessions whose server and profile may not be
+    /// deleted.
+    pub fn set_open_sessions(&mut self, open: OpenSessions) {
+        self.open_sessions = open;
+    }
+
+    fn profile_delete_blocked(&self, name: &str) -> bool {
+        self.selected_server
+            .as_deref()
+            .is_some_and(|server| self.open_sessions.has_profile(server, name))
     }
 
     pub fn loaded(&mut self, mut catalog: Catalog) {
@@ -411,7 +430,9 @@ impl State {
             }
             Message::SaveServer => return self.save_server(),
             Message::DeleteServer(name) => {
-                if self
+                if self.open_sessions.has_server(&name) {
+                    self.error = Some(SERVER_DELETE_BLOCKED.to_owned());
+                } else if self
                     .catalog
                     .servers
                     .iter()
@@ -429,6 +450,10 @@ impl State {
                     Form::ConfirmDeleteServer { name: pending, generation }
                         if pending == &name && *generation == self.catalog.generation
                 ) {
+                    return Effect::None;
+                }
+                if self.open_sessions.has_server(&name) {
+                    self.error = Some(SERVER_DELETE_BLOCKED.to_owned());
                     return Effect::None;
                 }
                 let mut catalog = self.catalog.clone();
@@ -616,7 +641,9 @@ impl State {
             }
             Message::SaveProfile => return self.save_profile(),
             Message::DeleteProfile(name) => {
-                if let Some(server) = self
+                if self.profile_delete_blocked(&name) {
+                    self.error = Some(PROFILE_DELETE_BLOCKED.to_owned());
+                } else if let Some(server) = self
                     .selected()
                     .filter(|server| server.profiles.iter().any(|profile| profile.name == name))
                 {
@@ -636,6 +663,10 @@ impl State {
                     Form::ConfirmDeleteProfile { server, name: pending, generation }
                         if server == &selected && pending == &name && *generation == self.catalog.generation
                 ) {
+                    return Effect::None;
+                }
+                if self.open_sessions.has_profile(&selected, &name) {
+                    self.error = Some(PROFILE_DELETE_BLOCKED.to_owned());
                     return Effect::None;
                 }
                 let mut catalog = self.catalog.clone();
@@ -974,6 +1005,15 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
         .map_err(str::to_owned)
 }
 
+/// Why a delete is disabled, or nothing when it is allowed.
+fn delete_blocked_hint(blocked: bool, hint: &'static str) -> Element<'static, Message, Theme> {
+    if blocked {
+        text(hint).size(12).style(builtins::text::muted).into()
+    } else {
+        column![].into()
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn view(state: &State) -> Element<'_, Message, Theme> {
     let ConnectViewModel {
@@ -999,12 +1039,18 @@ pub fn view(state: &State) -> Element<'_, Message, Theme> {
     let details: Element<'_, Message, Theme> = match &state.form {
         Form::ConfirmDeleteServer { name, .. } => connect_modal::form(
             text("Delete server").size(Pixels(22.0)).into(),
-            vec![text(format!("Delete server {name} and its profiles?")).into()],
+            vec![
+                text(format!("Delete server {name} and its profiles?")).into(),
+                delete_blocked_hint(state.open_sessions.has_server(name), SERVER_DELETE_BLOCKED),
+            ],
             row![
                 button("Delete")
                     .style(builtins::button::secondary)
                     .padding([8, 18])
-                    .on_press(Message::ConfirmDeleteServer(name.clone())),
+                    .on_press_maybe(
+                        (!state.open_sessions.has_server(name))
+                            .then(|| Message::ConfirmDeleteServer(name.clone())),
+                    ),
                 button("Cancel")
                     .style(builtins::button::secondary)
                     .padding([8, 18])
@@ -1016,12 +1062,18 @@ pub fn view(state: &State) -> Element<'_, Message, Theme> {
         ),
         Form::ConfirmDeleteProfile { name, .. } => connect_modal::form(
             text("Delete profile").size(Pixels(22.0)).into(),
-            vec![text(format!("Delete profile {name}?")).into()],
+            vec![
+                text(format!("Delete profile {name}?")).into(),
+                delete_blocked_hint(state.profile_delete_blocked(name), PROFILE_DELETE_BLOCKED),
+            ],
             row![
                 button("Delete")
                     .style(builtins::button::secondary)
                     .padding([8, 18])
-                    .on_press(Message::ConfirmDeleteProfile(name.clone())),
+                    .on_press_maybe(
+                        (!state.profile_delete_blocked(name))
+                            .then(|| Message::ConfirmDeleteProfile(name.clone())),
+                    ),
                 button("Cancel")
                     .style(builtins::button::secondary)
                     .padding([8, 18])
@@ -1086,10 +1138,17 @@ pub fn view(state: &State) -> Element<'_, Message, Theme> {
                 .spacing(10)
                 .into(),
                 original.as_ref().map(|name| {
-                    button("Delete server")
-                        .style(builtins::button::link)
-                        .on_press(Message::DeleteServer(name.clone()))
-                        .into()
+                    let blocked = state.open_sessions.has_server(name);
+                    column![
+                        button("Delete server")
+                            .style(builtins::button::link)
+                            .on_press_maybe(
+                                (!blocked).then(|| Message::DeleteServer(name.clone()))
+                            ),
+                        delete_blocked_hint(blocked, SERVER_DELETE_BLOCKED),
+                    ]
+                    .spacing(4)
+                    .into()
                 }),
             )
         }
@@ -1235,10 +1294,17 @@ pub fn view(state: &State) -> Element<'_, Message, Theme> {
                 .spacing(10)
                 .into(),
                 original.as_ref().map(|name| {
-                    button("Delete profile")
-                        .style(builtins::button::link)
-                        .on_press(Message::DeleteProfile(name.clone()))
-                        .into()
+                    let blocked = state.profile_delete_blocked(name);
+                    column![
+                        button("Delete profile")
+                            .style(builtins::button::link)
+                            .on_press_maybe(
+                                (!blocked).then(|| Message::DeleteProfile(name.clone()))
+                            ),
+                        delete_blocked_hint(blocked, PROFILE_DELETE_BLOCKED),
+                    ]
+                    .spacing(4)
+                    .into()
                 }),
             )
         }
@@ -1506,6 +1572,56 @@ mod tests {
         ));
         assert!(matches!(
             state.update(Message::ConfirmDeleteServer("outpost".to_owned())),
+            Effect::Persist { .. }
+        ));
+    }
+
+    #[test]
+    fn servers_and_profiles_with_open_sessions_cannot_be_deleted() {
+        let profile = |name: &str| SavedProfile {
+            name: name.into(),
+            caption: String::new(),
+            send_on_connect: String::new(),
+            automation: AutomationDefinition::default(),
+            packages: Vec::new(),
+        };
+        let mut state = State::default();
+        state.loaded(Catalog {
+            generation: 1,
+            servers: vec![SavedServer {
+                name: "mud".into(),
+                endpoint: "wss://example.org/ws".into(),
+                encoding: String::new(),
+                shared_automation: AutomationDefinition::default(),
+                package_activations: Vec::new(),
+                profiles: vec![profile("main"), profile("alt")],
+            }],
+        });
+        state.set_open_sessions(OpenSessions::from_pairs([("mud", "main")]));
+
+        state.update(Message::DeleteServer("mud".into()));
+        assert!(!matches!(state.form, Form::ConfirmDeleteServer { .. }));
+        assert_eq!(state.error.as_deref(), Some(SERVER_DELETE_BLOCKED));
+
+        state.update(Message::DeleteProfile("main".into()));
+        assert!(!matches!(state.form, Form::ConfirmDeleteProfile { .. }));
+        assert_eq!(state.error.as_deref(), Some(PROFILE_DELETE_BLOCKED));
+
+        // A session opened while the confirmation is showing still blocks it.
+        state.set_open_sessions(OpenSessions::default());
+        state.update(Message::DeleteServer("mud".into()));
+        assert!(matches!(state.form, Form::ConfirmDeleteServer { .. }));
+        state.set_open_sessions(OpenSessions::from_pairs([("mud", "main")]));
+        assert!(matches!(
+            state.update(Message::ConfirmDeleteServer("mud".into())),
+            Effect::None
+        ));
+        assert_eq!(state.error.as_deref(), Some(SERVER_DELETE_BLOCKED));
+
+        // A sibling profile without a session is still deletable.
+        state.update(Message::DeleteProfile("alt".into()));
+        assert!(matches!(
+            state.update(Message::ConfirmDeleteProfile("alt".into())),
             Effect::Persist { .. }
         ));
     }

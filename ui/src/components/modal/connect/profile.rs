@@ -20,6 +20,7 @@ use smudgy_core::models::profile::{
 };
 use smudgy_core::models::server::Server;
 use smudgy_core::models::server::{self as server_model, ServerCas};
+use smudgy_session_model::connect::OpenSessions;
 
 use super::{
     AppliedProfileOperation, Message, ProfileCrudAction, ProfileFormField, ProfileOperationAction,
@@ -226,6 +227,17 @@ pub(super) fn handle_delete_profile(state: &mut State) -> Task<Message> {
         state.profile_crud_error = Some(t!("profile-error-delete-no-server"));
         return Task::none();
     };
+    if state
+        .open_sessions
+        .has_profile(&server.name, &expected.name)
+    {
+        warn!(
+            "Refusing to delete profile '{}' on '{}' while it has an open session",
+            expected.name, server.name
+        );
+        state.profile_crud_error = Some(t!("profile-delete-blocked-open-session"));
+        return Task::none();
+    }
     let target_name = expected.name.clone();
     start_profile_operation(
         state,
@@ -269,11 +281,20 @@ fn start_profile_operation(
 
 // --- View Logic ---
 
-/// Renders the profile create/edit form, or the delete confirmation.
+/// Renders the profile create/edit form, or the delete confirmation. A
+/// profile with an open session in `open` renders its delete disabled.
 pub(super) fn view_profile_form<'a>(
     state: &'a State,
     action: &'a ProfileCrudAction,
+    open: &OpenSessions,
 ) -> Element<'a, Message> {
+    let delete_blocked = match action {
+        ProfileCrudAction::Edit { server, expected }
+        | ProfileCrudAction::ConfirmDelete { server, expected } => {
+            open.has_profile(&server.name, &expected.name)
+        }
+        ProfileCrudAction::Create { .. } => false,
+    };
     match action {
         ProfileCrudAction::Create { .. } => {
             let name_field = column![
@@ -339,10 +360,17 @@ pub(super) fn view_profile_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
             let delete_button = button(text(t!("profile-delete"))).style(builtins::button::link);
-            let delete_button = if state.pending_profile_operation.is_some() {
+            let delete_button = if state.pending_profile_operation.is_some() || delete_blocked {
                 delete_button
             } else {
                 delete_button.on_press(Message::RequestConfirmDeleteProfile)
+            };
+            let delete_footer: Element<'a, Message> = if delete_blocked {
+                column![delete_button, delete_blocked_hint()]
+                    .spacing(4)
+                    .into()
+            } else {
+                delete_button.into()
             };
 
             smudgy_ui_shared::connect_modal::form(
@@ -358,7 +386,7 @@ pub(super) fn view_profile_form<'a>(
                     .push(cancel_button)
                     .spacing(10)
                     .into(),
-                Some(delete_button.into()),
+                Some(delete_footer),
             )
         }
         ProfileCrudAction::ConfirmDelete { expected, .. } => {
@@ -368,11 +396,12 @@ pub(super) fn view_profile_form<'a>(
             let confirm_delete_button = button(text(t!("profile-confirm-delete-action")))
                 .style(builtins::button::secondary)
                 .padding([8, 18]);
-            let confirm_delete_button = if state.pending_profile_operation.is_some() {
-                confirm_delete_button
-            } else {
-                confirm_delete_button.on_press(Message::ConfirmDeleteProfile)
-            };
+            let confirm_delete_button =
+                if state.pending_profile_operation.is_some() || delete_blocked {
+                    confirm_delete_button
+                } else {
+                    confirm_delete_button.on_press(Message::ConfirmDeleteProfile)
+                };
             let cancel_delete_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
@@ -380,7 +409,14 @@ pub(super) fn view_profile_form<'a>(
 
             smudgy_ui_shared::connect_modal::form(
                 text(t!("profile-delete")).size(Pixels(22.0)).into(),
-                vec![confirmation_text.into(), profile_error(state)],
+                vec![
+                    confirmation_text.into(),
+                    if delete_blocked {
+                        delete_blocked_hint()
+                    } else {
+                        profile_error(state)
+                    },
+                ],
                 Row::new()
                     .push(confirm_delete_button)
                     .push(cancel_delete_button)
@@ -390,6 +426,14 @@ pub(super) fn view_profile_form<'a>(
             )
         }
     }
+}
+
+/// Why a profile's delete is disabled: a session is open on it.
+fn delete_blocked_hint() -> Element<'static, Message> {
+    text(t!("profile-delete-blocked-open-session"))
+        .size(12)
+        .style(builtins::text::muted)
+        .into()
 }
 
 /// A muted field label rendered above its input.

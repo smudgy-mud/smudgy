@@ -15,6 +15,7 @@ use smudgy_core::models::server::{
     ServerCas, link_url_host, load_server, update_server_if_unchanged, with_server_if_unchanged,
 };
 use smudgy_core::models::{profile::Profile, server::Server};
+use smudgy_session_model::connect::OpenSessions;
 use smudgy_ui_shared::connect_model::{
     ConnectViewModel, Form as ConnectForm, Intent as ConnectIntent, Panel as ConnectPanel,
     ProfileInventory, ProfileSummary,
@@ -587,6 +588,10 @@ pub struct State {
     /// Monotonic id of the most recent usage request. `Task::perform` completions are
     /// unordered: a slow pre-clear scan must not overwrite the post-clear figure.
     image_cache_usage_request: u64,
+    /// The server/profile pairs with an open session, refreshed by the window
+    /// before every message. Deleting any of them is refused; the view gates
+    /// its buttons on the live store, and these guards back that up.
+    open_sessions: OpenSessions,
 }
 
 // Manual `Debug` (not derived) so the live credential buffer `profile_form_password`
@@ -806,6 +811,7 @@ impl Default for State {
             pending_profile_operation: None,
             image_cache_usage: None,
             image_cache_usage_request: 0,
+            open_sessions: OpenSessions::default(),
         }
     }
 }
@@ -813,6 +819,11 @@ impl Default for State {
 impl State {
     pub fn set_session_open_error(&mut self, error: impl Into<String>) {
         self.session_open_error = Some(error.into());
+    }
+
+    /// Replace the open-session snapshot the delete guards check.
+    pub fn set_open_sessions(&mut self, open: OpenSessions) {
+        self.open_sessions = open;
     }
 
     #[cfg(all(test, feature = "web-audio-cpal"))]
@@ -1453,6 +1464,9 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
         Message::RequestConfirmDeleteServer(server_name) => {
             if state.pending_server_operation.is_some() {
                 warn!("Ignoring server delete request while an operation is pending");
+            } else if state.open_sessions.has_server(&server_name) {
+                warn!("Refusing to delete server '{server_name}' while it has an open session");
+                state.server_crud_error = Some(t!("server-delete-blocked-open-session"));
             } else if let Some(expected) = state
                 .servers
                 .iter()
@@ -1473,6 +1487,14 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             } else if let Some(ServerCrudAction::ConfirmDelete(expected)) =
                 state.server_action.clone()
             {
+                if state.open_sessions.has_server(&expected.name) {
+                    warn!(
+                        "Refusing to delete server '{}' while it has an open session",
+                        expected.name
+                    );
+                    state.server_crud_error = Some(t!("server-delete-blocked-open-session"));
+                    return (task, event);
+                }
                 state.server_crud_error = None;
                 let envelope = ServerOperationEnvelope {
                     id: next_server_operation_id(state),
@@ -1688,6 +1710,17 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
             } else if let Some(ProfileCrudAction::Edit { server, expected }) =
                 state.profile_action.clone()
             {
+                if state
+                    .open_sessions
+                    .has_profile(&server.name, &expected.name)
+                {
+                    warn!(
+                        "Refusing to delete profile '{}' on '{}' while it has an open session",
+                        expected.name, server.name
+                    );
+                    state.profile_crud_error = Some(t!("profile-delete-blocked-open-session"));
+                    return (task, event);
+                }
                 state.profile_action = Some(ProfileCrudAction::ConfirmDelete { server, expected });
                 state.profile_crud_error = None;
                 advance_profile_form_revision(state);
@@ -1909,8 +1942,9 @@ fn view_model(state: &State) -> ConnectViewModel<'_> {
     )
 }
 
-/// The main view function for the connect modal.
-pub fn view(state: &State) -> Element<'_, Message> {
+/// The main view function for the connect modal. `open` is the live set of
+/// open sessions; a server or profile in it renders its delete disabled.
+pub fn view<'a>(state: &'a State, open: &OpenSessions) -> Element<'a, Message> {
     let model = view_model(state);
     let server_pane = view_server_list(state, model.servers, model.new_server);
 
@@ -1924,6 +1958,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
             view_server_form(
                 state,
                 state.server_action.as_ref().expect("server form is open"),
+                open,
             ),
             false,
         ),
@@ -1931,6 +1966,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
             view_profile_form(
                 state,
                 state.profile_action.as_ref().expect("profile form is open"),
+                open,
             ),
             false,
         ),

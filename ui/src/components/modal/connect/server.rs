@@ -15,6 +15,7 @@ use crate::theme::Element;
 use crate::theme::builtins;
 
 use smudgy_core::models::server::{ServerCas, ServerConfig, parse_wss_address};
+use smudgy_session_model::connect::OpenSessions;
 
 use super::{
     AppliedServerOperation, Message, ServerCrudAction, ServerFormField, ServerOperationAction,
@@ -406,7 +407,14 @@ pub(super) fn view_server_list<'a>(
 pub(super) fn view_server_form<'a>(
     state: &'a State,
     action: &'a ServerCrudAction,
+    open: &OpenSessions,
 ) -> Element<'a, Message> {
+    let delete_blocked = match action {
+        ServerCrudAction::Edit(expected) | ServerCrudAction::ConfirmDelete(expected) => {
+            open.has_server(&expected.name)
+        }
+        ServerCrudAction::Create => false,
+    };
     match action {
         ServerCrudAction::Create => {
             // --- Create Form ---
@@ -509,7 +517,7 @@ pub(super) fn view_server_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelServerForm);
             let mut delete_button = button(text(t!("server-delete"))).style(builtins::button::link);
-            if state.pending_server_operation.is_none() {
+            if state.pending_server_operation.is_none() && !delete_blocked {
                 delete_button =
                     delete_button.on_press(Message::RequestConfirmDeleteServer(name.clone()));
             }
@@ -552,7 +560,13 @@ pub(super) fn view_server_form<'a>(
                             .push(clear_cache_button)
                             .spacing(10)
                             .align_y(iced::Alignment::Center),
-                        delete_button,
+                        if delete_blocked {
+                            column![delete_button, delete_blocked_hint()]
+                                .spacing(4)
+                                .into()
+                        } else {
+                            Element::from(delete_button)
+                        },
                     ]
                     .spacing(15)
                     .into(),
@@ -568,7 +582,7 @@ pub(super) fn view_server_form<'a>(
             let mut confirm_delete_button = button(text(t!("server-confirm-delete-action")))
                 .style(builtins::button::secondary)
                 .padding([8, 18]);
-            if state.pending_server_operation.is_none() {
+            if state.pending_server_operation.is_none() && !delete_blocked {
                 confirm_delete_button =
                     confirm_delete_button.on_press(Message::ConfirmDeleteServer);
             }
@@ -579,7 +593,14 @@ pub(super) fn view_server_form<'a>(
 
             smudgy_ui_shared::connect_modal::form(
                 text(t!("server-delete")).size(Pixels(22.0)).into(),
-                vec![confirmation_text.into(), server_error(state)],
+                vec![
+                    confirmation_text.into(),
+                    if delete_blocked {
+                        delete_blocked_hint()
+                    } else {
+                        server_error(state)
+                    },
+                ],
                 Row::new()
                     .push(confirm_delete_button)
                     .push(cancel_delete_button)
@@ -589,6 +610,14 @@ pub(super) fn view_server_form<'a>(
             )
         }
     }
+}
+
+/// Why a server's delete is disabled: a session is open on it.
+fn delete_blocked_hint() -> Element<'static, Message> {
+    text(t!("server-delete-blocked-open-session"))
+        .size(12)
+        .style(builtins::text::muted)
+        .into()
 }
 
 /// Renders the current server-form error (if any) as danger text, or an empty

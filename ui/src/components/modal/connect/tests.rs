@@ -1018,3 +1018,110 @@ fn opening_prefers_recent_server_and_falls_back_if_it_was_removed() {
     assert_eq!(initial_server(&servers, None).unwrap().name, "Alpha");
     assert!(initial_server(&[], Some("Zulu")).is_none());
 }
+
+fn open_on(server: &str, profile: &str) -> OpenSessions {
+    OpenSessions::from_pairs([(server, profile)])
+}
+
+#[test]
+fn a_server_with_an_open_session_cannot_be_deleted() {
+    let mut state = initial_state();
+    state.servers.push(server("mud"));
+    state.servers.push(server("other"));
+    state.set_open_sessions(open_on("mud", "Default"));
+
+    let _ = update(
+        &mut state,
+        Message::RequestConfirmDeleteServer("mud".into()),
+    );
+    assert!(
+        !matches!(
+            state.server_action,
+            Some(ServerCrudAction::ConfirmDelete(_))
+        ),
+        "the confirmation must not open for a server with a live session"
+    );
+    assert_eq!(
+        state.server_crud_error,
+        Some(t!("server-delete-blocked-open-session"))
+    );
+
+    // A server without a session still reaches its confirmation.
+    let _ = update(
+        &mut state,
+        Message::RequestConfirmDeleteServer("other".into()),
+    );
+    assert!(matches!(
+        &state.server_action,
+        Some(ServerCrudAction::ConfirmDelete(expected)) if expected.name == "other"
+    ));
+}
+
+#[test]
+fn a_session_opened_during_server_confirmation_blocks_the_delete() {
+    let mut state = initial_state();
+    state.servers.push(server("mud"));
+    let _ = update(
+        &mut state,
+        Message::RequestConfirmDeleteServer("mud".into()),
+    );
+    assert!(matches!(
+        state.server_action,
+        Some(ServerCrudAction::ConfirmDelete(_))
+    ));
+
+    state.set_open_sessions(open_on("mud", "Default"));
+    let _ = update(&mut state, Message::ConfirmDeleteServer);
+    assert!(state.pending_server_operation.is_none());
+    assert_eq!(
+        state.server_crud_error,
+        Some(t!("server-delete-blocked-open-session"))
+    );
+}
+
+#[test]
+fn a_profile_with_an_open_session_cannot_be_deleted() {
+    let mut state = initial_state();
+    state.servers.push(server("mud"));
+    state.profile_action = Some(ProfileCrudAction::Edit {
+        server: server("mud"),
+        expected: profile("Mage", "", ""),
+    });
+    state.set_open_sessions(open_on("mud", "Mage"));
+
+    let _ = update(&mut state, Message::RequestConfirmDeleteProfile);
+    assert!(matches!(
+        state.profile_action,
+        Some(ProfileCrudAction::Edit { .. })
+    ));
+    assert_eq!(
+        state.profile_crud_error,
+        Some(t!("profile-delete-blocked-open-session"))
+    );
+
+    // A session on a sibling profile does not block this one.
+    state.set_open_sessions(open_on("mud", "Thief"));
+    let _ = update(&mut state, Message::RequestConfirmDeleteProfile);
+    assert!(matches!(
+        state.profile_action,
+        Some(ProfileCrudAction::ConfirmDelete { .. })
+    ));
+}
+
+#[test]
+fn a_session_opened_during_profile_confirmation_blocks_the_delete() {
+    let mut state = initial_state();
+    state.servers.push(server("mud"));
+    state.profile_action = Some(ProfileCrudAction::ConfirmDelete {
+        server: server("mud"),
+        expected: profile("Mage", "", ""),
+    });
+    state.set_open_sessions(open_on("mud", "Mage"));
+
+    let _ = update(&mut state, Message::ConfirmDeleteProfile);
+    assert!(state.pending_profile_operation.is_none());
+    assert_eq!(
+        state.profile_crud_error,
+        Some(t!("profile-delete-blocked-open-session"))
+    );
+}
