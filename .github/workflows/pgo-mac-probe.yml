@@ -13,15 +13,6 @@ on:
         description: Base compiler flags for pgo.py generate (space separated), e.g. -Cdebuginfo=1
         required: false
         default: ''
-  # Dispatch only resolves workflows that exist on the default branch, so until this
-  # file lands there a push that touches the probe itself runs it on the branch.
-  push:
-    branches: ['perf/**']
-    paths:
-      - .github/workflows/pgo-mac-probe.yml
-      - bin/pgo_probe.py
-      - bin/pgo.py
-      - bin/pgo-apple-link.sh
 
 concurrency:
   group: pgo-mac-probe-${{ github.ref }}
