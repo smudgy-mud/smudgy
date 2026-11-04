@@ -1,7 +1,10 @@
 """The smoke exercises the same instrumented link as the application build and stays strict."""
 import ast
 import inspect
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import pgo_smoke as smoke
 
@@ -49,6 +52,25 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("-Cllvm-args=-pgo-warn-missing-function", calls["use"])
         self.assertNotIn("instrumented_link_flags", ast.unparse(ast.parse(inspect.getsource(smoke)))
                          .split("profile-use", 1)[1])
+
+    def test_output_directory_may_exist_but_not_hold_a_previous_run(self):
+        class Reached(Exception):
+            pass
+
+        def compiler(*command):
+            raise Reached(command)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(smoke.pgo, "native_target", lambda target=None: "x86_64-unknown-linux-gnu"), \
+                patch.object(smoke.pgo, "capture", compiler):
+            fresh = Path(temp)/"new"
+            with self.assertRaises(Reached):
+                smoke.smoke(fresh)
+            self.assertTrue(fresh.is_dir())
+            with self.assertRaises(Reached):
+                smoke.smoke(fresh)
+            (fresh/"result.json").write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "not empty"):
+                smoke.smoke(fresh)
 
     def test_any_profile_use_diagnostic_fails_the_smoke(self):
         # No compiler, target or helper name is exempt: the smoke has no review list.

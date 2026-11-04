@@ -24,10 +24,12 @@ def check_probe_counts(profile):
 
 def smoke(output, target=None):
     target = pgo.native_target(target)
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    pgo.require(not any(output.iterdir()),
+                f"Smoke output {output} is not empty; remove it or pass --output a fresh directory")
     compiler = pgo.capture("rustc", "-vV")
     tool = pgo.profdata_tool(compiler)
-    output = output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
     source = output/"probe.rs"
     source.write_text('''use std::hint::black_box;
 #[inline(never)]

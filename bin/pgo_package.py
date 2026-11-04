@@ -37,7 +37,12 @@ def stage(manifest_path, target, destination):
 def pair_identity(manifest):
     identity = manifest["build_identity"]
     environment = identity.get("native_environment") or {}
+    # Native V8 inputs differ per architecture by path and bytes; what must agree is
+    # whether a qualified native profile was used at all, and from which source/compiler.
+    native = (identity.get("native_inputs") or {}).get("native_pgo")
+    native_pgo = native and {key: native["manifest"].get(key) for key in ("stage", "compiler", "source_sha256")}
     return dict(
+        native_pgo=native_pgo or None,
         revision=manifest["revision"], files=identity["files"], compiler=identity.get("compiler"),
         cargo=identity.get("cargo"), helper_sha256=identity.get("helper_sha256"),
         # Cargo configs and local dependencies are keyed by machine paths; pair their contents.

@@ -184,6 +184,8 @@ class PackageTests(unittest.TestCase):
                                   ("helper_sha256", "other", "helper_sha256"),
                                   ("native_environment", dict(MACOSX_DEPLOYMENT_TARGET="12.0", RUSTY_V8_ARCHIVE="/x/v8.a"), "environment"),
                                   ("configs", {"/home/other/.cargo/config.toml": "other config"}, "configs"),
+                                  ("native_inputs", {"native_pgo": {"path": "/x/native.json", "sha256": "n", "manifest": {
+                                      "stage": "native-pgo-use", "compiler": "clang 20", "source_sha256": "v8"}}}, "native_pgo"),
                                   ("deployment_target", None, "deployment-target")):
             with self.subTest(key=key):
                 manifest = pgo.read(x86_64)
@@ -215,6 +217,23 @@ class PackageTests(unittest.TestCase):
         manifest["build_identity"]["local_dependencies"] = {"/Users/intel/deps": {"lib.rs": "patched"}}
         pgo.write(x86_64, manifest)
         with self.assertRaisesRegex(RuntimeError, "local_dependencies"):
+            pgo_package.pair(arm64, x86_64)
+
+    def test_paired_native_profiles_compare_provenance_not_paths(self):
+        def native(host, source="v8 source"):
+            return {"RUSTY_V8_ARCHIVE": {"path": f"/{host}/v8.a", "sha256": f"{host} archive"},
+                    "native_pgo": {"path": f"/{host}/native.json", "sha256": f"{host} manifest",
+                                   "manifest": {"stage": "native-pgo-use", "compiler": "clang 20", "source_sha256": source}}}
+        arm64, x86_64 = self.mac_pair(native_inputs=native("intel"))
+        with self.assertRaisesRegex(RuntimeError, "native_pgo"):
+            pgo_package.pair(arm64, x86_64)
+        manifest = pgo.read(arm64)
+        manifest["build_identity"]["native_inputs"] = native("arm")
+        pgo.write(arm64, manifest)
+        pgo_package.pair(arm64, x86_64)
+        manifest["build_identity"]["native_inputs"] = native("arm", source="other v8 source")
+        pgo.write(arm64, manifest)
+        with self.assertRaisesRegex(RuntimeError, "native_pgo"):
             pgo_package.pair(arm64, x86_64)
 
     def fake_lipo(self, slices):

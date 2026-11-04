@@ -49,6 +49,24 @@ class WiringTests(unittest.TestCase):
         self.rejects("bin/release-linux.sh", '--base "$manifest" --runtime-version',
                      '--base other.yml --runtime-version', "overlay must derive from the reviewed manifest")
 
+    def test_windows_pending_manifest_handshake_compares_one_resolved_path(self):
+        # -BuildOnly records the manifest path and -SkipBuild compares it; both phases
+        # must see the same string however the operator spelled it on either command.
+        script = (audit.ROOT/"bin/release.ps1").read_text(encoding="utf-8")
+        resolve = script.index("$PgoManifest = (Resolve-Path -LiteralPath $PgoManifest).Path")
+        self.assertLess(resolve, script.index("verify $PgoManifest"))
+        self.assertIn("Set-Content -LiteralPath $pgoPending -Value $PgoManifest", script)
+        self.assertIn("if ($pending -ne $PgoManifest)", script)
+
+    def test_linux_release_accepts_both_manifest_argument_forms_before_needing_python(self):
+        script = (audit.ROOT/"bin/release-linux.sh").read_text(encoding="utf-8")
+        parsing, rest = script.split('if [[ -n "$PGO_MANIFEST" ]]; then', 1)
+        self.assertIn('--pgo-manifest) PGO_MANIFEST=', parsing)
+        self.assertIn('--pgo-manifest=*) PGO_MANIFEST="${1#*=}"', parsing)
+        resolution = rest.split("cd \"$(dirname \"$0\")/..\"", 1)[0]
+        self.assertNotIn("python", resolution)
+        self.assertIn('[[ -f "$PGO_MANIFEST" ]]', resolution)
+
 
 if __name__ == "__main__":
     unittest.main()

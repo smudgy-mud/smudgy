@@ -89,6 +89,8 @@ then reports for every one of the tens of thousands of dead functions in the
 application. The training binary keeps its dead code, as it does on Linux and
 Windows, so every record survives; the `use` build keeps rustc's default link line
 and is dead-stripped as usual. `-Clinker` base flags are refused on Apple targets.
+Linux and Windows need no such step: rustc already withholds `--gc-sections` and
+`/OPT:REF` from a profile-generate link, so their training binaries keep every record.
 
 One class of missing-record diagnostic is structural on every platform and is
 recorded rather than fatal. Cargo compiles and instruments every crate in the

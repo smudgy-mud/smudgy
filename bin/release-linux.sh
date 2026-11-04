@@ -49,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --arch=*) ARCH="${1#*=}" ;;
         --skip-build) SKIP_BUILD=1 ;;
         --pgo-manifest) PGO_MANIFEST="${2:?--pgo-manifest requires a value}"; shift ;;
+        --pgo-manifest=*) PGO_MANIFEST="${1#*=}" ;;
         -h|--help)
             echo "Usage: bin/release-linux.sh [--arch <x86_64|aarch64>] [--skip-build] [--pgo-manifest <manifest>]"
             echo "  Builds and bundles a self-distributed smudgy Flatpak for --arch"
@@ -61,7 +62,9 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ -n "$PGO_MANIFEST" ]]; then
     [[ "$SKIP_BUILD" -eq 0 ]] || { echo "error: --pgo-manifest cannot use --skip-build" >&2; exit 1; }
-    PGO_MANIFEST="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$PGO_MANIFEST")"
+    [[ -f "$PGO_MANIFEST" ]] || { echo "error: PGO manifest not found: $PGO_MANIFEST" >&2; exit 1; }
+    # Absolute before the cd below, without the interpreter the prerequisite checks require.
+    PGO_MANIFEST="$(cd "$(dirname "$PGO_MANIFEST")" && pwd -P)/$(basename "$PGO_MANIFEST")"
 fi
 
 cd "$(dirname "$0")/.."

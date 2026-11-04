@@ -43,7 +43,9 @@ PGO_DIAGNOSTIC = re.compile(
 # profile that lacks a record for every function it dropped and the profile-use
 # compile reports each one as having no data. The training binary therefore links
 # through bin/pgo-apple-link.sh, which removes `-dead_strip` and nothing else; the
-# profile-use build keeps rustc's default link line.
+# profile-use build keeps rustc's default link line. GNU and MSVC targets need nothing:
+# rustc omits --gc-sections and /OPT:REF when profile generation is enabled, while it
+# passes -dead_strip to the Apple linker unconditionally.
 INSTRUMENTED_LINK_FLAGS = {"darwin": (f"-Clinker={ROOT/'bin/pgo-apple-link.sh'}",)}
 # Cargo compiles and instruments every crate in the resolved graph, but rustc links
 # only the crates that some linked crate's code names, so a dependency nothing
