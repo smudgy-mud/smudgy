@@ -1,9 +1,10 @@
-"""Opt-in Windows PGO: generate, collect, merge, use, validate, and export.
+"""Opt-in native-target PGO: generate, collect, merge, use, validate, and export.
 
 Run `python bin/pgo.py --help`. Workloads are external JSON files; no corpus,
 credentials, personal data home, or machine-specific path is built into this tool.
 """
 import argparse
+import configparser
 import hashlib
 import json
 import os
@@ -15,7 +16,13 @@ import sys
 import time
 import tomllib
 
-TARGET = "x86_64-pc-windows-msvc"
+TARGETS = {
+    "x86_64-pc-windows-msvc": ("win32", "smudgy.exe"),
+    "x86_64-unknown-linux-gnu": ("linux", "smudgy"),
+    "aarch64-unknown-linux-gnu": ("linux", "smudgy"),
+    "x86_64-apple-darwin": ("darwin", "smudgy"),
+    "aarch64-apple-darwin": ("darwin", "smudgy"),
+}
 ROOT = Path(__file__).resolve().parents[1]
 FEATURES = "smudgy_ui/web-audio-cpal"
 COMPILER_OVERRIDES = {
@@ -31,6 +38,27 @@ EMBEDDED_COMMIT_VARIABLES = ("SMUDGY_GIT_COMMIT", "GITHUB_SHA", "CI_COMMIT_SHA")
 PGO_DIAGNOSTIC = re.compile(
     r"^\s*(?:\x1b\[[0-9;]*m\s*)*(?:warning|error)\b.*(?:instrumentation profile|no profile data available"
     r"|control flow change detected|hash mismatch|inconsistent number of counts|profile data may be out of date)", re.I)
+# Darwin's linker drops dead functions together with their profile records
+# (https://reviews.llvm.org/D25456), so a dead-stripped training binary flushes a
+# profile that lacks a record for every function it dropped and the profile-use
+# compile reports each one as having no data. The training binary therefore links
+# through bin/pgo-apple-link.sh, which removes `-dead_strip` and nothing else; the
+# profile-use build keeps rustc's default link line. GNU and MSVC targets need nothing:
+# rustc omits --gc-sections and /OPT:REF when profile generation is enabled, while it
+# passes -dead_strip to the Apple linker unconditionally.
+INSTRUMENTED_LINK_FLAGS = {"darwin": (f"-Clinker={ROOT/'bin/pgo-apple-link.sh'}",)}
+# Cargo compiles and instruments every crate in the resolved graph, but rustc links
+# only the crates that some linked crate's code names, so a dependency nothing
+# references (syn behind a proc-macro helper, a logger behind an unused feature) never
+# enters the instrumented executable, flushes no record, and is reported at profile
+# use as having no data for each function compiled in its codegen unit. The merged
+# profile is the evidence: a codegen unit with no record at all, neither one of its
+# internal functions (recorded under the unit's name) nor one of its crate's own
+# functions (named with the crate's disambiguator), was not linked. A unit with any
+# record was linked, and every diagnostic from it still stands.
+MISSING_RECORD = re.compile(
+    r"^\s*warning: (?P<unit>(?P<crate>[A-Za-z0-9_]+)\.[0-9a-f]+-cgu\.\d+): no profile data available for function "
+    r"(?P<function>\S+) Hash = \d+ up to 0 count discarded$")
 # Base flags that would hide or reconfigure those diagnostics, or override PGO itself.
 MANAGED_FLAG_PREFIXES = ("-A", "--cap-lints", "-Cllvm-args", "-Cprofile", "-Zprofile")
 RESERVED_SCENARIO_VARIABLES = {"LLVM_PROFILE_FILE", "PGO_SCENARIO_OUTPUT", "PGO_EXECUTABLE"}
@@ -67,6 +95,47 @@ def worktree_status():
     return capture("git", "status", "--porcelain")
 
 
+def instrumented_link_flags(target):
+    """Extra flags for the profile-generate build only: keep every record alive."""
+    return list(INSTRUMENTED_LINK_FLAGS.get(TARGETS[target][0], ()))
+
+
+def profile_function_names(run, identity):
+    """Every record name in the merged profile, as llvm-profdata lists them."""
+    return capture(str(profdata_tool(identity["compiler"])), "show", "--all-functions", str(run/"merged.profdata"))
+
+
+def unlinked_crate_diagnostics(diagnostics, names):
+    """Split missing-record diagnostics from codegen units the profile never saw
+    (crates rustc did not link) from the diagnostics that stand."""
+    units = {}
+    for line in diagnostics:
+        match = MISSING_RECORD.match(line)
+        if match:
+            tokens = units.setdefault(match["unit"], set())
+            # v0 names length-prefix every element, so the crate name is exact.
+            token = re.search(rf"Cs[0-9A-Za-z]+_{len(match['crate'])}{match['crate']}", match["function"])
+            if token:
+                tokens.add(token.group(0))
+    unlinked = {unit: 0 for unit, tokens in units.items()
+                if f"  {unit};" not in names and not any(token in names for token in tokens)}
+    remaining = []
+    for line in diagnostics:
+        match = MISSING_RECORD.match(line)
+        if match and match["unit"] in unlinked:
+            unlinked[match["unit"]] += 1
+        else:
+            remaining.append(line)
+    return remaining, dict(sorted(unlinked.items()))
+
+
+def deployment_target(target):
+    """The minimum OS version rustc links Apple slices for, honouring MACOSX_DEPLOYMENT_TARGET."""
+    if TARGETS[target][0] != "darwin":
+        return None
+    return capture("rustc", "--print", "deployment-target", "--target", target)
+
+
 def toolchain_rustc():
     """The PATH-selected toolchain's own compiler. Cargo is pinned to it so the
     compilation and the profile merge cannot resolve to different LLVMs."""
@@ -76,21 +145,72 @@ def toolchain_rustc():
     return sysroot, rustc
 
 
-def profdata_tool(compiler):
-    """The toolchain's llvm-profdata, required to share rustc's LLVM version."""
-    sysroot, _ = toolchain_rustc()
-    tool = sysroot/f"lib/rustlib/{TARGET}/bin/llvm-profdata.exe"
-    require(tool.is_file(), "Install llvm-tools-preview for the repository toolchain")
-    # rustup's tools print the release with a `-rust-<version>-<channel>` suffix that
-    # `rustc -vV` omits, so compare the numeric release only.
-    rustc_llvm = LLVM_RELEASE.search(compiler)
-    tool_llvm = LLVM_RELEASE.search(capture(str(tool), "--version"))
-    require(rustc_llvm and tool_llvm and rustc_llvm.group(1) == tool_llvm.group(1),
-            "llvm-profdata must come from the same LLVM release as rustc; install llvm-tools-preview for this toolchain")
-    return tool
+def host_target():
+    compiler = capture("rustc", "-vV")
+    host = re.search(r"^host: (.+)$", compiler, re.M)
+    require(host is not None, "rustc did not report its host target")
+    return host[1]
 
 
-def identity():
+def native_target(target=None):
+    host = host_target()
+    target = target or host
+    require(target in TARGETS, f"Unsupported PGO target: {target}")
+    require(TARGETS[target][0] == sys.platform and target == host,
+            f"Train and build {target} on its matching native Rust host; this host is {host}")
+    return target
+
+
+def executable_name(target):
+    require(target in TARGETS, f"Unsupported PGO target: {target}")
+    return TARGETS[target][1]
+
+
+def source_files():
+    names = capture("git", "ls-files", "-c", "-o", "--exclude-standard", "-z").split("\0")
+    return {name: sha(ROOT/name) for name in sorted(set(names))
+            if name and (ROOT/name).is_file()}
+
+
+def flatpak_environment(path=Path("/.flatpak-info")):
+    """Keep stable SDK identity, excluding ephemeral sandbox instance IDs."""
+    if not path.is_file():
+        return None
+    info = configparser.ConfigParser(interpolation=None)
+    info.read(path, encoding="utf-8")
+    return {section: {key: info.get(section, key) for key in keys if info.has_option(section, key)}
+            for section, keys in {"Application": ("name", "runtime", "sdk"),
+                                  "Runtime": ("name", "runtime", "sdk"),
+                                  "Instance": ("runtime-commit", "app-commit", "arch", "branch")}.items()}
+
+
+def native_inputs(target):
+    """Fingerprint optional externally built V8 inputs, including their profile."""
+    files = {}
+    for name in ("RUSTY_V8_ARCHIVE", "RUSTY_V8_SRC_BINDING_PATH"):
+        value = os.environ.get(name)
+        if value:
+            path = Path(value).resolve()
+            require(path.is_file(), f"PGO requires a local, immutable {name}")
+            files[name] = dict(path=str(path), sha256=sha(path))
+    manifest_path = os.environ.get("SMUDGY_NATIVE_PGO_MANIFEST")
+    if manifest_path:
+        manifest = read(manifest_path)
+        require(manifest.get("schema") == 1 and manifest.get("stage") == "native-pgo-use",
+                "Expected a native profile-use manifest")
+        require(manifest.get("target") == target, "Native V8 PGO target differs from Rust target")
+        require(manifest.get("compiler") and manifest.get("source_sha256"), "Native manifest needs compiler and source provenance")
+        for name, key in (("RUSTY_V8_ARCHIVE", "archive"), ("RUSTY_V8_SRC_BINDING_PATH", "bindings")):
+            require(name in files and files[name]["sha256"] == manifest[key]["sha256"],
+                    f"Native PGO {key} differs from selected V8 input")
+        profile = manifest["profile"]
+        require(sha(profile["path"]) == profile["sha256"], "Native PGO profile changed")
+        files["native_pgo"] = dict(path=str(Path(manifest_path).resolve()),
+                                   sha256=sha(manifest_path), manifest=manifest)
+    return files
+
+
+def identity(target=None):
     """Include local patch sources and Cargo configuration, not just Git HEAD."""
     forbidden = [key for key in os.environ if os.environ[key] and (
         key in COMPILER_OVERRIDES | {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}
@@ -114,13 +234,12 @@ def identity():
                 require(not (COMPILER_OVERRIDES | {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}) & config.get("env", {}).keys(),
                         f"Remove compiler/flag environment overrides from {path}")
                 configs[str(path)] = sha(path)
-    names = capture("git", "ls-files", "-c", "-o", "--exclude-standard", "-z").split("\0")
-    files = {name: sha(ROOT/name) for name in sorted(set(names))
-             if name and (ROOT/name).is_file()}
+    target = native_target(target)
+    files = source_files()
     # Cargo metadata resolves the same shipping feature graph, including path
     # dependencies outside the checkout and generated target/patch sources.
     metadata = json.loads(capture("cargo", "metadata", "--locked", "--format-version", "1",
-                                  "--filter-platform", TARGET, "--features", FEATURES))
+                                  "--filter-platform", target, "--features", FEATURES))
     local_dependencies = {}
     for package in metadata["packages"]:
         if package["source"] is not None:
@@ -134,31 +253,41 @@ def identity():
         }
     native_environment = {name: os.environ.get(name) for name in (
         "RUSTC", "RUSTY_V8_ARCHIVE", "V8_FROM_SOURCE", "V8_FORCE_DEBUG",
+        "RUSTY_V8_SRC_BINDING_PATH", "SMUDGY_NATIVE_PGO_MANIFEST", "GN_ARGS", "EXTRA_GN_ARGS",
         "CC", "CXX", "CL", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LIB", "INCLUDE",
-        *EMBEDDED_COMMIT_VARIABLES)}
-    # HEAD is stamped into the binary when no commit variable is set, so it is an input too.
-    return dict(compiler=capture("rustc", "-vV"), cargo=capture("cargo", "-V"), revision=head_revision(),
+        "MACOSX_DEPLOYMENT_TARGET", "SDKROOT", *EMBEDDED_COMMIT_VARIABLES)}
+    return dict(compiler=capture("rustc", "-vV"), cargo=capture("cargo", "-V"),
+                target=target, deployment_target=deployment_target(target),
                 files=files, configs=configs, local_dependencies=local_dependencies,
+                native_inputs=native_inputs(target), flatpak=flatpak_environment(),
                 native_environment=native_environment, helper_sha256=sha(__file__))
 
 
-def build(run, stage, rustflags=()):
-    current = identity()
+def build(run, stage, rustflags=(), target=None, allow_dirty=False):
+    target = native_target(target if stage == "generate" else read(run/"run.json")["target"])
+    current = identity(target)
     if stage == "generate":
-        run.mkdir(parents=True, exist_ok=False)
         require(not any(flag.startswith(MANAGED_FLAG_PREFIXES) or "pgo-" in flag for flag in rustflags),
                 "PGO flags, lint levels, lint caps and LLVM arguments are managed by this tool")
-        config = dict(source=str(ROOT), revision=head_revision(), worktree_status=worktree_status(),
-                      target=TARGET, features=FEATURES, base_flags=list(rustflags), identity=current)
+        require(not (instrumented_link_flags(target) and any(flag.startswith("-Clinker") for flag in rustflags)),
+                "The instrumented link is managed by this tool on Apple targets; -Clinker base flags are unsupported")
+        # The recorded revision must describe the compiled bytes. A modified checkout is
+        # allowed only for experiments, which packaging refuses.
+        status = worktree_status()
+        require(allow_dirty or not status,
+                "Commit or stash local changes before PGO; --allow-dirty starts an experiment that cannot be packaged")
+        run.mkdir(parents=True, exist_ok=False)
+        config = dict(source=str(ROOT), revision=head_revision(), worktree_status=status, allow_dirty=allow_dirty,
+                      target=target, features=FEATURES, base_flags=list(rustflags), identity=current)
         write(run/"run.json", config)
         (run/"raw-unassigned").mkdir()
-        flags = [*rustflags, f"-Cprofile-generate={run/'raw-unassigned'}"]
+        flags = [*rustflags, *instrumented_link_flags(target), f"-Cprofile-generate={run/'raw-unassigned'}"]
     else:
         config = read(run/"run.json")
         require(current == config["identity"], "Source, toolchain, configuration or local dependencies changed; start a new PGO run")
         merge = read(run/"merge.json")
         require(sha(run/"merged.profdata") == merge["sha256"], "Merged profile changed")
-        check_build(run/"generate/manifest.json")
+        check_build(run/"generate/manifest.json", target)
         flags = [*config["base_flags"], f"-Cprofile-use={run/'merged.profdata'}", "-Cllvm-args=-pgo-warn-missing-function"]
     output = run/stage
     output.mkdir()
@@ -169,10 +298,10 @@ def build(run, stage, rustflags=()):
     env.pop("LLVM_PROFILE_FILE", None)
     # `-vv` lifts Cargo's `--cap-lints allow` on dependency crates, which would otherwise
     # silence their profile diagnostics along with every other warning.
-    command = ["cargo", "build", "-vv", "--locked", "--profile", "release-full", "--target", TARGET,
+    command = ["cargo", "build", "-vv", "--locked", "--profile", "release-full", "--target", target,
                "-p", "smudgy_ui", "--bin", "smudgy", "--features", FEATURES]
-    manifest = dict(stage=stage, source=str(ROOT), run=str(run), command=command, flags=flags, rustc=str(rustc),
-                    started=time.time(), profile_sha256=sha(run/"merged.profdata") if stage == "use" else None)
+    manifest = dict(stage=stage, target=target, source=str(ROOT), run=str(run), command=command, flags=flags,
+                    rustc=str(rustc), started=time.time(), profile_sha256=sha(run/"merged.profdata") if stage == "use" else None)
     write(output/"manifest.json", manifest)
     print(f"{stage}: {output/'build.log'}", flush=True)
     with (output/"build.log").open("w", encoding="utf-8") as log:
@@ -180,23 +309,34 @@ def build(run, stage, rustflags=()):
     manifest.update(exit_code=result.returncode, seconds=time.time()-manifest["started"])
     write(output/"manifest.json", manifest)
     require(result.returncode == 0, f"Build failed; see {output/'build.log'}")
-    require(identity() == current, "Inputs changed during compilation; discard this run")
+    require(identity(target) == current, "Inputs changed during compilation; discard this run")
     log = (output/"build.log").read_text(encoding="utf-8", errors="replace")
     diagnostics = [line for line in log.splitlines() if PGO_DIAGNOSTIC.search(line)]
-    exe = output/TARGET/"release-full/smudgy.exe"
+    unlinked = {}
+    if diagnostics and stage == "use":
+        diagnostics, unlinked = unlinked_crate_diagnostics(diagnostics, profile_function_names(run, current))
+    exe = output/target/"release-full"/executable_name(target)
     manifest.update(executable=str(exe), executable_sha256=sha(exe), pgo_diagnostics=diagnostics,
-                    inputs_verified=True)
+                    unlinked_crates=unlinked, inputs_verified=True)
     pdb = exe.with_suffix(".pdb")
     if pdb.exists():
         manifest.update(pdb=str(pdb), pdb_sha256=sha(pdb))
     write(output/"manifest.json", manifest)
     require(not diagnostics, f"PGO coverage diagnostics require investigation: {output/'build.log'}")
+    if unlinked:
+        print(f"{stage}: {sum(unlinked.values())} missing-record diagnostics from {len(unlinked)} codegen units "
+              "rustc did not link are recorded in the receipt", flush=True)
     print(json.dumps({key: manifest[key] for key in ("stage", "seconds", "executable")}), flush=True)
 
 
-def check_build(path):
-    build = read(path)
+def check_build_receipt(build, target=None):
     require(build.get("exit_code") == 0 and build.get("inputs_verified") and not build.get("pgo_diagnostics"), "Build is incomplete or has unresolved PGO diagnostics")
+    require(target is None or build.get("target") == target, "Build target differs from PGO run")
+
+
+def check_build(path, target=None):
+    build = read(path)
+    check_build_receipt(build, target)
     require(sha(build["executable"]) == build["executable_sha256"], "Executable differs from build manifest")
     return build
 
@@ -204,9 +344,9 @@ def check_build(path):
 def workload(run, label, scenario_path, training):
     require(re.fullmatch(r"[A-Za-z0-9_-]+", label), "Use letters, digits, underscores and hyphens in labels")
     config = read(run/"run.json")
-    require(identity() == config["identity"], "Build inputs changed")
+    require(identity(config["target"]) == config["identity"], "Build inputs changed")
     stage = "generate" if training else "use"
-    built = check_build(run/stage/"manifest.json")
+    built = check_build(run/stage/"manifest.json", config["target"])
     scenario = read(scenario_path)
     require(scenario.get("verify") and scenario.get("categories"), "Scenario needs a verification command and workload categories")
     extra_env = scenario.get("env", {})
@@ -263,13 +403,17 @@ def accepted(run, directory, executable_hash):
     records = []
     for path in sorted((run/directory).glob("*/manifest.json")):
         record = read(path)
-        require(record.get("exit_code") == 0 and record.get("verification_exit_code") == 0,
-                f"Incomplete or failed workload: {path}; preserve it and start a fresh run")
-        require(record["executable_sha256"] == executable_hash, f"Wrong executable in {path}")
-        require(directory != "training" or record.get("raw"), f"No profile was collected by {path}; it cannot count toward coverage")
+        check_workload_receipt(record, executable_hash, training=directory == "training")
         records.append(record)
     require(records, f"No verified {directory} workloads")
     return records
+
+
+def check_workload_receipt(record, executable_hash, training=False):
+    require(record.get("exit_code") == 0 and record.get("verification_exit_code") == 0,
+            "Incomplete or failed workload receipt; preserve it and start a fresh run")
+    require(record["executable_sha256"] == executable_hash, "Wrong executable in workload receipt")
+    require(not training or record.get("raw"), "No profile was collected by a training receipt; it cannot count toward coverage")
 
 
 def check_heldout(records, training):
@@ -291,14 +435,29 @@ def training_evidence(records):
     return [dict(scenario_sha256=record["scenario_sha256"], inputs=record["inputs"]) for record in records]
 
 
+def check_symbols(manifest, built, executable):
+    if manifest.get("pdb_sha256"):
+        require(manifest["pdb_sha256"] == built.get("pdb_sha256") == sha(executable.with_name("smudgy.pdb")),
+                "PGO symbols hash mismatch")
+
+
+def check_coverage(records, validation):
+    categories = {c for r in records for c in r["scenario"]["categories"]}
+    if validation:
+        require({"replay", "captures", "heldout", "interactive"} <= categories,
+                "Validation requires replay, captures, held-out and interactive coverage")
+    else:
+        require({"replay", "captures", "interactive"} <= categories,
+                "Training requires replay, captures and interactive coverage")
+
+
 def merge(run):
     require(not (run/"merge.json").exists(), "Profiles already merged; start a fresh run")
     config = read(run/"run.json")
-    require(identity() == config["identity"], "Build inputs changed")
-    generated = check_build(run/"generate/manifest.json")
+    require(identity(config["target"]) == config["identity"], "Build inputs changed")
+    generated = check_build(run/"generate/manifest.json", config["target"])
     records = accepted(run, "training", generated["executable_sha256"])
-    categories = {c for r in records for c in r["scenario"]["categories"]}
-    require({"replay", "captures", "interactive"} <= categories, "Training requires replay, captures and interactive coverage")
+    check_coverage(records, validation=False)
     raw = {p: digest for r in records for p, digest in r["raw"].items()}
     require(raw and all(sha(p) == digest for p, digest in raw.items()), "Raw profiles are missing or changed")
     tool = profdata_tool(config["identity"]["compiler"])
@@ -310,23 +469,22 @@ def merge(run):
 
 def export(run):
     config = read(run/"run.json")
-    require(identity() == config["identity"], "Build inputs changed")
-    built = check_build(run/"use/manifest.json")
+    require(identity(config["target"]) == config["identity"], "Build inputs changed")
+    built = check_build(run/"use/manifest.json", config["target"])
     require(built["profile_sha256"] == sha(run/"merged.profdata"), "Profile changed after compilation")
     records = accepted(run, "validation", built["executable_sha256"])
-    categories = {c for r in records for c in r["scenario"]["categories"]}
-    require({"replay", "captures", "heldout", "interactive"} <= categories,
-            "Validation requires replay, captures, held-out and interactive coverage")
+    check_coverage(records, validation=True)
     training = training_evidence(read(run/"merge.json")["workloads"])
     check_heldout(records, training)
     output = run/"dist"
     output.mkdir()
-    shutil.copy2(built["executable"], output/"smudgy.exe")
-    require(sha(output/"smudgy.exe") == built["executable_sha256"], "Exported executable differs from the validated build")
-    manifest = dict(schema=1, stage="validated-pgo", run=str(run), executable=str(output/"smudgy.exe"),
-                    executable_sha256=built["executable_sha256"], revision=config["revision"],
-                    worktree_status=config.get("worktree_status"), profile_sha256=sha(run/"merged.profdata"),
-                    validation=records, training=training)
+    name = executable_name(config["target"])
+    shutil.copy2(built["executable"], output/name)
+    require(sha(output/name) == built["executable_sha256"], "Exported executable differs from the validated build")
+    manifest = dict(schema=2, stage="validated-pgo", target=config["target"], run=str(run), executable=str(output/name),
+                    executable_name=name, executable_sha256=built["executable_sha256"], revision=config["revision"],
+                    worktree_status=config.get("worktree_status"), build=built, build_identity=config["identity"],
+                    profile_sha256=sha(run/"merged.profdata"), validation=records, training=training)
     if built.get("pdb"):
         require(sha(built["pdb"]) == built["pdb_sha256"], "Symbols changed")
         shutil.copy2(built["pdb"], output/"smudgy.pdb")
@@ -336,24 +494,65 @@ def export(run):
     print(output/"manifest.json")
 
 
-def verify_artifact(path):
+def profdata_tool(compiler):
+    """The toolchain's llvm-profdata for the compiler host, required to share rustc's LLVM."""
+    # Tools run on the compiler host, not the cross-compilation target.
+    sysroot, _ = toolchain_rustc()
+    name = "llvm-profdata.exe" if sys.platform == "win32" else "llvm-profdata"
+    tool = sysroot/"lib/rustlib"/host_target()/"bin"/name
+    require(tool.is_file(), "Install llvm-tools-preview for the repository toolchain")
+    # rustup's tools print the release with a `-rust-<version>-<channel>` suffix that
+    # `rustc -vV` omits, so compare the numeric release only.
+    rustc_llvm = LLVM_RELEASE.search(compiler)
+    tool_llvm = LLVM_RELEASE.search(capture(str(tool), "--version"))
+    require(rustc_llvm and tool_llvm and rustc_llvm.group(1) == tool_llvm.group(1),
+            "llvm-profdata must come from the same LLVM release as rustc; install llvm-tools-preview for this toolchain")
+    return tool
+
+
+def verify_artifact(path, target=None, portable=False):
     manifest = read(path)
-    require(manifest.get("schema") == 1 and manifest.get("stage") == "validated-pgo", "Expected a validated PGO export manifest")
+    require(manifest.get("schema") == 2 and manifest.get("stage") == "validated-pgo", "Expected a validated PGO export manifest")
+    recorded_target = manifest["target"]
+    require(recorded_target == manifest["build_identity"]["target"], "Inconsistent PGO target provenance")
+    require(target is None or target == recorded_target, "PGO artifact target mismatch")
+    require(manifest["executable_name"] == executable_name(recorded_target), "Wrong exported executable name")
+    executable = Path(path).resolve().parent/manifest["executable_name"]
+    require(sha(executable) == manifest["executable_sha256"], "PGO artifact hash mismatch")
+    require("training" in manifest, "Export predates held-out training evidence; export again with this helper")
+    # Packaging must happen at the validated commit, whether or not the run directory is present.
+    require(head_revision() == manifest["revision"], "Packaging checkout revision differs from the validated PGO run")
+    require(not manifest.get("worktree_status"), "Export was built from a modified checkout (--allow-dirty) and cannot be packaged")
+    if portable:
+        require(target is not None, "Portable verification requires an explicit target")
+        require(source_files() == manifest["build_identity"]["files"], "Packaging source differs from validated PGO inputs")
+        built = manifest["build"]
+        check_build_receipt(built, recorded_target)
+        require(built["executable_sha256"] == manifest["executable_sha256"] and built["profile_sha256"] == manifest["profile_sha256"], "Inconsistent PGO build provenance")
+        check_symbols(manifest, built, executable)
+        records = manifest["validation"]
+        require(records, "No verified validation workloads")
+        for record in records:
+            check_workload_receipt(record, built["executable_sha256"])
+        check_coverage(records, validation=True)
+        check_heldout(records, manifest["training"])
+        manifest["executable"] = str(executable)
+        return manifest
     run = Path(manifest["run"])
     config = read(run/"run.json")
-    require(identity() == config["identity"], "Packaging source differs from validated PGO inputs")
-    require(head_revision() == manifest["revision"] == config["revision"],
-            "Packaging checkout revision differs from the validated PGO run")
-    built = check_build(run/"use/manifest.json")
-    require(manifest["executable_sha256"] == built["executable_sha256"] == sha(manifest["executable"]), "PGO artifact hash mismatch")
-    if manifest.get("pdb_sha256"):
-        require(manifest["pdb_sha256"] == built.get("pdb_sha256") == sha(Path(manifest["executable"]).with_name("smudgy.pdb")),
-                "PGO symbols hash mismatch")
+    require(recorded_target == config["target"], "PGO export target differs from original run")
+    require(manifest["revision"] == config["revision"], "PGO export revision differs from original run")
+    require(identity(recorded_target) == config["identity"] == manifest["build_identity"], "Packaging source differs from validated PGO inputs")
+    built = check_build(run/"use/manifest.json", recorded_target)
+    require(manifest["build"] == built, "Build receipt changed")
+    require(manifest["executable_sha256"] == built["executable_sha256"], "PGO artifact hash mismatch")
+    check_symbols(manifest, built, executable)
     require(manifest["profile_sha256"] == built["profile_sha256"] == sha(run/"merged.profdata"), "PGO profile changed")
     records = accepted(run, "validation", built["executable_sha256"])
     require(manifest["validation"] == records, "Validation records changed")
     require(manifest["training"] == training_evidence(read(run/"merge.json")["workloads"]), "Training records changed")
     check_heldout(records, manifest["training"])
+    manifest["executable"] = str(executable)
     return manifest
 
 
@@ -364,17 +563,22 @@ def main():
     parser.add_argument("--rustflag", action="append", default=[], help="Base compiler argument, repeated; use --rustflag=-Cdebuginfo=1 to retain symbols")
     parser.add_argument("--label")
     parser.add_argument("--scenario", type=Path)
+    parser.add_argument("--target", choices=sorted(TARGETS), help="Generation target (defaults to native host), or expected export target")
+    parser.add_argument("--portable", action="store_true", help="Verify a trusted runner export without its original build directory; requires --target and identical source files")
+    parser.add_argument("--allow-dirty", action="store_true", help="Generate from a modified checkout for an experiment; such exports cannot be packaged")
     args = parser.parse_args()
-    require(sys.platform == "win32", "This PGO workflow currently supports Windows x64 only")
+    require(not args.portable or args.stage == "verify", "--portable is only for verification")
+    require(args.target is None or args.stage in {"generate", "verify"}, "Later stages inherit the generation target")
+    require(not args.allow_dirty or args.stage == "generate", "--allow-dirty is decided when the run is generated")
     run = args.path.resolve()
     if args.stage in {"generate", "use"}:
         require(args.stage == "generate" or not args.rustflag, "Use inherits the generation flags")
-        build(run, args.stage, args.rustflag)
+        build(run, args.stage, args.rustflag, args.target, args.allow_dirty)
     elif args.stage in {"train", "validate"}:
         require(args.label and args.scenario, "Supply --label and --scenario")
         workload(run, args.label, args.scenario.resolve(), args.stage == "train")
     elif args.stage == "verify":
-        print(json.dumps(verify_artifact(run)))
+        print(json.dumps(verify_artifact(run, args.target, args.portable)))
     else:
         {"merge": merge, "export": export}[args.stage](run)
 

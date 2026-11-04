@@ -30,7 +30,7 @@
 #
 # Overridable config (environment): SMUDGY_SIGN_IDENTITY, SMUDGY_NOTARY_PROFILE.
 #
-# Usage: bin/release-mac.sh [--skip-build]
+# Usage: bin/release-mac.sh [--skip-build] [--pgo-arm64 <manifest> --pgo-x86_64 <manifest>]
 #   --skip-build   re-sign / re-package an already-built Smudgy.app (mirrors
 #                  release.ps1's -SkipBuild).
 
@@ -48,11 +48,15 @@ BUNDLE_TARGET=aarch64-apple-darwin
 
 # --- argument parsing -------------------------------------------------------
 SKIP_BUILD=0
+PGO_ARM64=""
+PGO_X86_64=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build) SKIP_BUILD=1 ;;
+        --pgo-arm64) PGO_ARM64="${2:?--pgo-arm64 requires a manifest}"; shift ;;
+        --pgo-x86_64) PGO_X86_64="${2:?--pgo-x86_64 requires a manifest}"; shift ;;
         -h|--help)
-            echo "Usage: bin/release-mac.sh [--skip-build]"
+            echo "Usage: bin/release-mac.sh [--skip-build] [--pgo-arm64 <manifest> --pgo-x86_64 <manifest>]"
             echo "  Builds, signs, notarizes, and packages a universal Smudgy.dmg."
             echo "  --skip-build   re-sign / re-package an already-built Smudgy.app."
             echo "  See the header of this script for prerequisites and env vars."
@@ -61,9 +65,25 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+if [[ -n "$PGO_ARM64" || -n "$PGO_X86_64" ]]; then
+    [[ -n "$PGO_ARM64" && -n "$PGO_X86_64" && "$SKIP_BUILD" -eq 0 ]] || {
+        echo "error: PGO requires both architecture manifests and cannot use --skip-build" >&2
+        exit 1
+    }
+    # Resolve before changing cwd. The two profiles were trained on separate native hosts.
+    PGO_ARM64="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$PGO_ARM64")"
+    PGO_X86_64="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$PGO_X86_64")"
+fi
 
 cd "$(dirname "$0")/.."
 repo_root="$(pwd)"
+if [[ -n "$PGO_ARM64" ]]; then
+    python3 bin/pgo.py verify "$PGO_ARM64" --portable --target aarch64-apple-darwin >/dev/null
+    python3 bin/pgo.py verify "$PGO_X86_64" --portable --target x86_64-apple-darwin >/dev/null
+    # Both slices must come from one frozen checkout, toolchain, flag set and SDK
+    # environment, and each must record the deployment target it was linked for.
+    python3 bin/pgo_package.py pair "$PGO_ARM64" "$PGO_X86_64"
+fi
 
 # --- prerequisite checks ----------------------------------------------------
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found; $2" >&2; exit 1; }; }
@@ -138,10 +158,29 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> cargo patch-crate --force"
     cargo patch-crate --force
 
-    echo "==> cargo about generate --workspace --features smudgy_ui/web-audio-cpal --locked about.hbs -o THIRD-PARTY-NOTICES.md"
+    # The validated exports compiled the committed notices in, so in PGO mode the
+    # regeneration must reproduce them byte for byte; the original bytes are restored
+    # on any failure (mirrors release.ps1).
+    pgo_notice_backup=""
+    if [[ -n "$PGO_ARM64" ]]; then
+        pgo_notice_backup="$out_dir/THIRD-PARTY-NOTICES.validated.md"
+        cp THIRD-PARTY-NOTICES.md "$pgo_notice_backup"
+        trap 'cp "$pgo_notice_backup" THIRD-PARTY-NOTICES.md' EXIT
+    fi
+    echo "==> Generating embedded third-party notices"
     cargo about generate --workspace --features smudgy_ui/web-audio-cpal \
         --locked about.hbs -o THIRD-PARTY-NOTICES.md
     python3 bin/normalize-third-party-notices.py
+    if [[ -n "$pgo_notice_backup" ]]; then
+        cmp -s THIRD-PARTY-NOTICES.md "$pgo_notice_backup" || {
+            echo "error: regenerated third-party notices differ from the ones compiled into the validated PGO exports;" >&2
+            echo "       commit the regenerated notices and run a fresh PGO cycle" >&2
+            exit 1
+        }
+        trap - EXIT
+        rm -f "$pgo_notice_backup"
+        echo "==> Third-party notices match the validated PGO exports"
+    fi
 
     # Make sure both darwin targets are installed (no-op if already present).
     if command -v rustup >/dev/null 2>&1; then
@@ -151,9 +190,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     # Build the physical-Web-Audio app and the inspector sidecar for each
     # architecture -- mirrors release.ps1's package-qualified feature selection.
     for t in "${TARGETS[@]}"; do
-        echo "==> cargo build --profile $PROFILE --target $t -p smudgy_ui -p smudgy_inspector --features smudgy_ui/web-audio-cpal"
-        cargo build --profile "$PROFILE" --target "$t" -p smudgy_ui -p smudgy_inspector \
-            --features smudgy_ui/web-audio-cpal
+        if [[ -n "$PGO_ARM64" ]]; then
+            cargo build --locked --profile "$PROFILE" --target "$t" -p smudgy_inspector
+            pgo_manifest="$PGO_ARM64"
+            [[ "$t" == "x86_64-apple-darwin" ]] && pgo_manifest="$PGO_X86_64"
+            python3 bin/pgo_package.py stage "$pgo_manifest" "target/$t/$PROFILE/smudgy" --target "$t"
+        else
+            cargo build --profile "$PROFILE" --target "$t" -p smudgy_ui -p smudgy_inspector \
+                --features smudgy_ui/web-audio-cpal
+        fi
     done
 
     # Assemble the .app skeleton from the bundle target's already-built smudgy_ui
@@ -172,8 +217,11 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     # [package.metadata.bundle.bin.smudgy] table, ignores that name override,
     # and emits smudgy_ui.app -- which the path below would then fail to find.
     echo "==> (cd ui && cargo bundle --profile $PROFILE --target $BUNDLE_TARGET --format osx --features smudgy_ui/web-audio-cpal)"
-    ( cd ui && cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" \
-        --format osx --features smudgy_ui/web-audio-cpal )
+    ( cd ui
+      # cargo-bundle 0.7.0 supports this variable. Its build must not replace PGO.
+      [[ -z "$PGO_ARM64" ]] || export CARGO_BUNDLE_SKIP_BUILD=1
+      cargo bundle --profile "$PROFILE" --target "$BUNDLE_TARGET" \
+          --format osx --features smudgy_ui/web-audio-cpal )
 fi
 
 # --- locate the .app --------------------------------------------------------
@@ -208,6 +256,10 @@ assert_universal() {
 }
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+    if [[ -n "$PGO_ARM64" ]]; then
+        python3 bin/pgo_package.py check "$PGO_ARM64" "target/aarch64-apple-darwin/$PROFILE/smudgy" --target aarch64-apple-darwin
+        python3 bin/pgo_package.py check "$PGO_X86_64" "target/x86_64-apple-darwin/$PROFILE/smudgy" --target x86_64-apple-darwin
+    fi
     echo "==> Fusing universal binaries (arm64 + x86_64)"
     for bin in smudgy smudgy_inspector; do
         inputs=()
@@ -220,6 +272,12 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
         chmod +x "$macos_dir/$bin"
         assert_universal "$macos_dir/$bin"
     done
+    if [[ -n "$PGO_ARM64" ]]; then
+        # Thin each slice back out of the fused binary and compare it with its export,
+        # recording the pre-signature universal digest (signing changes the bytes later).
+        python3 bin/pgo_package.py universal "$macos_dir/smudgy" --arm64 "$PGO_ARM64" --x86_64 "$PGO_X86_64" \
+            --receipt "$out_dir/pgo-universal.json"
+    fi
 else
     for bin in smudgy smudgy_inspector; do
         [[ -f "$macos_dir/$bin" ]] || { echo "error: --skip-build but $macos_dir/$bin is missing; run a full build first" >&2; exit 1; }

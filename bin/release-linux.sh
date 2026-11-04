@@ -42,13 +42,16 @@ FLATHUB_URL=https://dl.flathub.org/repo/flathub.flatpakrepo
 
 # --- argument parsing -------------------------------------------------------
 SKIP_BUILD=0
+PGO_MANIFEST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch) ARCH="${2:?--arch requires a value}"; shift ;;
         --arch=*) ARCH="${1#*=}" ;;
         --skip-build) SKIP_BUILD=1 ;;
+        --pgo-manifest) PGO_MANIFEST="${2:?--pgo-manifest requires a value}"; shift ;;
+        --pgo-manifest=*) PGO_MANIFEST="${1#*=}" ;;
         -h|--help)
-            echo "Usage: bin/release-linux.sh [--arch <x86_64|aarch64>] [--skip-build]"
+            echo "Usage: bin/release-linux.sh [--arch <x86_64|aarch64>] [--skip-build] [--pgo-manifest <manifest>]"
             echo "  Builds and bundles a self-distributed smudgy Flatpak for --arch"
             echo "  (default: this host's). Set SMUDGY_GPG_KEYID to sign the bundle."
             echo "  See the script header for details."
@@ -57,6 +60,12 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+if [[ -n "$PGO_MANIFEST" ]]; then
+    [[ "$SKIP_BUILD" -eq 0 ]] || { echo "error: --pgo-manifest cannot use --skip-build" >&2; exit 1; }
+    [[ -f "$PGO_MANIFEST" ]] || { echo "error: PGO manifest not found: $PGO_MANIFEST" >&2; exit 1; }
+    # Absolute before the cd below, without the interpreter the prerequisite checks require.
+    PGO_MANIFEST="$(cd "$(dirname "$PGO_MANIFEST")" && pwd -P)/$(basename "$PGO_MANIFEST")"
+fi
 
 cd "$(dirname "$0")/.."
 repo_root="$(pwd)"
@@ -101,6 +110,12 @@ repo_dir="$repo_root/target/flatpak-repo"          # multi-arch ostree repo (sha
 build_dir="$repo_root/target/flatpak-build-$ARCH"  # per-arch build + state dirs
 mkdir -p "$repo_root/target" "$repo_root/dist"     # must exist on a fresh checkout (CI)
 [[ -f "$manifest" ]] || { echo "error: manifest not found: $manifest" >&2; exit 1; }
+if [[ -n "$PGO_MANIFEST" ]]; then
+    need python3 "install Python 3.11+ and bin/requirements-pgo.txt"
+    python3 bin/pgo_package.py flatpak "$PGO_MANIFEST" \
+        "target/pgo-package/$ARCH/flatpak.json" --arch "$ARCH" --base "$manifest" --runtime-version "$RUNTIME_VERSION"
+    manifest="target/pgo-package/$ARCH/flatpak.json"
+fi
 
 # Version from ui/Cargo.toml — the single source of truth bump-version.sh keeps
 # every crate in lock-step with (and the value the client sends as
@@ -125,7 +140,7 @@ flatpak install --user -y --noninteractive flathub org.flatpak.Builder
 # Keeps the bundle's AppStream release in sync with the crate version. A no-op
 # when they already match (idempotent). bump-version.sh could own this instead.
 today="$(date +%F)"
-if grep -q '<release ' "$metainfo"; then
+if [[ -z "$PGO_MANIFEST" ]] && grep -q '<release ' "$metainfo"; then
     sed -i -E "s|<release version=\"[^\"]*\" date=\"[^\"]*\" />|<release version=\"$version\" date=\"$today\" />|" "$metainfo"
 fi
 
@@ -166,13 +181,26 @@ state_dir="$repo_root/target/flatpak-builder-$ARCH"
 builder=(flatpak run --filesystem=host org.flatpak.Builder)
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    echo "==> flatpak-builder (compiles smudgy in the $ARCH sandbox — this takes a while)"
+    if [[ -n "$PGO_MANIFEST" ]]; then
+        echo "==> flatpak-builder (packages the validated $ARCH PGO executable)"
+    else
+        echo "==> flatpak-builder (compiles smudgy in the $ARCH sandbox — this takes a while)"
+    fi
     # No --install-deps-from: the runtimes are pre-installed above (on the host).
     # Letting flatpak-builder install them runs a sandboxed `flatpak install` that
     # needs a session D-Bus, which headless CI lacks ("Cannot autolaunch D-Bus").
     "${builder[@]}" --user --force-clean --arch="$ARCH" \
         --state-dir="$state_dir" --repo="$repo_dir" \
         "$build_dir" "$repo_root/$manifest"
+    if [[ -n "$PGO_MANIFEST" ]]; then
+        python3 bin/pgo_package.py check "$PGO_MANIFEST" "$build_dir/files/bin/smudgy.bin" \
+            --target "$ARCH-unknown-linux-gnu"
+        # build-bundle ships the exported ostree commit, not the build directory, so
+        # hash the executable inside that commit too. The Platform runtime carries no
+        # ostree CLI, so the host's is required (Debian/Ubuntu: apt install ostree).
+        need ostree "install ostree to verify the committed PGO executable"
+        python3 bin/pgo_package.py committed "$PGO_MANIFEST" "$repo_dir" --arch "$ARCH"
+    fi
 else
     [[ -d "$repo_dir" ]] || { echo "error: --skip-build but $repo_dir is missing; run a full build first" >&2; exit 1; }
 fi

@@ -1,7 +1,10 @@
 """Failure-path tests for the PGO artifact and workload gates; no Rust build."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -20,13 +23,22 @@ class PgoTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.run = Path(self.temp.name)
-        pgo.write(self.run/"run.json", {"identity": {"source": "same"}, "revision": "test"})
-        self.patch_identity = patch.object(pgo, "identity", return_value={"source": "same"})
+        self.target = "x86_64-pc-windows-msvc"
+        self.identity = {"source": "same", "target": self.target, "files": {"source.rs": "digest"}}
+        pgo.write(self.run/"run.json", {"identity": self.identity, "revision": "test", "target": self.target,
+                                        "worktree_status": ""})
+        self.patch_identity = patch.object(pgo, "identity", return_value=self.identity)
         self.patch_identity.start()
         self.addCleanup(self.patch_identity.stop)
+        self.patch_target = patch.object(pgo, "native_target", side_effect=lambda target=None: target or self.target)
+        self.patch_target.start()
+        self.addCleanup(self.patch_target.stop)
         self.patch_revision = patch.object(pgo, "head_revision", return_value="test")
         self.patch_revision.start()
         self.addCleanup(self.patch_revision.stop)
+        self.patch_status = patch.object(pgo, "worktree_status", return_value="")
+        self.patch_status.start()
+        self.addCleanup(self.patch_status.stop)
         (self.run/"merged.profdata").write_bytes(b"profile")
         self.training_record = dict(exit_code=0, verification_exit_code=0, scenario_sha256="trained-scenario",
                                     inputs={"C:/workloads/corpus.log": "trained-corpus"},
@@ -39,7 +51,7 @@ class PgoTests(unittest.TestCase):
             directory.mkdir()
             exe = directory/"smudgy.exe"
             exe.write_bytes(stage.encode())
-            pgo.write(directory/"manifest.json", dict(exit_code=0, inputs_verified=True,
+            pgo.write(directory/"manifest.json", dict(target=self.target, exit_code=0, inputs_verified=True,
                 executable=str(exe), executable_sha256=pgo.sha(exe), pgo_diagnostics=[],
                 profile_sha256=pgo.sha(self.run/"merged.profdata") if stage == "use" else None))
 
@@ -106,7 +118,7 @@ class PgoTests(unittest.TestCase):
             }, clear=True),
         ):
             before = pgo.identity()
-            pgo.write(self.run/"run.json", {"identity": before})
+            pgo.write(self.run/"run.json", {"identity": before, "target": self.target})
             notice.write_text("regenerated embedded notices", encoding="utf-8")
             self.assertNotEqual(before["files"], pgo.identity()["files"])
             with self.assertRaisesRegex(RuntimeError, "changed"):
@@ -116,6 +128,31 @@ class PgoTests(unittest.TestCase):
         with patch.object(pgo, "identity", return_value={"source": "different"}):
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 pgo.build(self.run, "use")
+
+    def test_compiler_environment_overrides_cannot_bypass_identity(self):
+        self.patch_identity.stop()
+        for variable in pgo.COMPILER_OVERRIDES:
+            with self.subTest(variable=variable), patch.dict(pgo.os.environ, {variable: "another-compiler"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "Unset build overrides"):
+                    pgo.identity()
+
+    def test_cargo_config_cannot_select_a_different_compiler(self):
+        self.patch_identity.stop()
+        directory = self.run/".cargo"
+        directory.mkdir()
+        contents = [
+            '[build]\nrustc = "other-rustc"\n',
+            '[build]\nrustc-wrapper = "wrapper"\n',
+            '[build]\nrustc-workspace-wrapper = "wrapper"\n',
+            '[env]\nCARGO_BUILD_RUSTC = { value = "other-rustc", force = true }\n',
+            'include = ["another-compiler.toml"]\n',
+        ]
+        with patch.object(pgo, "ROOT", self.run), patch.dict(pgo.os.environ, {"CARGO_HOME": str(directory)}, clear=True):
+            for content in contents:
+                with self.subTest(content=content):
+                    (directory/"config.toml").write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "Remove compiler|Flatten included"):
+                        pgo.identity()
 
     def test_missing_training_categories_cannot_merge(self):
         output = self.run/"training/test"
@@ -213,22 +250,30 @@ class PgoTests(unittest.TestCase):
         record = pgo.read(self.run/"training/tampered/manifest.json")
         self.assertEqual(len(record["raw"]), 1)
 
-    def test_profdata_must_come_from_the_rustc_llvm(self):
+    def fake_toolchain(self, host, platform):
+        """A sysroot holding the host's rustc and llvm-profdata, with capture answering for both."""
         sysroot = self.run/"sysroot"
-        tool = sysroot/f"lib/rustlib/{pgo.TARGET}/bin/llvm-profdata.exe"
-        tool.parent.mkdir(parents=True)
+        suffix = ".exe" if platform == "win32" else ""
+        tool = sysroot/"lib/rustlib"/host/"bin"/f"llvm-profdata{suffix}"
+        tool.parent.mkdir(parents=True, exist_ok=True)
         tool.write_bytes(b"")
-        (sysroot/"bin").mkdir()
-        (sysroot/"bin"/("rustc.exe" if sys.platform == "win32" else "rustc")).write_bytes(b"")
+        (sysroot/"bin").mkdir(exist_ok=True)
+        (sysroot/"bin"/f"rustc{suffix}").write_bytes(b"")
 
         def capture(*command):
             if command == ("rustc", "--print", "sysroot"):
                 return str(sysroot)
+            if command == ("rustc", "-vV"):
+                return f"rustc 1.97.1 (abc 2026-10-01)\nhost: {host}\nLLVM version: 22.1.6"
             if command == (str(tool), "--version"):
                 # rustup's llvm-tools carry the Rust release suffix; rustc -vV does not.
                 return "LLVM (http://llvm.org/):\n  LLVM version 22.1.6-rust-1.97.1-stable\n  Optimized build."
             raise AssertionError(command)
 
+        return tool, capture
+
+    def test_profdata_must_come_from_the_rustc_llvm(self):
+        tool, capture = self.fake_toolchain(self.target, sys.platform)
         with patch.object(pgo, "capture", capture):
             with self.assertRaisesRegex(RuntimeError, "same LLVM release"):
                 pgo.profdata_tool("rustc 1.97.1 (abc 2026-10-01)\nhost: x86_64-pc-windows-msvc\nLLVM version: 22.1.5")
@@ -268,6 +313,151 @@ class PgoTests(unittest.TestCase):
         with patch.object(pgo, "toolchain_rustc", side_effect=RuntimeError("stop before cargo")):
             with self.assertRaisesRegex(RuntimeError, "stop before cargo"):
                 pgo.build(self.run/"fresh-ok", "generate", ["-Cdebuginfo=1", "-Ctarget-cpu=x86-64-v3"])
+
+    def test_modified_checkout_cannot_start_a_run_unless_marked_as_an_experiment(self):
+        with patch.object(pgo, "worktree_status", return_value=" M ui/src/lib.rs"):
+            with self.assertRaisesRegex(RuntimeError, "Commit or stash"):
+                pgo.build(self.run/"fresh-dirty", "generate", [])
+            self.assertFalse((self.run/"fresh-dirty").exists())
+            with patch.object(pgo, "toolchain_rustc", side_effect=RuntimeError("stop before cargo")):
+                with self.assertRaisesRegex(RuntimeError, "stop before cargo"):
+                    pgo.build(self.run/"fresh-experiment", "generate", [], allow_dirty=True)
+        config = pgo.read(self.run/"fresh-experiment/run.json")
+        self.assertEqual((config["worktree_status"], config["allow_dirty"]), (" M ui/src/lib.rs", True))
+
+    def test_experiment_exports_cannot_be_packaged(self):
+        self.validation()
+        pgo.export(self.run)
+        manifest = pgo.read(self.run/"dist/manifest.json")
+        self.assertEqual(manifest["worktree_status"], "")
+        with patch.object(pgo, "source_files", return_value=self.identity["files"]):
+            pgo.verify_artifact(self.run/"dist/manifest.json", self.target, portable=True)
+            manifest["worktree_status"] = " M ui/src/lib.rs"
+            pgo.write(self.run/"dist/manifest.json", manifest)
+            for portable in (True, False):
+                with self.subTest(portable=portable), self.assertRaisesRegex(RuntimeError, "modified checkout"):
+                    pgo.verify_artifact(self.run/"dist/manifest.json", self.target, portable=portable)
+
+    def test_instrumented_link_keeps_dead_code_on_apple_targets_only(self):
+        script = str(pgo.ROOT/"bin/pgo-apple-link.sh")
+        self.assertTrue(Path(script).is_file())
+        for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+            self.assertEqual(pgo.instrumented_link_flags(target), [f"-Clinker={script}"])
+        for target in ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            self.assertEqual(pgo.instrumented_link_flags(target), [])
+        # The generate receipt carries the link flag; the use build keeps the base flags only.
+        with patch.object(pgo, "toolchain_rustc", return_value=(self.run, self.run/"rustc")), \
+             patch.object(pgo.subprocess, "run", return_value=Mock(returncode=1)):
+            for target, link in (("aarch64-apple-darwin", [f"-Clinker={script}"]), (self.target, [])):
+                with self.subTest(target=target):
+                    run = self.run/f"link-{target}"
+                    with self.assertRaisesRegex(RuntimeError, "Build failed"):
+                        pgo.build(run, "generate", ["-Cdebuginfo=1"], target)
+                    self.assertEqual(pgo.read(run/"generate/manifest.json")["flags"],
+                                     ["-Cdebuginfo=1", *link, f"-Cprofile-generate={run/'raw-unassigned'}"])
+                    self.assertEqual(pgo.read(run/"run.json")["base_flags"], ["-Cdebuginfo=1"])
+            pgo.write(self.run/"run.json", dict(pgo.read(self.run/"run.json"), base_flags=["-Cdebuginfo=1"]))
+            shutil.rmtree(self.run/"use")
+            with self.assertRaisesRegex(RuntimeError, "Build failed"):
+                pgo.build(self.run, "use")
+        self.assertEqual(pgo.read(self.run/"use/manifest.json")["flags"],
+                         ["-Cdebuginfo=1", f"-Cprofile-use={self.run/'merged.profdata'}", "-Cllvm-args=-pgo-warn-missing-function"])
+        with self.assertRaisesRegex(RuntimeError, "instrumented link is managed"):
+            pgo.build(self.run/"linker", "generate", ["-Clinker=/usr/bin/clang"], "aarch64-apple-darwin")
+
+    def test_missing_records_are_structural_only_for_crates_the_profile_never_saw(self):
+        def missing(unit, function):
+            return f"warning: {unit}: no profile data available for function {function} Hash = 7 up to 0 count discarded"
+        syn, logger, app = "syn.e314352a13b1d352-cgu.0", "env_logger.32919bcdb6693f4f-cgu.0", "smudgy.1a2b3c-cgu.0"
+        unlinked = [
+            missing(syn, "_RNvCsabc123_3syn4item"),
+            # A local copy of an upstream inline function carries no syn token; the unit does.
+            missing(syn, "_RNvXsK_NtCsgtPOCBgevO_4core3fmtNtB5_5ErrorNtB5_5Debug3fmt"),
+            missing(logger, "_RINvNtCsgtPOCBgevO_4core3ptr9drop_glueNtCsdef456_10env_logger6LoggerECsdef456_10env_logger"),
+        ]
+        standing = [
+            missing(app, "_RNvCs5JAvRntY6Pu_6smudgy4main"),
+            "warning: Function control flow change detected (hash mismatch) _RNvCsabc123_3syn4parse Hash = 2",
+            "warning: C:\\src\\lib.rs: no profile data available for function _ZN3syn3bar Hash = 1 up to 0 count discarded",
+            missing(syn, "_RNvCsabc123_3syn5other Hash = 1 up to 3"),
+        ]
+        names = f"  main:\n  {app};_RNvCs5JAvRntY6Pu_6smudgy7closure:\n  _RNvCs5JAvRntY6Pu_6smudgy4main:\n"
+        remaining, units = pgo.unlinked_crate_diagnostics(unlinked + standing, names)
+        self.assertEqual(remaining, standing)
+        self.assertEqual(units, {logger: 1, syn: 2})
+        # One record from the unit, internal or by crate token, means rustc linked it.
+        for evidence in (f"  {syn};_RNvXsK_core3fmt5Debug3fmt:\n", "  _RNvCsabc123_3syn9other_fn:\n"):
+            with self.subTest(evidence=evidence):
+                remaining, units = pgo.unlinked_crate_diagnostics(unlinked, names + evidence)
+                self.assertEqual((remaining, units), (unlinked[:2], {logger: 1}))
+        # A longer crate name that merely contains the token's name is not evidence.
+        remaining, units = pgo.unlinked_crate_diagnostics(unlinked, names + "  _RNvCsabc123_7syn_ext4item:\n")
+        self.assertEqual(units, {logger: 1, syn: 2})
+
+    def test_use_build_records_unlinked_crates_and_still_fails_on_other_diagnostics(self):
+        unlinked = ("warning: syn.e314352a13b1d352-cgu.0: no profile data available for function "
+                    "_RNvCsabc123_3syn4item Hash = 7 up to 0 count discarded")
+        standing = ("warning: smudgy.1a2b3c-cgu.0: no profile data available for function "
+                    "_RNvCs5JAvRntY6Pu_6smudgy4main Hash = 7 up to 0 count discarded")
+
+        log = [f"   Compiling syn\n{unlinked}\n"]
+
+        def cargo(command, cwd, env, stdout, stderr):
+            exe = Path(env["CARGO_TARGET_DIR"])/self.target/"release-full"/"smudgy.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"built")
+            stdout.write("".join(log))
+            return Mock(returncode=0)
+
+        pgo.write(self.run/"run.json", dict(pgo.read(self.run/"run.json"), base_flags=[]))
+        # The profile records smudgy's unit and nothing from syn's.
+        with patch.object(pgo, "toolchain_rustc", return_value=(self.run, self.run/"rustc")), \
+             patch.object(pgo, "profile_function_names", return_value="  main:\n  _RNvCs5JAvRntY6Pu_6smudgy4main:\n"), \
+             patch.object(pgo.subprocess, "run", cargo):
+            shutil.rmtree(self.run/"use")
+            pgo.build(self.run, "use")
+            manifest = pgo.read(self.run/"use/manifest.json")
+            self.assertEqual((manifest["pgo_diagnostics"], manifest["unlinked_crates"]),
+                             ([], {"syn.e314352a13b1d352-cgu.0": 1}))
+            pgo.check_build_receipt(manifest, self.target)
+            shutil.rmtree(self.run/"use")
+            log.append(f"{standing}\n")
+            with self.assertRaisesRegex(RuntimeError, "require investigation"):
+                pgo.build(self.run, "use")
+        manifest = pgo.read(self.run/"use/manifest.json")
+        self.assertEqual((manifest["pgo_diagnostics"], manifest["unlinked_crates"]), ([standing], {"syn.e314352a13b1d352-cgu.0": 1}))
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            pgo.check_build_receipt(manifest, self.target)
+
+    @unittest.skipIf(sys.platform == "win32", "the Apple link script is a POSIX shell script")
+    def test_apple_link_script_removes_dead_strip_and_nothing_else(self):
+        fake = self.run/"fake-cc"
+        fake.mkdir()
+        (fake/"cc").write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+        (fake/"cc").chmod(0o755)
+        env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ['PATH']}")
+        script = str(pgo.ROOT/"bin/pgo-apple-link.sh")
+        linked = subprocess.run([script, "-arch", "arm64", "a b.o", "-Wl,-dead_strip", "-o", "out",
+                                 "-Wl,-exported_symbols_list,/tmp/x y"], env=env, capture_output=True, text=True)
+        self.assertEqual((linked.returncode, linked.stdout.splitlines()),
+                         (0, ["-arch", "arm64", "a b.o", "-o", "out", "-Wl,-exported_symbols_list,/tmp/x y"]))
+        for arguments, message in (([script, "a.o", "-o", "out"], "no -Wl,-dead_strip"),
+                                   ([script, "-Wl,-dead_strip", "@args.txt"], "response file")):
+            with self.subTest(arguments=arguments):
+                failed = subprocess.run(arguments, env=env, capture_output=True, text=True)
+                self.assertEqual(failed.returncode, 1)
+                self.assertIn(message, failed.stderr)
+                self.assertEqual(failed.stdout, "")
+
+    def test_deployment_target_is_recorded_for_apple_slices_only(self):
+        def capture(*command):
+            self.assertEqual(command[:4], ("rustc", "--print", "deployment-target", "--target"))
+            return {"aarch64-apple-darwin": "deployment_target=11.0", "x86_64-apple-darwin": "deployment_target=10.12"}[command[4]]
+        with patch.object(pgo, "capture", capture):
+            self.assertEqual(pgo.deployment_target("aarch64-apple-darwin"), "deployment_target=11.0")
+            self.assertEqual(pgo.deployment_target("x86_64-apple-darwin"), "deployment_target=10.12")
+            self.assertIsNone(pgo.deployment_target("x86_64-pc-windows-msvc"))
+            self.assertIsNone(pgo.deployment_target("aarch64-unknown-linux-gnu"))
 
     def test_training_without_declared_inputs_cannot_anchor_heldout_evidence(self):
         merge = pgo.read(self.run/"merge.json")
@@ -330,32 +520,113 @@ class PgoTests(unittest.TestCase):
         self.assertEqual(record["exit_code"], 1)
         self.assertNotIn("verification_exit_code", record)
 
+    def test_native_targets_and_executable_names(self):
+        self.patch_target.stop()
+        for target, (platform, name) in pgo.TARGETS.items():
+            with self.subTest(target=target), patch.object(pgo, "host_target", return_value=target), patch.object(pgo.sys, "platform", platform):
+                self.assertEqual(pgo.native_target(), target)
+                self.assertEqual(pgo.executable_name(target), name)
+                other = next(t for t in pgo.TARGETS if t != target)
+                with self.assertRaisesRegex(RuntimeError, "matching native"):
+                    pgo.native_target(other)
 
-    def test_compiler_environment_overrides_cannot_bypass_identity(self):
-        self.patch_identity.stop()
-        for variable in pgo.COMPILER_OVERRIDES:
-            with self.subTest(variable=variable), patch.dict(pgo.os.environ, {variable: "another-compiler"}, clear=True):
-                with self.assertRaisesRegex(RuntimeError, "Unset build overrides"):
-                    pgo.identity()
+    def test_profdata_uses_host_tool_and_platform_suffix(self):
+        for target, (platform, _) in pgo.TARGETS.items():
+            expected, capture = self.fake_toolchain(target, platform)
+            with self.subTest(target=target), patch.object(pgo.sys, "platform", platform), patch.object(pgo, "capture", capture):
+                tool = pgo.profdata_tool(capture("rustc", "-vV"))
+                self.assertEqual(tool, expected)
+                self.assertEqual(tool.parent.parent.name, target)
+                self.assertEqual(tool.name, "llvm-profdata.exe" if platform == "win32" else "llvm-profdata")
+
+    def test_portable_export_does_not_need_original_run(self):
+        self.validation()
+        pgo.export(self.run)
+        path = self.run/"dist/manifest.json"
+        manifest = pgo.read(path)
+        manifest["run"] = "missing-original-run"
+        manifest["executable"] = "missing-original-executable"
+        pgo.write(path, manifest)
+        with patch.object(pgo, "source_files", return_value=self.identity["files"]):
+            verified = pgo.verify_artifact(path, self.target, portable=True)
+            self.assertEqual(Path(verified["executable"]).read_bytes(), b"use")
+            with self.assertRaisesRegex(RuntimeError, "target mismatch"):
+                pgo.verify_artifact(path, "aarch64-apple-darwin", portable=True)
+        with patch.object(pgo, "source_files", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "Packaging source"):
+                pgo.verify_artifact(path, self.target, portable=True)
+
+    def test_portable_export_rejects_inconsistent_receipts(self):
+        self.validation()
+        pgo.export(self.run)
+        path = self.run/"dist/manifest.json"
+        original = pgo.read(path)
+        for section, key, value in (("build", "target", "aarch64-apple-darwin"),
+                                    ("build", "exit_code", 1),
+                                    ("build", "profile_sha256", "changed")):
+            with self.subTest(key=key), patch.object(pgo, "source_files", return_value=self.identity["files"]):
+                changed = json.loads(json.dumps(original))
+                changed[section][key] = value
+                pgo.write(path, changed)
+                with self.assertRaises(RuntimeError):
+                    pgo.verify_artifact(path, self.target, portable=True)
+
+    def test_native_pgo_target_and_archive_are_checked(self):
+        archive = self.run/"v8.a"
+        binding = self.run/"binding.rs"
+        profile = self.run/"native.profdata"
+        for path in (archive, binding, profile):
+            path.write_bytes(path.name.encode())
+        manifest_path = self.run/"native.json"
+        manifest = dict(schema=1, stage="native-pgo-use", target=self.target,
+                        compiler="clang test", source_sha256="native-source-digest",
+                        archive={"sha256":pgo.sha(archive)}, bindings={"sha256":pgo.sha(binding)},
+                        profile={"path":str(profile), "sha256":pgo.sha(profile)})
+        pgo.write(manifest_path, manifest)
+        with patch.dict(pgo.os.environ, {"RUSTY_V8_ARCHIVE":str(archive),
+                                        "RUSTY_V8_SRC_BINDING_PATH":str(binding),
+                                        "SMUDGY_NATIVE_PGO_MANIFEST":str(manifest_path)}, clear=True):
+            self.assertIn("native_pgo", pgo.native_inputs(self.target))
+            with self.assertRaisesRegex(RuntimeError, "target differs"):
+                pgo.native_inputs("aarch64-apple-darwin")
+            archive.write_bytes(b"replaced")
+            with self.assertRaisesRegex(RuntimeError, "archive differs"):
+                pgo.native_inputs(self.target)
+
+    def test_unix_export_retains_executable_mode(self):
+        self.validation()
+        for target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin"):
+            with self.subTest(target=target):
+                config = pgo.read(self.run/"run.json")
+                config["target"] = target
+                self.identity["target"] = target
+                config["identity"] = self.identity
+                pgo.write(self.run/"run.json", config)
+                built = pgo.read(self.run/"use/manifest.json")
+                built["target"] = target
+                pgo.write(self.run/"use/manifest.json", built)
+                if (self.run/"dist").exists():
+                    import shutil
+                    shutil.rmtree(self.run/"dist")
+                original = self.run/"use/smudgy.exe"
+                original.chmod(0o755)
+                pgo.export(self.run)
+                self.assertEqual((self.run/"dist/smudgy").read_bytes(), b"use")
+                if sys.platform != "win32":
+                    self.assertEqual((self.run/"dist/smudgy").stat().st_mode & 0o777, 0o755)
+
+    def test_mismatched_build_target_cannot_export(self):
+        self.validation()
+        built = pgo.read(self.run/"use/manifest.json")
+        built["target"] = "aarch64-apple-darwin"
+        pgo.write(self.run/"use/manifest.json", built)
+        with self.assertRaisesRegex(RuntimeError, "Build target"):
+            pgo.export(self.run)
+        self.assertFalse((self.run/"dist").exists())
 
 
-    def test_cargo_config_cannot_select_a_different_compiler(self):
-        self.patch_identity.stop()
-        directory = self.run/".cargo"
-        directory.mkdir()
-        contents = [
-            '[build]\nrustc = "other-rustc"\n',
-            '[build]\nrustc-wrapper = "wrapper"\n',
-            '[build]\nrustc-workspace-wrapper = "wrapper"\n',
-            '[env]\nCARGO_BUILD_RUSTC = { value = "other-rustc", force = true }\n',
-            'include = ["another-compiler.toml"]\n',
-        ]
-        with patch.object(pgo, "ROOT", self.run), patch.dict(pgo.os.environ, {"CARGO_HOME": str(directory)}, clear=True):
-            for content in contents:
-                with self.subTest(content=content):
-                    (directory/"config.toml").write_text(content, encoding="utf-8")
-                    with self.assertRaisesRegex(RuntimeError, "Remove compiler|Flatten included"):
-                        pgo.identity()
+
+
 
 
 if __name__ == "__main__":

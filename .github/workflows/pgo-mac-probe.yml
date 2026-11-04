@@ -1,0 +1,158 @@
+name: PGO Mac probe
+
+# Builds the real application with profile generation and profile use on GitHub's
+# native Apple Silicon and Intel runners, reports which functions the use build found
+# no profile data for (bin/pgo_probe.py), then fuses the two use builds with lipo and
+# proves each slice thins back out byte for byte. Nothing here trains, validates,
+# exports or packages a release profile; it is evidence for the gates in bin/pgo.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustflags:
+        description: Base compiler flags for pgo.py generate (space separated), e.g. -Cdebuginfo=1
+        required: false
+        default: ''
+  # Dispatch only resolves workflows that exist on the default branch, so until this
+  # file lands there a push that touches the probe itself runs it on the branch.
+  push:
+    branches: ['perf/**']
+    paths:
+      - .github/workflows/pgo-mac-probe.yml
+      - bin/pgo_probe.py
+      - bin/pgo.py
+      - bin/pgo-apple-link.sh
+
+concurrency:
+  group: pgo-mac-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install the pinned toolchain and its profile merger
+        run: |
+          rustup toolchain install --no-self-update
+          rustup component add llvm-tools-preview
+          rustc -vV
+          rustc --print deployment-target --target ${{ matrix.target }}
+          xcrun --show-sdk-version
+          sw_vers
+      - name: Materialize dependency source patches
+        run: |
+          command -v cargo-patch-crate >/dev/null 2>&1 ||
+            cargo install --locked patch-crate
+          cargo patch-crate --force
+      - name: Check the tooling before spending hours on a build
+        run: |
+          python -m pip install -r bin/requirements-pgo.txt
+          python -m unittest discover -s bin -p 'test_pgo*.py'
+      - name: Generate, flush one profile, merge, and build with profile use
+        env:
+          PROBE_RUSTFLAGS: ${{ inputs.rustflags || '' }}
+        run: |
+          flags=()
+          for flag in $PROBE_RUSTFLAGS; do flags+=(--rustflag="$flag"); done
+          python3 bin/pgo_probe.py "$RUNNER_TEMP/pgo-probe" --target ${{ matrix.target }} "${flags[@]}"
+      - name: Summarize
+        if: always()
+        run: |
+          run="$RUNNER_TEMP/pgo-probe"
+          {
+            echo "## ${{ matrix.target }}"
+            echo '```json'
+            cat "$run/probe/result.json" 2>/dev/null || echo '{"error": "probe produced no result"}'
+            echo '```'
+            echo "### Profile diagnostics in the use build log"
+            echo '```'
+            grep -E 'instrumentation profile|no profile data available|control flow change detected|hash mismatch|inconsistent number of counts|profile data may be out of date' "$run/use/build.log" 2>/dev/null || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pgo-probe-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/pgo-probe/run.json
+            ${{ runner.temp }}/pgo-probe/merge.json
+            ${{ runner.temp }}/pgo-probe/profile-summary.txt
+            ${{ runner.temp }}/pgo-probe/generate/manifest.json
+            ${{ runner.temp }}/pgo-probe/generate/build.log
+            ${{ runner.temp }}/pgo-probe/use/manifest.json
+            ${{ runner.temp }}/pgo-probe/use/build.log
+            ${{ runner.temp }}/pgo-probe/probe/result.json
+          if-no-files-found: warn
+      - name: Upload the profile-use slice
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pgo-slice-${{ matrix.target }}
+          path: ${{ runner.temp }}/pgo-probe/use/${{ matrix.target }}/release-full/smudgy
+          if-no-files-found: warn
+
+  universal:
+    name: Fuse and thin the slices
+    needs: probe
+    if: ${{ !cancelled() }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: pgo-*
+          path: slices
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --no-self-update
+      - name: Fuse with lipo, thin each slice back out, and compare digests
+        run: |
+          arm="slices/pgo-slice-aarch64-apple-darwin/smudgy"
+          intel="slices/pgo-slice-x86_64-apple-darwin/smudgy"
+          ls -l "$arm" "$intel"
+          lipo -create "$arm" "$intel" -output universal
+          lipo -detailed_info universal
+          lipo universal -thin arm64 -output thin-arm64
+          lipo universal -thin x86_64 -output thin-x86_64
+          shasum -a 256 "$arm" thin-arm64 "$intel" thin-x86_64 universal | tee digests.txt
+          [[ "$(shasum -a 256 < "$arm")" == "$(shasum -a 256 < thin-arm64)" ]] || { echo "arm64 slice is not byte-identical after lipo" >&2; exit 1; }
+          [[ "$(shasum -a 256 < "$intel")" == "$(shasum -a 256 < thin-x86_64)" ]] || { echo "x86_64 slice is not byte-identical after lipo" >&2; exit 1; }
+          for manifest in slices/pgo-probe-*/use/manifest.json; do
+            python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["target"], m["executable_sha256"])' "$manifest"
+          done
+          echo "Both slices thin back out byte for byte."
+      - name: Record deployment targets and linked platform versions
+        run: |
+          {
+            echo "## Universal fusion"
+            echo '```'
+            cat digests.txt
+            echo
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              echo "$t: $(rustc --print deployment-target --target $t)"
+            done
+            echo
+            for f in thin-arm64 thin-x86_64; do
+              echo "== vtool -show-build $f"
+              vtool -show-build "$f"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
