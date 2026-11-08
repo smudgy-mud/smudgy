@@ -198,6 +198,7 @@ async fn camel_case_names_with_snake_case_aliases_through_0_5() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

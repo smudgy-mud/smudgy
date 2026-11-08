@@ -8,6 +8,7 @@ mod linux {
     use std::hint::black_box;
 
     use gungraun::prelude::*;
+    use smudgy_bench::graphics::{DecodeQueue, enable_full_graphics};
     use smudgy_bench::wire::{WireProfile, chunk, dress_lines};
     use smudgy_core::session::{
         connection::{
@@ -51,20 +52,26 @@ mod linux {
         rx: UnboundedReceiver<RuntimeAction>,
         protocol: ProtocolState,
         transcode: Transcode,
+        /// The stub graphics host's pending decodes, when the processor runs
+        /// the full graphics protocol.
+        decodes: Option<DecodeQueue>,
     }
 
     impl Pipeline {
-        fn new() -> Self {
+        fn new(full_graphics: bool) -> Self {
             let (runtime_tx, rx) = unbounded_channel();
+            let mut vt_processor = VtProcessor::new(runtime_tx.clone());
+            let decodes = full_graphics.then(|| enable_full_graphics(&mut vt_processor));
             Self {
                 telnet: TelnetParser::new(),
                 vt_parser: VTParser::new(),
-                vt_processor: VtProcessor::new(runtime_tx.clone()),
+                vt_processor,
                 replies: Vec::new(),
                 runtime_tx,
                 rx,
                 protocol: ProtocolState::with_fixed_dims(DEFAULT_DIMS),
                 transcode: Transcode::default(),
+                decodes,
             }
         }
 
@@ -82,6 +89,14 @@ mod linux {
                 );
                 black_box(self.replies.as_slice());
                 self.vt_processor.notify_end_of_buffer();
+                // Between batches, as the connection's `select!` would:
+                // decodes land and the replies they settled are written.
+                if let Some(decodes) = &mut self.decodes {
+                    decodes.complete_all(&mut self.vt_processor);
+                    self.replies.clear();
+                    self.vt_processor.drain_replies(&mut self.replies);
+                    black_box(self.replies.as_slice());
+                }
             }
 
             let mut complete = 0;
@@ -131,6 +146,14 @@ mod linux {
         setup_wire(WireProfile::IacDense)
     }
 
+    fn ansi_graphics() -> Vec<u8> {
+        setup_wire(WireProfile::AnsiGraphics)
+    }
+
+    fn ansi_graphics_full() -> Vec<u8> {
+        setup_wire(WireProfile::AnsiGraphicsFull)
+    }
+
     #[library_benchmark]
     #[bench::ansi_light(ansi_light())]
     #[bench::iac_dense(iac_dense())]
@@ -140,12 +163,18 @@ mod linux {
         black_box(parser.receive(black_box(&bytes), &mut sink));
     }
 
+    // `full_graphics` runs the processor in `GraphicsMode::Full` with the
+    // stub host (`ansi_graphics_full`); every other profile leaves graphics
+    // off, as a processor without a server configuration does. (Gungraun's
+    // attribute macro takes no doc comment.)
     #[library_benchmark]
-    #[bench::ansi_light(ansi_light())]
-    #[bench::ansi_heavy(ansi_heavy())]
-    #[bench::iac_dense(iac_dense())]
-    fn ingest_pipeline(bytes: Vec<u8>) -> (usize, usize) {
-        black_box(Pipeline::new().feed(black_box(&bytes)))
+    #[bench::ansi_light(ansi_light(), false)]
+    #[bench::ansi_heavy(ansi_heavy(), false)]
+    #[bench::iac_dense(iac_dense(), false)]
+    #[bench::ansi_graphics(ansi_graphics(), false)]
+    #[bench::ansi_graphics_full(ansi_graphics_full(), true)]
+    fn ingest_pipeline(bytes: Vec<u8>, full_graphics: bool) -> (usize, usize) {
+        black_box(Pipeline::new(full_graphics).feed(black_box(&bytes)))
     }
 
     library_benchmark_group!(

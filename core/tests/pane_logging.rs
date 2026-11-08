@@ -63,6 +63,7 @@ async fn session_log_is_line_structured_under_redirects_and_gags() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -184,6 +185,7 @@ async fn session_log_persists_open_line_before_completion() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

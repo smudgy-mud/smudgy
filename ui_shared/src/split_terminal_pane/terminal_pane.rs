@@ -308,6 +308,49 @@ fn draw_system_row_decorations<Renderer>(
     }
 }
 
+/// Fills every row's explicit span backgrounds (a non-default background colour,
+/// a link's wash) into the current layer: the pass under the text and its
+/// decorations, between the two passes of placements drawn under the text. Rows
+/// walk up from `bottom`, as [`Widget::draw`] walks them.
+fn draw_backgrounds<P: text::Paragraph>(
+    cache: &[ParagraphCache<P>],
+    text_left: f32,
+    bottom: f32,
+    clip: Rectangle,
+    renderer: &mut impl advanced::Renderer,
+) {
+    let mut y = bottom;
+    for cache in cache {
+        y -= cache.row_height();
+        let text_top = y + cache.text_offset();
+        // Undecorated spans (the overwhelmingly common case) skip before any
+        // span_bounds work.
+        for (span_idx, span) in cache.spans.spans().iter().enumerate() {
+            let Some(highlight) = span.highlight else {
+                continue;
+            };
+            for region in cache.paragraph.span_bounds(span_idx) {
+                let rect = Rectangle {
+                    x: text_left + cache.text_x + region.x,
+                    y: region.y + text_top,
+                    width: region.width,
+                    height: region.height,
+                };
+                if let Some(bounds) = rect.intersection(&clip) {
+                    renderer.fill_quad(
+                        Quad {
+                            bounds,
+                            border: highlight.border,
+                            ..Default::default()
+                        },
+                        highlight.background,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn draw_text_decoration<Renderer: advanced::Renderer>(
     renderer: &mut Renderer,
     region: Rectangle,
@@ -556,6 +599,31 @@ pub(super) fn effective_metrics(
         Some(px) => (px, (px * 1.25).round()),
         None => (prefs.font_size, prefs.line_height),
     }
+}
+
+/// The text's ascent minus its descent at `font_size`, in pixels. cosmic-text
+/// centres a row's glyph box in its line height, so a plain row's baseline
+/// sits `(line_height + rise) / 2` below the row's top; the inline-object
+/// host needs `rise` to put text beside a tall object on the object's last
+/// row. One glyph shaped once per prefs generation and size; iced's
+/// paragraph API exposes no baseline, so this asks cosmic-text directly.
+fn measure_text_rise(font: iced::Font, font_size: f32, line_height: f32) -> f32 {
+    use iced::advanced::graphics::text::{cosmic_text, font_system, to_attributes};
+    let mut system = font_system().write().expect("font system lock");
+    let system = system.raw();
+    let mut buffer =
+        cosmic_text::Buffer::new(system, cosmic_text::Metrics::new(font_size, line_height));
+    buffer.set_text(
+        system,
+        "x",
+        &to_attributes(font),
+        cosmic_text::Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(system, false);
+    buffer.layout_runs().next().map_or(0.0, |run| {
+        2.0 * (run.line_y - run.line_top) - run.line_height
+    })
 }
 
 fn clipped_tooltip_text(text: &LinkTooltipText) -> LinkTooltipText {
@@ -1368,6 +1436,10 @@ pub(super) struct State<P: text::Paragraph> {
     /// advance)` — the font size composes because a per-pane override changes
     /// the cell without a prefs bump.
     pub advance: Option<(u64, f32, f32)>,
+    /// Measured `(prefs generation, effective font size, text rise)`: the
+    /// text's ascent minus its descent, which sizes the riser that keeps text
+    /// beside a tall inline object on the object's last row.
+    text_rise: Option<(u64, f32, f32)>,
     /// Keyboard modifiers as of the last change event, reported with link clicks.
     pub modifiers: keyboard::Modifiers,
     /// The buffer cell the press landed on, kept while the pointer stays on it. A
@@ -1420,6 +1492,7 @@ impl<P: text::Paragraph> Default for State<P> {
             effects_above: Vec::new(),
             is_focused: false,
             advance: None,
+            text_rise: None,
             modifiers: keyboard::Modifiers::default(),
             pressed_cell: None,
             previous_click: None,
@@ -2043,6 +2116,21 @@ where
             }
         };
 
+        // The text's ascent minus its descent at this font and size, measured
+        // on the same cadence; see `measure_text_rise`.
+        let text_rise = match state.text_rise {
+            Some((generation, probe_size, rise))
+                if generation == prefs.generation && probe_size == font_size =>
+            {
+                rise
+            }
+            _ => {
+                let rise = measure_text_rise(prefs.font, font_size, line_height);
+                state.text_rise = Some((prefs.generation, font_size, rise));
+                rise
+            }
+        };
+
         // When a maximum line length (in columns) is configured, clamp the
         // wrap width to `cols * advance`. Text stays left-aligned in the
         // full pane.
@@ -2129,6 +2217,12 @@ where
                 } else {
                     (font_size, line_height)
                 };
+            // The grid an object on this row measures itself in: a terminal
+            // graphics placement is `columns` advances by `rows` row heights.
+            let object_metrics = crate::inline_object::ObjectMetrics {
+                cell_width: advance,
+                line_height: row_line_height,
+            };
             let row_bounds = iced::Size::new(
                 (text_bounds.width - inset).max(1.0),
                 if line.styled_line.objects.is_some() {
@@ -2171,6 +2265,7 @@ where
                             self.inline_resolver.as_ref(),
                             _renderer,
                             row_bounds.width,
+                            &object_metrics,
                         )
                     }))
             {
@@ -2277,6 +2372,8 @@ where
                     self.inline_resolver.as_ref(),
                     _renderer,
                     row_bounds.width,
+                    &object_metrics,
+                    text_rise,
                 );
             }
             // cosmic-text takes the maximum explicit glyph line-height. Give
@@ -2465,7 +2562,57 @@ where
         } else {
             layout.bounds().intersection(viewport).unwrap_or_default()
         };
+        let host = crate::inline_object::Host::<Message, Theme, Renderer>::get(tree);
+        let clipped_viewport = layout.bounds().intersection(viewport);
+        let bottom = layout.bounds().y + layout.bounds().height + state.bottom_offset;
+        // The rows are drawn in passes. Layers paint in the order they open, and
+        // returning to the layer around one paints underneath it, so each pass
+        // after the first that opened a layer takes a layer of its own: placements
+        // that go under the rows' background colours, those colours, placements
+        // that go under the text alone, text effects, then the text with its
+        // decorations and selection, and after all of it the objects over the
+        // text. Without any of those the rows stay in the pane's own layer.
+        let mut layered = false;
+        if let Some(clipped_viewport) = clipped_viewport {
+            layered = host.is_some_and(|host| {
+                host.draw_under(
+                    crate::inline_object::Under::Backgrounds,
+                    renderer,
+                    _theme,
+                    _style_defaults,
+                    layout,
+                    cursor,
+                    viewport,
+                )
+            });
+            if layered {
+                renderer.start_layer(clipped_viewport);
+            }
+            draw_backgrounds(
+                &state.cache,
+                layout.bounds().x,
+                bottom,
+                clipped_viewport,
+                renderer,
+            );
+            if layered {
+                renderer.end_layer();
+            }
+            layered |= host.is_some_and(|host| {
+                host.draw_under(
+                    crate::inline_object::Under::Text,
+                    renderer,
+                    _theme,
+                    _style_defaults,
+                    layout,
+                    cursor,
+                    viewport,
+                )
+            });
+        }
         if self.terminal_buffer.has_inline_effects() {
+            // Each effect takes a layer of its own, whether or not one draws.
+            layered = true;
             let remaining = draw_effects(
                 &state.cache,
                 layout.bounds() + iced::Vector::new(0.0, state.bottom_offset),
@@ -2498,11 +2645,8 @@ where
                 remaining,
             );
         }
-        if let Some(clipped_viewport) = layout.bounds().intersection(viewport) {
-            // Effects have their own layers. Returning to the parent layer would
-            // paint these glyphs underneath them, regardless of call order.
-            let foreground_layer = self.terminal_buffer.has_inline_effects();
-            if foreground_layer {
+        if let Some(clipped_viewport) = clipped_viewport {
+            if layered {
                 renderer.start_layer(clipped_viewport);
             }
             // One phase for every shimmering row this frame, off the blink
@@ -2512,7 +2656,7 @@ where
                 .as_secs_f32()
                 / SHIMMER_PERIOD_SECS)
                 .fract();
-            let mut y = layout.bounds().y + layout.bounds().height + state.bottom_offset;
+            let mut y = bottom;
             for cache in state.cache.iter() {
                 y -= cache.row_height();
                 let text_top = y + cache.text_offset();
@@ -2539,92 +2683,73 @@ where
                     );
                 }
 
-                // Span decorations: explicit background quads and link underlines —
-                // the same geometry iced's rich_text widget draws (fill_paragraph
-                // renders glyphs only). Undecorated spans (the overwhelmingly
-                // common case) skip before any span_bounds work.
+                // Link underlines, overlines and strikes: the same geometry iced's
+                // rich_text widget draws (fill_paragraph renders glyphs only). The
+                // explicit background quads went in with `draw_backgrounds`.
+                // Undecorated spans (the overwhelmingly common case) skip before
+                // any span_bounds work; a span with a background and a decoration
+                // measures its regions in both passes.
                 for (span_idx, span) in cache.spans.spans().iter().enumerate() {
                     let metadata = span.link.unwrap_or_default();
-                    if span.highlight.is_none()
-                        && metadata.underline == LinkDecoration::None
+                    if metadata.underline == LinkDecoration::None
                         && metadata.overline == LinkDecoration::None
                         && metadata.strikethrough == LinkDecoration::None
                     {
                         continue;
                     }
-                    let regions = cache.paragraph.span_bounds(span_idx);
                     let blink_hidden = match metadata.blink {
                         smudgy_session_model::Blink::None => false,
                         smudgy_session_model::Blink::Slow => !state.slow_blink_visible,
                         smudgy_session_model::Blink::Fast => !state.fast_blink_visible,
                     };
-
-                    if let Some(highlight) = span.highlight {
-                        for region in &regions {
-                            let rect = Rectangle {
-                                x: layout.bounds().x + cache.text_x + region.x,
-                                y: region.y + text_top,
-                                width: region.width,
-                                height: region.height,
-                            };
-                            if let Some(bounds) = rect.intersection(&clipped_viewport) {
-                                renderer.fill_quad(
-                                    Quad {
-                                        bounds,
-                                        border: highlight.border,
-                                        ..Default::default()
-                                    },
-                                    highlight.background,
-                                );
-                            }
-                        }
+                    if blink_hidden {
+                        continue;
                     }
+                    let regions = cache.paragraph.span_bounds(span_idx);
 
-                    if !blink_hidden {
-                        // Baseline placement per iced's rich_text: the underline
-                        // sits at font size plus half the leading, nudged up by
-                        // 8% of the font size.
-                        let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
-                        let underline_y =
-                            font_size + (line_height - font_size) / 2.0 - font_size * 0.08;
-                        let strike_y = (line_height - font_size) / 2.0 + font_size * 0.55;
-                        let overline_y = (line_height - font_size) / 2.0 + 1.0;
-                        let color = metadata
-                            .decoration_color
-                            .or(span.color)
-                            .unwrap_or(iced::Color::WHITE);
-                        for region in &regions {
-                            let region = Rectangle {
-                                x: layout.bounds().x + cache.text_x + region.x,
-                                y: region.y + text_top,
-                                width: region.width,
-                                height: region.height,
-                            };
-                            draw_text_decoration(
-                                renderer,
-                                region,
-                                region.y + underline_y,
-                                metadata.underline,
-                                color,
-                                clipped_viewport,
-                            );
-                            draw_text_decoration(
-                                renderer,
-                                region,
-                                region.y + overline_y,
-                                metadata.overline,
-                                color,
-                                clipped_viewport,
-                            );
-                            draw_text_decoration(
-                                renderer,
-                                region,
-                                region.y + strike_y,
-                                metadata.strikethrough,
-                                color,
-                                clipped_viewport,
-                            );
-                        }
+                    // Baseline placement per iced's rich_text: the underline sits
+                    // at font size plus half the leading, nudged up by 8% of the
+                    // font size.
+                    let (font_size, line_height) = effective_metrics(&prefs, self.font_size);
+                    let underline_y =
+                        font_size + (line_height - font_size) / 2.0 - font_size * 0.08;
+                    let strike_y = (line_height - font_size) / 2.0 + font_size * 0.55;
+                    let overline_y = (line_height - font_size) / 2.0 + 1.0;
+                    let color = metadata
+                        .decoration_color
+                        .or(span.color)
+                        .unwrap_or(iced::Color::WHITE);
+                    for region in &regions {
+                        let region = Rectangle {
+                            x: layout.bounds().x + cache.text_x + region.x,
+                            y: region.y + text_top,
+                            width: region.width,
+                            height: region.height,
+                        };
+                        draw_text_decoration(
+                            renderer,
+                            region,
+                            region.y + underline_y,
+                            metadata.underline,
+                            color,
+                            clipped_viewport,
+                        );
+                        draw_text_decoration(
+                            renderer,
+                            region,
+                            region.y + overline_y,
+                            metadata.overline,
+                            color,
+                            clipped_viewport,
+                        );
+                        draw_text_decoration(
+                            renderer,
+                            region,
+                            region.y + strike_y,
+                            metadata.strikethrough,
+                            color,
+                            clipped_viewport,
+                        );
                     }
                 }
 
@@ -2804,11 +2929,11 @@ where
                     );
                 }
             }
-            if foreground_layer {
+            if layered {
                 renderer.end_layer();
             }
         }
-        if let Some(host) = crate::inline_object::Host::<Message, Theme, Renderer>::get(tree) {
+        if let Some(host) = host {
             host.draw(renderer, _theme, _style_defaults, layout, cursor, viewport);
         }
     }

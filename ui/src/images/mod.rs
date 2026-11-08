@@ -19,9 +19,16 @@
 //!
 //! The MSSP `ICON` pipeline ([`server_icon`]) shares this module's decode distrust but
 //! carries its own, tighter fetch posture and a per-server-directory cache.
+//!
+//! Kitty terminal graphics decode here too ([`graphics`]): the pixels arrive in the
+//! session's byte stream rather than from a source, but run on the same runtime under
+//! the same decode limits.
 
+mod graphics;
 mod http_cache;
 pub mod server_icon;
+
+pub use graphics::graphics_decoder;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -40,6 +40,7 @@ async fn connected_session_runtime_joins_on_shutdown() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
 
@@ -62,6 +63,8 @@ async fn connected_session_runtime_joins_on_shutdown() {
         encoding: None,
         compression: InboundCompression::NONE,
         tls: TlsMode::Off,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     })
     .unwrap();
 
@@ -109,6 +112,7 @@ async fn dropping_event_stream_before_ready_unregisters_runtime() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let events = spawn(params);
     assert!(

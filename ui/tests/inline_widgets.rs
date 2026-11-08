@@ -16,6 +16,8 @@ mod support;
 use support::*;
 #[path = "inline_widgets/content.rs"]
 mod content;
+#[path = "inline_widgets/graphics.rs"]
+mod graphics;
 #[path = "inline_widgets/imports.rs"]
 mod imports;
 #[path = "inline_widgets/reload.rs"]

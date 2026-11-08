@@ -4,11 +4,16 @@ version = "0.5.9-ptb"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22"
+# Decoded pixels travel as `Bytes`: the session record and the image handle
+# share one allocation instead of copying a frame per placement.
+bytes = "1"
 color-art = { workspace = true }
 encoding_rs = "0.8"
 flate2 = "1"
 log = { workspace = true }
 memchr = "2"
+serde = { workspace = true }
 serde_json = { workspace = true }
 smudgy_session_model = { workspace = true }
 vtparse = { workspace = true }

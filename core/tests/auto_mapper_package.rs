@@ -285,6 +285,7 @@ async fn auto_mapper_maps_follows_and_persists() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -574,6 +575,7 @@ async fn auto_mapper_maps_follows_and_persists() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -718,6 +720,7 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -958,6 +961,7 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1136,6 +1140,7 @@ async fn auto_mapper_maps_msdp_composite_room() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1297,6 +1302,7 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1582,6 +1588,7 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1751,6 +1758,7 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1890,6 +1898,7 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -2185,6 +2194,7 @@ async fn auto_mapper_refused_relink_keeps_the_exit() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -2423,6 +2433,7 @@ async fn auto_mapper_waits_for_the_zones_cloud_map_to_load() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

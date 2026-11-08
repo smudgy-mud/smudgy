@@ -162,6 +162,13 @@ pub enum RuntimeAction {
         compression: crate::session::connection::InboundCompression,
         /// The transport mode resolved from `ServerConfig::tls` + `tls_verify`.
         tls: crate::session::connection::TlsMode,
+        /// How kitty graphics commands and terminal queries are treated
+        /// (`ServerConfig::graphics`); seeds the connection's VT processor.
+        graphics: smudgy_protocol::graphics::GraphicsMode,
+        /// Whether graphics transmits may read this machine's files and
+        /// shared memory (`ServerConfig::graphics_local_files`); honoured
+        /// only when the peer turns out to be a loopback address.
+        graphics_local_files: bool,
     },
     /// Tears down the active TCP connection (if any) at the user's request. The
     /// socket task then emits [`RuntimeAction::Disconnected`] like any other
@@ -928,6 +935,14 @@ pub enum RuntimeAction {
     WindowSizeChanged {
         cols: u16,
         rows: u16,
+        /// The cell size the grid was measured with, in fixed point:
+        /// logical pixels times `smudgy_protocol::graphics::CELL_FIXED_SCALE`
+        /// (256), rounded to the nearest unit (`cell_fixed`). Zero until a
+        /// font has been measured. Lays terminal graphics placements out
+        /// from the pane's real advance, and answers the pixel-size terminal
+        /// queries graphics clients send, truncated to whole pixels there.
+        cell_width: u16,
+        cell_height: u16,
     },
     Reload,
     Shutdown,

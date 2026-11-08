@@ -61,6 +61,7 @@ async fn pane_scroll_commands_keep_order_and_validate_arguments() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let (bus, mut commands) = smudgy_core::session::ui_command::channel();

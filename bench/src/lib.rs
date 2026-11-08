@@ -15,6 +15,7 @@
 
 pub mod alloc;
 pub mod atlas;
+pub mod graphics;
 pub mod session;
 pub mod wire;
 

@@ -53,6 +53,7 @@ fn session_params(session_id: u32, server: &str) -> Arc<SessionParams> {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })
 }
 

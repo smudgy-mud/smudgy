@@ -1,7 +1,7 @@
 use super::*;
 // use iced::Command; // Ensure this line is removed or commented if present from previous edits
 use smudgy_core::models::profile::ProfileConfig;
-use smudgy_core::models::server::{ServerCas, ServerConfig};
+use smudgy_core::models::server::{GraphicsMode, ServerCas, ServerConfig};
 
 // Helper to create a default state
 fn initial_state() -> State {
@@ -228,6 +228,243 @@ fn editing_a_wss_server_leaves_tls_unchecked_for_telnet() {
         ServerOperationAction::Update { config, .. }
             if config.wss_url.is_none() && !config.tls && config.port == 4000
     ));
+}
+
+const GRAPHICS_MODES: [GraphicsMode; 3] = [
+    GraphicsMode::Full,
+    GraphicsMode::DisplayOnly,
+    GraphicsMode::Off,
+];
+
+/// The config the pending save will write, for a create or an edit alike.
+fn pending_server_config(state: &State) -> &ServerConfig {
+    match &state
+        .pending_server_operation
+        .as_ref()
+        .expect("pending save")
+        .action
+    {
+        ServerOperationAction::Create { config, .. }
+        | ServerOperationAction::Update { config, .. } => config,
+        ServerOperationAction::Delete { .. } => panic!("expected a save, not a delete"),
+    }
+}
+
+/// Opens the create form and fills in a valid Telnet server named `MyMUD`.
+fn fill_create_form(state: &mut State) {
+    let _ = update(state, Message::RequestCreateServer);
+    for (field, value) in [
+        (ServerFormField::Name, "MyMUD"),
+        (ServerFormField::Destination, "mud.example.com"),
+        (ServerFormField::Port, "4000"),
+    ] {
+        let _ = update(
+            state,
+            Message::UpdateServerFormField(field, value.to_owned()),
+        );
+    }
+}
+
+/// Completes the pending create as the store would and returns the saved server.
+fn finish_pending_create(state: &mut State) -> Server {
+    let pending = state
+        .pending_server_operation
+        .clone()
+        .expect("pending save");
+    let created = Server {
+        name: "MyMUD".to_owned(),
+        path: std::path::PathBuf::from("MyMUD"),
+        config: pending_server_config(state).clone(),
+    };
+    let _ = update(
+        state,
+        Message::ServerOperationFinished(ServerOperationCompletion {
+            key: pending.key(),
+            result: Ok(AppliedServerOperation::Created(created.clone())),
+        }),
+    );
+    created
+}
+
+#[test]
+fn server_form_graphics_defaults_to_full() {
+    assert_eq!(ServerConfigFormData::default().graphics, GraphicsMode::Full);
+
+    // A pick with no form open goes nowhere.
+    let mut state = initial_state();
+    let _ = update(&mut state, Message::UpdateServerGraphics(GraphicsMode::Off));
+    assert_eq!(state.server_form_data.graphics, GraphicsMode::Full);
+
+    // A new form starts at Full whatever an earlier form left behind.
+    state.server_form_data.graphics = GraphicsMode::DisplayOnly;
+    fill_create_form(&mut state);
+    assert_eq!(state.server_form_data.graphics, GraphicsMode::Full);
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(state.server_crud_error.is_none());
+    assert_eq!(pending_server_config(&state).graphics, GraphicsMode::Full);
+}
+
+#[test]
+fn server_form_round_trips_each_graphics_mode_through_create_and_edit() {
+    for mode in GRAPHICS_MODES {
+        let mut state = initial_state();
+        fill_create_form(&mut state);
+        let _ = update(&mut state, Message::UpdateServerGraphics(mode));
+        assert_eq!(state.server_form_data.graphics, mode);
+        let _ = update(&mut state, Message::SubmitServerForm);
+        assert!(state.server_crud_error.is_none(), "{mode:?}");
+        assert_eq!(pending_server_config(&state).graphics, mode);
+        let created = finish_pending_create(&mut state);
+
+        // Editing shows the saved mode, and an untouched save writes the same config back.
+        let _ = update(&mut state, Message::RequestEditServer(created.name.clone()));
+        assert_eq!(state.server_form_data.graphics, mode);
+        let _ = update(&mut state, Message::SubmitServerForm);
+        assert!(matches!(
+            &state.pending_server_operation.as_ref().expect("pending save").action,
+            ServerOperationAction::Update { expected, config }
+                if expected == &created && config == &created.config
+        ));
+    }
+}
+
+#[test]
+fn editing_a_server_shows_and_changes_its_graphics_mode() {
+    for stored in GRAPHICS_MODES {
+        for picked in GRAPHICS_MODES {
+            let mut state = initial_state();
+            let mut existing = server("mud");
+            existing.config.graphics = stored;
+            state.servers.push(existing.clone());
+
+            let _ = update(
+                &mut state,
+                Message::RequestEditServer(existing.name.clone()),
+            );
+            assert_eq!(state.server_form_data.graphics, stored);
+            let _ = update(&mut state, Message::UpdateServerGraphics(picked));
+            let _ = update(&mut state, Message::SubmitServerForm);
+            assert_eq!(
+                pending_server_config(&state).graphics,
+                picked,
+                "{stored:?} -> {picked:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn server_form_local_image_files_defaults_to_off() {
+    assert!(!ServerConfigFormData::default().graphics_local_files);
+
+    // A toggle with no form open goes nowhere.
+    let mut state = initial_state();
+    let _ = update(&mut state, Message::ToggleServerGraphicsLocalFiles(true));
+    assert!(!state.server_form_data.graphics_local_files);
+
+    // A new form starts off whatever an earlier form left behind.
+    state.server_form_data.graphics_local_files = true;
+    fill_create_form(&mut state);
+    assert!(!state.server_form_data.graphics_local_files);
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(state.server_crud_error.is_none());
+    assert!(!pending_server_config(&state).graphics_local_files);
+}
+
+#[test]
+fn local_image_files_turned_on_at_create_is_saved_and_shown_when_editing() {
+    let mut state = initial_state();
+    fill_create_form(&mut state);
+    let _ = update(&mut state, Message::ToggleServerGraphicsLocalFiles(true));
+    assert!(state.server_form_data.graphics_local_files);
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(state.server_crud_error.is_none());
+    assert!(pending_server_config(&state).graphics_local_files);
+    let created = finish_pending_create(&mut state);
+
+    let _ = update(&mut state, Message::RequestEditServer(created.name.clone()));
+    assert!(state.server_form_data.graphics_local_files);
+    assert!(server::shows_graphics_local_files(&state));
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(matches!(
+        &state.pending_server_operation.as_ref().expect("pending save").action,
+        ServerOperationAction::Update { expected, config }
+            if expected == &created && config == &created.config
+    ));
+}
+
+#[test]
+fn editing_a_server_shows_and_changes_its_local_image_files_choice() {
+    for stored in [false, true] {
+        let mut existing = server("mud");
+        existing.config.graphics_local_files = stored;
+
+        // An untouched save writes the stored choice back.
+        let mut state = initial_state();
+        state.servers.push(existing.clone());
+        let _ = update(
+            &mut state,
+            Message::RequestEditServer(existing.name.clone()),
+        );
+        assert_eq!(state.server_form_data.graphics_local_files, stored);
+        let _ = update(&mut state, Message::SubmitServerForm);
+        assert!(
+            matches!(
+                &state.pending_server_operation.as_ref().expect("pending save").action,
+                ServerOperationAction::Update { expected, config }
+                    if expected == &existing && config.graphics_local_files == stored
+            ),
+            "{stored}"
+        );
+
+        // Flipping it saves the flipped choice.
+        let mut state = initial_state();
+        state.servers.push(existing.clone());
+        let _ = update(
+            &mut state,
+            Message::RequestEditServer(existing.name.clone()),
+        );
+        let _ = update(&mut state, Message::ToggleServerGraphicsLocalFiles(!stored));
+        let _ = update(&mut state, Message::SubmitServerForm);
+        assert_eq!(
+            pending_server_config(&state).graphics_local_files,
+            !stored,
+            "{stored}"
+        );
+    }
+}
+
+#[test]
+fn local_image_files_checkbox_is_hidden_while_graphics_are_off() {
+    let mut state = initial_state();
+    fill_create_form(&mut state);
+    let _ = update(&mut state, Message::ToggleServerGraphicsLocalFiles(true));
+    for mode in GRAPHICS_MODES {
+        let _ = update(&mut state, Message::UpdateServerGraphics(mode));
+        assert_eq!(
+            server::shows_graphics_local_files(&state),
+            mode != GraphicsMode::Off,
+            "{mode:?}"
+        );
+        // Hiding the checkbox leaves the choice as the user left it.
+        assert!(state.server_form_data.graphics_local_files, "{mode:?}");
+    }
+
+    // Graphics back on shows the checkbox still checked.
+    let _ = update(
+        &mut state,
+        Message::UpdateServerGraphics(GraphicsMode::Full),
+    );
+    assert!(server::shows_graphics_local_files(&state));
+    assert!(state.server_form_data.graphics_local_files);
+
+    // A save with graphics off keeps the hidden choice for when they come back.
+    let _ = update(&mut state, Message::UpdateServerGraphics(GraphicsMode::Off));
+    let _ = update(&mut state, Message::SubmitServerForm);
+    assert!(state.server_crud_error.is_none());
+    let saved = pending_server_config(&state);
+    assert_eq!(saved.graphics, GraphicsMode::Off);
+    assert!(saved.graphics_local_files);
 }
 
 #[test]

@@ -89,6 +89,7 @@ fn responders_answer_ttype_and_naws_over_a_live_socket() {
         ui_tx,
         Arc::new(AtomicBool::new(false)),
         window_size.clone(),
+        Arc::new(AtomicU32::new(0)),
     );
     connection.connect(
         "127.0.0.1",
@@ -194,6 +195,7 @@ fn mccp2_compresses_the_stream_and_reverts_on_stream_end() {
         ui_tx,
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+        Arc::new(AtomicU32::new(0)),
     );
     connection.connect(
         "127.0.0.1",
@@ -359,6 +361,7 @@ fn nested_marker_at_stream_end_does_not_strand_the_latch() {
         ui_tx,
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+        Arc::new(AtomicU32::new(0)),
     );
     connection.connect(
         "127.0.0.1",
@@ -478,6 +481,7 @@ fn compression_test_connection(
         ui_tx,
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+        Arc::new(AtomicU32::new(0)),
     );
     connection.connect(
         "127.0.0.1",

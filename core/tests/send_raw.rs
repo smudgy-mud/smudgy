@@ -32,6 +32,7 @@ fn prepare(id: u32) -> (String, Arc<SessionParams>) {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     (server, params)
 }
@@ -129,6 +130,8 @@ createTrigger("^SENDRAW_GO$", () => {{
         encoding: encoding.map(|s| Arc::new(s.to_string())),
         compression: InboundCompression::NONE,
         tls: TlsMode::Off,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     })
     .unwrap();
     loop {

@@ -63,6 +63,24 @@ const fn ansi_color(index: i64) -> AnsiColor {
     }
 }
 
+/// The palette index of a named color: the inverse of [`ansi_color`], with
+/// the bright variants at 8..=15, as the kitty graphics protocol reads an
+/// image id out of a foreground set by `3x`/`9x`.
+#[must_use]
+pub fn ansi_index(color: AnsiColor, bold: bool) -> u8 {
+    let base = match color {
+        AnsiColor::Black => 0,
+        AnsiColor::Red => 1,
+        AnsiColor::Green => 2,
+        AnsiColor::Yellow => 3,
+        AnsiColor::Blue => 4,
+        AnsiColor::Magenta => 5,
+        AnsiColor::Cyan => 6,
+        AnsiColor::White => 7,
+    };
+    if bold { base + 8 } else { base }
+}
+
 /// Clamp an SGR color component to the u8 range (out-of-range values clamp
 /// rather than wrap — `38;2;300;0;0` is a saturated red, not a dim one).
 fn component(value: i64) -> u8 {
@@ -108,13 +126,54 @@ fn color_256(index: i64) -> Color {
     }
 }
 
+/// An extended color (`38`, `48` or `58` with `5;n` or `2;r;g;b`) as the
+/// sequence gave it, before the palette index is resolved to a [`Color`].
+/// The kitty graphics protocol reads an image id out of the foreground and
+/// a placement id out of the underline color, and a palette index means the
+/// index itself there, not the RGB it maps to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtendedColor {
+    /// `5;n`: a 256-color palette index.
+    Indexed(u8),
+    /// `2;r;g;b`: a direct color.
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+impl From<ExtendedColor> for Color {
+    #[inline]
+    fn from(color: ExtendedColor) -> Self {
+        match color {
+            ExtendedColor::Indexed(index) => color_256(i64::from(index)),
+            ExtendedColor::Rgb { r, g, b } => Self::Rgb { r, g, b },
+        }
+    }
+}
+
+/// The SGR state a [`Style`] does not carry, tracked beside it by whoever
+/// drives [`process_with_extras`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SgrExtras {
+    /// The underline color (SGR 58), as given; `None` after SGR 59 or a
+    /// reset, when the underline takes the foreground's color.
+    pub underline_color: Option<ExtendedColor>,
+    /// The palette index the foreground was last set to with `38;5;n`;
+    /// `None` once anything else set it, so a reader that needs the index
+    /// (rather than the color it resolves to) can tell the two apart.
+    pub fg_index: Option<u8>,
+}
+
 /// Decode a colon-form extended color (`38:5:n`, `38:2::r:g:b`) from a slot's
-/// sub-parameters (everything after the 38/48). Four or more components after
-/// mode 2 mean the first is an ITU T.416 colorspace id, which is skipped.
-/// `None` when the mode is missing or unrecognized.
-fn extended_color_from_subparams(mode: Option<i64>, mut sub: Subparams<'_>) -> Option<Color> {
+/// sub-parameters (everything after the 38/48/58). Four or more components
+/// after mode 2 mean the first is an ITU T.416 colorspace id, which is
+/// skipped. `None` when the mode is missing or unrecognized.
+fn extended_color_from_subparams(
+    mode: Option<i64>,
+    mut sub: Subparams<'_>,
+) -> Option<ExtendedColor> {
     match mode {
-        Some(5) => Some(color_256(sub.next().flatten().unwrap_or(0))),
+        Some(5) => Some(ExtendedColor::Indexed(component(
+            sub.next().flatten().unwrap_or(0),
+        ))),
         Some(2) => {
             let first = sub.next().flatten().unwrap_or(0);
             let second = sub.next().flatten().unwrap_or(0);
@@ -124,7 +183,7 @@ fn extended_color_from_subparams(mode: Option<i64>, mut sub: Subparams<'_>) -> O
                 Some(fourth) => (second, third, fourth.unwrap_or(0)),
                 None => (first, second, third),
             };
-            Some(Color::Rgb {
+            Some(ExtendedColor::Rgb {
                 r: component(r),
                 g: component(g),
                 b: component(b),
@@ -135,16 +194,19 @@ fn extended_color_from_subparams(mode: Option<i64>, mut sub: Subparams<'_>) -> O
 }
 
 /// Decode a semicolon-form extended color (`38;5;n`, `38;2;r;g;b`) from the
-/// slots following the 38/48 introducer. Advance only for a recognized mode;
-/// a truncated tail reads missing components as 0, matching common client behavior.
-fn extended_color_from_slots<'a, I>(slots: &mut I) -> Option<Color>
+/// slots following the 38/48/58 introducer. Advance only for a recognized
+/// mode; a truncated tail reads missing components as 0, matching common
+/// client behavior.
+fn extended_color_from_slots<'a, I>(slots: &mut I) -> Option<ExtendedColor>
 where
     I: Iterator<Item = &'a [CsiParam]> + Clone,
 {
     let mut rest = slots.clone();
     let color = match rest.next().and_then(first_value) {
-        Some(5) => color_256(rest.next().and_then(first_value).unwrap_or(0)),
-        Some(2) => Color::Rgb {
+        Some(5) => {
+            ExtendedColor::Indexed(component(rest.next().and_then(first_value).unwrap_or(0)))
+        }
+        Some(2) => ExtendedColor::Rgb {
             r: component(rest.next().and_then(first_value).unwrap_or(0)),
             g: component(rest.next().and_then(first_value).unwrap_or(0)),
             b: component(rest.next().and_then(first_value).unwrap_or(0)),
@@ -153,6 +215,23 @@ where
     };
     *slots = rest;
     Some(color)
+}
+
+/// Apply an extended color to the channel its introducer names: `38` the
+/// foreground (remembering a palette index as such), `48` the background,
+/// `58` the underline.
+fn set_extended_color(style: &mut Style, extras: &mut SgrExtras, code: i64, color: ExtendedColor) {
+    match code {
+        38 => {
+            style.fg = color.into();
+            extras.fg_index = match color {
+                ExtendedColor::Indexed(index) => Some(index),
+                ExtendedColor::Rgb { .. } => None,
+            };
+        }
+        48 => style.bg = color.into(),
+        _ => extras.underline_color = Some(color),
+    }
 }
 
 /// Interprets one SGR (`CSI … m`) parameter list against `initial_style`,
@@ -165,6 +244,18 @@ where
 /// leave the style entirely untouched.
 #[must_use]
 pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
+    process_with_extras(initial_style, params, &mut SgrExtras::default())
+}
+
+/// [`process`], also tracking in `extras` what a [`Style`] does not hold:
+/// the underline color (`58`, reset by `59` and by `0`) and whether the
+/// foreground was last set by palette index.
+#[must_use]
+pub fn process_with_extras(
+    initial_style: Style,
+    params: &[CsiParam],
+    extras: &mut SgrExtras,
+) -> Style {
     // Reject the entire sequence before applying any directive, including markers in
     // components or otherwise ignored tails. Slots and subparameters then borrow the input.
     if params
@@ -184,14 +275,10 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
             // Colon form: the directive is self-contained in its slot. Only
             // extended colors and the standard underline variants currently
             // have a Style representation.
-            if (code == 38 || code == 48)
+            if (code == 38 || code == 48 || code == 58)
                 && let Some(color) = extended_color_from_subparams(mode, sub)
             {
-                if code == 38 {
-                    style.fg = color;
-                } else {
-                    style.bg = color;
-                }
+                set_extended_color(&mut style, extras, code, color);
             } else if code == 4 {
                 style.attributes.underline = match mode.unwrap_or(1) {
                     0 => Underline::None,
@@ -205,6 +292,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
         match code {
             0 => {
                 style = Style::default();
+                *extras = SgrExtras::default();
             }
             1 => {
                 style.attributes.bold = true;
@@ -235,18 +323,18 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                     color: ansi_color(code - 30),
                     bold: false,
                 };
+                extras.fg_index = None;
             }
-            38 | 48 => {
+            38 | 48 | 58 => {
                 if let Some(color) = extended_color_from_slots(&mut slots) {
-                    if code == 38 {
-                        style.fg = color;
-                    } else {
-                        style.bg = color;
-                    }
+                    set_extended_color(&mut style, extras, code, color);
                 }
             }
             // 39 resets the color, not the text intensity (ECMA-48).
-            39 => style.fg = Color::DefaultForeground { bold: false },
+            39 => {
+                style.fg = Color::DefaultForeground { bold: false };
+                extras.fg_index = None;
+            }
             40..=47 => {
                 style.bg = Color::Ansi {
                     color: ansi_color(code - 40),
@@ -254,11 +342,15 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                 };
             }
             49 => style.bg = Color::DefaultBackground,
+            // The underline color has no Style channel; it is tracked only
+            // for readers that ask (the graphics protocol's placeholders).
+            59 => extras.underline_color = None,
             90..=97 => {
                 style.fg = Color::Ansi {
                     color: ansi_color(code - 90),
                     bold: true,
                 };
+                extras.fg_index = None;
             }
             100..=107 => {
                 style.bg = Color::Ansi {
@@ -275,7 +367,10 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, Color, Subparams, color_256, process};
+    use super::{
+        AnsiColor, Color, ExtendedColor, SgrExtras, Subparams, color_256, process,
+        process_with_extras,
+    };
     use smudgy_session_model::{Blink, Style, TextAttributes, Underline};
     use vtparse::CsiParam;
 
@@ -673,6 +768,78 @@ mod tests {
                     assert_eq!(process(initial, &stream), initial, "{stream:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn underline_color_is_tracked_beside_the_style_in_both_forms() {
+        let mut extras = SgrExtras::default();
+        let style = process_with_extras(default_style(), &params("58;5;42"), &mut extras);
+        assert_eq!(extras.underline_color, Some(ExtendedColor::Indexed(42)));
+        assert_eq!(style, default_style(), "58 touches no Style channel");
+        let _ = process_with_extras(style, &params("58;2;1;2;3"), &mut extras);
+        assert_eq!(
+            extras.underline_color,
+            Some(ExtendedColor::Rgb { r: 1, g: 2, b: 3 })
+        );
+        let _ = process_with_extras(style, &params("58:5:7"), &mut extras);
+        assert_eq!(extras.underline_color, Some(ExtendedColor::Indexed(7)));
+        let _ = process_with_extras(style, &params("58:2::9:8:7"), &mut extras);
+        assert_eq!(
+            extras.underline_color,
+            Some(ExtendedColor::Rgb { r: 9, g: 8, b: 7 }),
+            "a colorspace id is skipped, and the slot ends the directive"
+        );
+        let _ = process_with_extras(style, &params("59"), &mut extras);
+        assert_eq!(extras.underline_color, None);
+        let _ = process_with_extras(style, &params("58;5;3;0"), &mut extras);
+        assert_eq!(extras.underline_color, None, "SGR 0 resets it");
+        // The semicolon form consumes its components: `5;42` is not blink.
+        let styled = process_with_extras(default_style(), &params("58;5;42;1"), &mut extras);
+        assert_eq!(styled.attributes.blink, Blink::None);
+        assert!(styled.attributes.bold);
+        assert_eq!(
+            process(default_style(), &params("58;5;42")),
+            default_style()
+        );
+        // The three-component colon form, without a colourspace id.
+        let _ = process_with_extras(default_style(), &params("58:2:4:5:6"), &mut extras);
+        assert_eq!(
+            extras.underline_color,
+            Some(ExtendedColor::Rgb { r: 4, g: 5, b: 6 })
+        );
+        // An unknown mode sets nothing, and the slots after it are
+        // directives of their own: `3` italic, then `1` bold.
+        let styled = process_with_extras(default_style(), &params("58;3;1;3"), &mut extras);
+        assert_eq!(
+            extras.underline_color,
+            Some(ExtendedColor::Rgb { r: 4, g: 5, b: 6 }),
+            "left as it was"
+        );
+        assert!(styled.attributes.bold && styled.attributes.italic);
+    }
+
+    #[test]
+    fn the_foreground_palette_index_is_remembered_until_another_foreground() {
+        let mut extras = SgrExtras::default();
+        let style = process_with_extras(default_style(), &params("38;5;42"), &mut extras);
+        assert_eq!(extras.fg_index, Some(42));
+        assert_eq!(style.fg, color_256(42), "the Style still resolves it");
+        let _ = process_with_extras(style, &params("48;5;1"), &mut extras);
+        assert_eq!(
+            extras.fg_index,
+            Some(42),
+            "a background does not disturb it"
+        );
+        let _ = process_with_extras(style, &params("38:5:200"), &mut extras);
+        assert_eq!(extras.fg_index, Some(200));
+        for reset in ["31", "91", "39", "38;2;1;2;3", "0", "38:2::1:2:3"] {
+            let mut extras = SgrExtras {
+                fg_index: Some(42),
+                underline_color: None,
+            };
+            let _ = process_with_extras(default_style(), &params(reset), &mut extras);
+            assert_eq!(extras.fg_index, None, "{reset}");
         }
     }
 }

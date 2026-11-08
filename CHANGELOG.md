@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Images from the game appear in the terminal.** A server that speaks the
+  kitty terminal graphics protocol can send pictures straight into the main
+  terminal: an image it transmits shows up at the cursor, covering as many
+  columns and rows as it spans, and text printed after it carries on beside
+  the image's bottom row. A server can show a stored image more than once,
+  size it in cells, crop it, and delete images or placements; each session
+  keeps up to 64 MiB of decoded images and lets the oldest go when a new one
+  needs the room. Transmitting a new image under an id already in use makes
+  it the one that id names from then on, while placements already in the
+  scrollback keep showing the earlier image. Servers detect the support the
+  way the protocol describes it, with a graphics query plus the DA1 and
+  pixel-size terminal reports, which Smudgy answers with the main terminal's
+  real cell size. A new
+  per-server `graphics` setting chooses `full` (images, and the answers
+  servers use to detect them; the default), `display only` (images, but no
+  answers) or `off`. Images can also be placed through Unicode placeholder
+  characters, positioned relative to other placements, layered above or
+  below the text by z-index, and anchored without moving the cursor
+  (`C=1`). Animations play too: a server can add frames to an image, compose
+  one frame onto another, and start, stop and step the playback. Reading
+  images from local files, temporary files or, on Linux, shared memory is
+  off by default and enabled per server; it is honoured only for a server
+  at a loopback address, and since a loopback address can also be a tunnel
+  or a forwarded port, only for a server the user has said is local.
+
+### Changed
+
+- The main terminal pane reports its cell size in pixels alongside its
+  character grid, so the session runtime can answer pixel-size queries.
+- An escape string that exceeds the parser's 8 KiB bound now tells the
+  processor so, instead of vanishing silently.
+
+### Fixed
+
+- **An escape sequence right after a broken character no longer shows up as
+  text.** When a server cut a multibyte character short and went straight
+  into an escape sequence, the sequence's opening byte was dropped with the
+  broken character and the rest of the sequence was printed. The broken
+  character now shows as a replacement character and the sequence does its
+  job.
+
 ## [0.5.8] - 2026-10-24
 
 ### Added

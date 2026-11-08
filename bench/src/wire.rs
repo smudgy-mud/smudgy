@@ -52,6 +52,20 @@ pub enum WireProfile {
     /// escaped-literal `IAC IAC` inside line text, and periodic short
     /// subnegotiations. Stresses the IAC layer rather than SGR parsing.
     IacDense,
+    /// [`WireProfile::AnsiLight`] styling plus a chunked kitty-graphics
+    /// upload (`ESC _ G … ESC \`, 4 KiB base64 chunks) at the head of every
+    /// [`GRAPHICS_EVERY`]th line. Stresses the APC path: every payload byte
+    /// takes the per-byte route, and the line count is unchanged, so the
+    /// profile isolates the cost of image traffic riding a text stream.
+    AnsiGraphics,
+    /// [`WireProfile::AnsiGraphics`] with uploads a displaying connection
+    /// stores and places: each image starts with a PNG header declaring
+    /// [`GRAPHICS_FULL_DIMENSION`] square pixels, carries a fresh image id,
+    /// and asks for its `OK` reply. Same lines, sizes, chunking and seed as
+    /// `AnsiGraphics` (the bytes differ only in the header and control
+    /// keys), so the two compare the parse-and-drop path with the whole
+    /// state machine: records, placements, quota eviction and replies.
+    AnsiGraphicsFull,
 }
 
 /// Dresses `lines` (plain display text) into a single raw wire-byte stream
@@ -63,6 +77,8 @@ pub fn dress_lines(lines: &[String], profile: WireProfile) -> Vec<u8> {
         WireProfile::AnsiLight => dress_ansi_light(lines),
         WireProfile::AnsiHeavy => dress_ansi_heavy(lines),
         WireProfile::IacDense => dress_iac_dense(lines),
+        WireProfile::AnsiGraphics => dress_ansi_graphics(lines, Uploads::Dropped),
+        WireProfile::AnsiGraphicsFull => dress_ansi_graphics(lines, Uploads::Stored),
     }
 }
 
@@ -78,6 +94,20 @@ pub fn chunk(bytes: &[u8], chunk_len: usize) -> Vec<&[u8]> {
 use crate::SplitMix64;
 
 const SEED_ANSI_LIGHT: u64 = 0x5EED_0000_0000_0001;
+const SEED_ANSI_GRAPHICS: u64 = 0x5EED_0000_0000_0004;
+
+/// Lines per graphics upload in [`WireProfile::AnsiGraphics`].
+pub const GRAPHICS_EVERY: usize = 50;
+/// Decoded bytes per upload: a modest PNG's worth, which base64 and the
+/// 4 KiB chunk rule turn into 16 chunks.
+pub const GRAPHICS_IMAGE_BYTES: usize = 48 * 1024;
+/// The protocol's chunk ceiling for a base64 payload.
+pub const GRAPHICS_CHUNK_PAYLOAD: usize = 4096;
+/// The width and height the [`WireProfile::AnsiGraphicsFull`] PNG headers
+/// declare: 64 KiB of RGBA once decoded, a plausible size for a 48 KiB PNG,
+/// so the default 64 MiB quota holds 1024 of them and a corpus with more
+/// uploads keeps evicting.
+pub const GRAPHICS_FULL_DIMENSION: u32 = 128;
 const SEED_ANSI_HEAVY: u64 = 0x5EED_0000_0000_0002;
 const SEED_IAC_DENSE: u64 = 0x5EED_0000_0000_0003;
 
@@ -187,6 +217,117 @@ fn dress_ansi_light(lines: &[String]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// What the uploads of a graphics profile are for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Uploads {
+    /// [`WireProfile::AnsiGraphics`]: one id, replies suppressed, no PNG
+    /// header; a displaying connection refuses every upload at its probe.
+    Dropped,
+    /// [`WireProfile::AnsiGraphicsFull`]: a PNG header, a fresh id each,
+    /// replies requested.
+    Stored,
+}
+
+fn dress_ansi_graphics(lines: &[String], uploads_are: Uploads) -> Vec<u8> {
+    let mut rng = SplitMix64::new(SEED_ANSI_GRAPHICS);
+    let uploads = lines.len() / GRAPHICS_EVERY;
+    let mut out =
+        Vec::with_capacity(lines.iter().map(|l| l.len() + 24).sum::<usize>() + uploads * 72 * 1024);
+    let mut upload = 0_u32;
+    for (i, line) in lines.iter().enumerate() {
+        if i % GRAPHICS_EVERY == GRAPHICS_EVERY - 1 {
+            upload += 1;
+            push_graphics_upload(&mut out, &mut rng, uploads_are, upload);
+        }
+        push_light_line(&mut out, line, &mut rng, false);
+        if i % 20 == 19 {
+            push_prompt_ga(&mut out, &mut rng);
+        }
+    }
+    out
+}
+
+/// Standard base64 with padding, inlined so the bench support layer adds no
+/// dependency for a few dozen bytes of code.
+fn base64_encode(bytes: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let b0 = group[0];
+        let b1 = group.get(1).copied().unwrap_or(0);
+        let b2 = group.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[usize::from(b0 >> 2)]);
+        out.push(ALPHABET[usize::from(((b0 & 0b11) << 4) | (b1 >> 4))]);
+        out.push(if group.len() > 1 {
+            ALPHABET[usize::from(((b1 & 0b1111) << 2) | (b2 >> 6))]
+        } else {
+            b'='
+        });
+        out.push(if group.len() > 2 {
+            ALPHABET[usize::from(b2 & 0b11_1111)]
+        } else {
+            b'='
+        });
+    }
+    out
+}
+
+/// The first 24 bytes of a PNG file declaring `width` x `height` RGBA
+/// pixels: the signature and the start of the IHDR chunk, which is all the
+/// protocol's probe reads. The rest of the chunk (and its CRC) is left to
+/// the random bytes after it; nothing in the bench decodes them.
+fn png_header(width: u32, height: u32) -> [u8; 24] {
+    let mut header = [0_u8; 24];
+    header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    header[8..12].copy_from_slice(&13_u32.to_be_bytes());
+    header[12..16].copy_from_slice(b"IHDR");
+    header[16..20].copy_from_slice(&width.to_be_bytes());
+    header[20..24].copy_from_slice(&height.to_be_bytes());
+    header
+}
+
+/// One chunked `a=T,f=100` upload of [`GRAPHICS_IMAGE_BYTES`] pseudo-random
+/// bytes, split per the protocol: 4 KiB base64 chunks, `m=1` on all but the
+/// last. The bytes are not a real PNG — nothing decodes them, and the bench
+/// measures the wire path and the state machine, not the codec. A stored
+/// upload (`upload`, from 1, is its image id) starts with a PNG header so a
+/// displaying connection admits it.
+fn push_graphics_upload(
+    out: &mut Vec<u8>,
+    rng: &mut SplitMix64,
+    uploads_are: Uploads,
+    upload: u32,
+) {
+    let mut image = Vec::with_capacity(GRAPHICS_IMAGE_BYTES);
+    while image.len() < GRAPHICS_IMAGE_BYTES {
+        image.extend_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    image.truncate(GRAPHICS_IMAGE_BYTES);
+    if uploads_are == Uploads::Stored {
+        image[..24].copy_from_slice(&png_header(
+            GRAPHICS_FULL_DIMENSION,
+            GRAPHICS_FULL_DIMENSION,
+        ));
+    }
+    let encoded = base64_encode(&image);
+    let chunks: Vec<&[u8]> = encoded.chunks(GRAPHICS_CHUNK_PAYLOAD).collect();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let last = index + 1 == chunks.len();
+        out.extend_from_slice(b"\x1b_G");
+        if index == 0 {
+            match uploads_are {
+                Uploads::Dropped => out.extend_from_slice(b"a=T,f=100,i=1,q=2,"),
+                Uploads::Stored => {
+                    out.extend_from_slice(format!("a=T,f=100,i={upload},").as_bytes());
+                }
+            }
+        }
+        out.extend_from_slice(if last { b"m=0;" } else { b"m=1;" });
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
 }
 
 /// One randomly-drawn SGR parameter string in the `AnsiHeavy` mix: 16-color,
@@ -317,13 +458,15 @@ mod tests {
         literal_iac: usize,
         negotiations: usize,
         subnegotiations: usize,
+        apc: usize,
     }
 
     /// Walks the stream enforcing the framing invariants the parser relies
-    /// on: no bare ESC (every ESC begins a complete `ESC [ params m` SGR that
-    /// terminates before end-of-stream), IAC is always followed by a complete
-    /// telnet unit, `IAC IAC` doubles are counted as balanced pairs, and
-    /// subnegotiations always reach their `IAC SE`.
+    /// on: no bare ESC (every ESC begins a complete `ESC [ params m` SGR, or
+    /// an `ESC _ G … ESC \` graphics chunk within the protocol's payload
+    /// ceiling, terminating before end-of-stream), IAC is always followed by
+    /// a complete telnet unit, `IAC IAC` doubles are counted as balanced
+    /// pairs, and subnegotiations always reach their `IAC SE`.
     fn scan(bytes: &[u8]) -> Scan {
         let mut counts = Scan::default();
         let mut i = 0;
@@ -371,6 +514,30 @@ mod tests {
                         }
                         other => panic!("IAC followed by unexpected command byte {other}"),
                     }
+                }
+                ESC if bytes.get(i + 1) == Some(&b'_') => {
+                    assert_eq!(
+                        bytes.get(i + 2),
+                        Some(&b'G'),
+                        "only graphics APCs are emitted"
+                    );
+                    let mut j = i + 3;
+                    while bytes.get(j) != Some(&ESC) {
+                        assert!(j < bytes.len(), "APC never reached ESC \\");
+                        j += 1;
+                    }
+                    assert_eq!(bytes.get(j + 1), Some(&b'\\'), "APC must end with ESC \\");
+                    let body = &bytes[i + 3..j];
+                    let payload = body
+                        .iter()
+                        .position(|&b| b == b';')
+                        .map_or(0, |at| body.len() - at - 1);
+                    assert!(
+                        payload <= GRAPHICS_CHUNK_PAYLOAD,
+                        "chunk payload {payload} exceeds the protocol ceiling"
+                    );
+                    counts.apc += 1;
+                    i = j + 2;
                 }
                 ESC => {
                     assert_eq!(
@@ -448,12 +615,89 @@ mod tests {
     }
 
     #[test]
+    fn ansi_graphics_is_valid_and_shaped_right() {
+        let lines = sample_lines();
+        let bytes = dress_lines(&lines, WireProfile::AnsiGraphics);
+        let counts = scan(&bytes);
+        let uploads = lines.len() / GRAPHICS_EVERY;
+        let chunks_per_upload =
+            (GRAPHICS_IMAGE_BYTES.div_ceil(3) * 4).div_ceil(GRAPHICS_CHUNK_PAYLOAD);
+        assert_eq!(uploads, 2, "the sample corpus carries two uploads");
+        assert_eq!(
+            counts.apc,
+            uploads * chunks_per_upload,
+            "every upload is fully chunked"
+        );
+        assert_eq!(counts.ga, lines.len() / 20, "prompts as in AnsiLight");
+        assert_eq!(counts.literal_iac, 0);
+        assert_eq!(counts.negotiations, 0);
+        assert!(counts.sgr >= 2 * (lines.len() - 1), "sgr = {}", counts.sgr);
+        // Uploads ride existing lines: no extra line terminators.
+        let crlfs = bytes.windows(2).filter(|w| w == b"\r\n").count();
+        let plain = dress_lines(&lines, WireProfile::AnsiLight);
+        let plain_crlfs = plain.windows(2).filter(|w| w == b"\r\n").count();
+        assert_eq!(crlfs, plain_crlfs);
+        assert_eq!(base64_encode(b"Man"), b"TWFu");
+        assert_eq!(base64_encode(b"Ma"), b"TWE=");
+        assert_eq!(base64_encode(b"M"), b"TQ==");
+    }
+
+    #[test]
+    fn ansi_graphics_full_differs_only_in_headers_and_keys() {
+        let lines = sample_lines();
+        let full = dress_lines(&lines, WireProfile::AnsiGraphicsFull);
+        let dropped = dress_lines(&lines, WireProfile::AnsiGraphics);
+        let counts = scan(&full);
+        assert_eq!(counts.apc, scan(&dropped).apc, "the same chunking");
+        assert_eq!(counts.ga, lines.len() / 20);
+        // A fresh id per upload, replies requested, a PNG header leading
+        // each image.
+        let header = base64_encode(&png_header(
+            GRAPHICS_FULL_DIMENSION,
+            GRAPHICS_FULL_DIMENSION,
+        ));
+        for (upload, first) in [
+            (1, "\x1b_Ga=T,f=100,i=1,m=1;"),
+            (2, "\x1b_Ga=T,f=100,i=2,m=1;"),
+        ] {
+            let at = full
+                .windows(first.len())
+                .position(|w| w == first.as_bytes())
+                .unwrap_or_else(|| panic!("upload {upload} starts with {first:?}"));
+            let payload = &full[at + first.len()..];
+            assert_eq!(&payload[..header.len()], header.as_slice());
+        }
+        assert!(!full.windows(3).any(|w| w == b"q=2"));
+        // Everything else is the same stream: removing the APCs leaves the
+        // same text.
+        let strip = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == ESC && bytes.get(i + 1) == Some(&b'_') {
+                    while !(bytes[i] == ESC && bytes.get(i + 1) == Some(&b'\\')) {
+                        i += 1;
+                    }
+                    i += 2;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            out
+        };
+        assert_eq!(strip(&full), strip(&dropped));
+    }
+
+    #[test]
     fn output_is_deterministic_across_calls() {
         let lines = sample_lines();
         for profile in [
             WireProfile::AnsiLight,
             WireProfile::AnsiHeavy,
             WireProfile::IacDense,
+            WireProfile::AnsiGraphics,
+            WireProfile::AnsiGraphicsFull,
         ] {
             let first = dress_lines(&lines, profile);
             let second = dress_lines(&lines, profile);

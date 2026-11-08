@@ -144,6 +144,7 @@ async fn run_capability_case(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory_for(vec![pkg])));
@@ -1311,6 +1312,7 @@ async fn worker_relative_specifier_resolves_against_the_calling_module() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory_for(Vec::new())));

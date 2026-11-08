@@ -70,6 +70,7 @@ async fn throwing_handler_leaves_the_call_state_restored() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let mut lines = Vec::new();

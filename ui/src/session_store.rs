@@ -1513,6 +1513,9 @@ impl ManagedSession {
             package_client: Some(package_client),
             extra_script_extensions,
             on_engine_rebuild,
+            // One process-wide decoder: kitty graphics decode on the image store's
+            // runtime under one shared concurrency bound, whichever session sent them.
+            graphics_decoder: Some(crate::images::graphics_decoder()),
         });
         #[cfg(feature = "web-audio-cpal")]
         let audio_policy = settings.audio.session(&server_name, &profile_name);
@@ -2050,11 +2053,18 @@ impl ManagedSession {
     /// session runtime, which caches it and drives the connection's NAWS report
     /// (RFC 1073). Wired only for the main terminal pane — NAWS describes "the"
     /// window, and script-created split panes are not it.
-    fn grid_change_handler(&self) -> Option<Rc<dyn Fn(u16, u16)>> {
+    fn grid_change_handler(
+        &self,
+    ) -> Option<Rc<dyn Fn(smudgy_ui_shared::split_terminal_pane::GridReport)>> {
         let tx = self.runtime_tx.clone()?;
-        Some(Rc::new(move |cols, rows| {
-            tx.send(RuntimeAction::WindowSizeChanged { cols, rows })
-                .ok();
+        Some(Rc::new(move |report| {
+            tx.send(RuntimeAction::WindowSizeChanged {
+                cols: report.cols,
+                rows: report.rows,
+                cell_width: report.cell_width,
+                cell_height: report.cell_height,
+            })
+            .ok();
         }))
     }
 
@@ -3529,9 +3539,15 @@ impl ManagedSession {
     fn inline_widget_resolver(&self) -> smudgy_ui_shared::inline_object::Resolver {
         let maps = self.map_store.clone();
         let text = self.text_store.clone();
-        smudgy_ui_shared::inline_object::resolver(move |object| {
+        // Kitty graphics placements draw through the process-global image store.
+        let images = image_store();
+        smudgy_ui_shared::inline_object::resolver(move |object, metrics| {
             with_store_context(&maps, || {
-                with_text_store_context(&text, || smudgy_widgets::inline_element(object))
+                with_text_store_context(&text, || {
+                    smudgy_widgets::with_image_store_context(&images, || {
+                        smudgy_widgets::inline_element(object, metrics)
+                    })
+                })
             })
             .map(|element| element.map(Message::InlineWidget))
         })

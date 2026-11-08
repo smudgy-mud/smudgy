@@ -143,6 +143,7 @@ async fn handlers_that_cannot_observe_matches_are_not_given_one() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })));
     let mut tx = None;
     let mut transcript = Vec::new();

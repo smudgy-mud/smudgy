@@ -190,6 +190,7 @@ async fn run_session(session_id: u32, server: &str, client: PackageApiClient) ->
         package_client: Some(client),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

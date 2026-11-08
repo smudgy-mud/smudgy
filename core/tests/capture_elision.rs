@@ -65,6 +65,7 @@ async fn run(lines: &[&str]) -> Vec<String> {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })));
 
     let mut tx = None;

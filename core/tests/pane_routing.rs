@@ -141,6 +141,7 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -707,6 +708,7 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let (bus, mut commands) = smudgy_core::session::ui_command::channel();
@@ -903,6 +905,7 @@ async fn ui_command_bus_orders_foreign_open_before_cross_session_group() {
             package_client: None,
             extra_script_extensions: Arc::new(Vec::new),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         })
     };
 

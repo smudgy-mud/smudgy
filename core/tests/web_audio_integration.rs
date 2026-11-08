@@ -149,6 +149,7 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let (service, probe) = start_test_mixer(48_000, TestDriverConfig::default()).unwrap();
     let application = ApplicationAudioOwner::new(deno_audio::AudioHostLimits::unlimited());
@@ -319,6 +320,7 @@ async fn trusted_smudgy_script_can_render_and_close_web_audio() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let (service, _application, registration) = audio_registration(session_id);
@@ -403,6 +405,7 @@ async fn unavailable_session_keeps_default_and_none_joinable_without_mixer() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let application = ApplicationAudioOwner::new(
         deno_audio::AudioHostLimits::unlimited()
@@ -491,6 +494,7 @@ async fn legacy_spawn_installs_no_web_audio_or_output_fallback() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let mut shutdown = None;
@@ -532,6 +536,7 @@ fn mismatched_audio_scope_is_rejected_before_runtime_publication() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let error = match spawn_with_audio(params, registration.scope()) {
         Ok(_) => panic!("cross-session scope must be rejected before spawn"),
@@ -598,6 +603,7 @@ async fn two_registered_sessions_contend_on_one_application_host() {
             package_client: None,
             extra_script_extensions: Arc::new(Vec::new),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         })
     };
     let (service, _probe) = start_test_mixer(48_000, TestDriverConfig::default())
@@ -778,6 +784,7 @@ async fn reload_reuses_exact_scope_and_global_host_limit_precedes_output() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let (service, _probe) = start_test_mixer(48_000, TestDriverConfig::default())
         .expect("headless process mixer starts");

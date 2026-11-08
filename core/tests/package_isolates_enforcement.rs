@@ -292,6 +292,7 @@ async fn spawn_and_drain(server: &str, factory: PackageProviderFactory) -> Vec<S
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory));

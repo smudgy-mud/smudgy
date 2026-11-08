@@ -258,6 +258,7 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

@@ -3408,15 +3408,16 @@ mod tests {
         // The enclosing pane lays its spans out after leaving both contexts.
         assert!(crate::map::with_active_store(|_| ()).is_none());
         assert!(crate::text_editor::with_active_text_store(|_| ()).is_none());
+        let metrics = smudgy_ui_shared::inline_object::ObjectMetrics::default();
         assert!(
             resolver
-                .resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object)
+                .resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object, &metrics)
                 .is_some()
         );
         assert_eq!(seen.load(Ordering::Relaxed), 0b11);
         // Viewed under no context, it adds none.
         let bare = nested_inline_resolver();
-        bare.resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object);
+        bare.resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object, &metrics);
         assert_eq!(seen.load(Ordering::Relaxed), 0);
     }
 
@@ -4494,8 +4495,8 @@ impl Drop for NativeInlineWidget {
 fn nested_inline_resolver() -> smudgy_ui_shared::inline_object::Resolver {
     let maps = crate::map::with_active_store(Clone::clone);
     let text = crate::text_editor::with_active_text_store(Clone::clone);
-    smudgy_ui_shared::inline_object::resolver(move |object| {
-        let build = || inline_element(object);
+    smudgy_ui_shared::inline_object::resolver(move |object, metrics| {
+        let build = || inline_element(object, metrics);
         let build = || match &text {
             Some(store) => crate::text_editor::with_text_store_context(store, build),
             None => build(),
@@ -4507,14 +4508,22 @@ fn nested_inline_resolver() -> smudgy_ui_shared::inline_object::Resolver {
     })
 }
 
+/// The element an inline object in a terminal row shows: a script's native widget, or a
+/// kitty graphics placement, which sizes itself in the row's cell grid (`metrics`) and
+/// draws through the image store of the enclosing
+/// [`with_image_store_context`](crate::with_image_store_context). `None` for a retired
+/// object or a resource neither of them knows.
 #[must_use]
 pub fn inline_element(
     object: &smudgy_session_model::inline_content::InlineObject,
+    metrics: &smudgy_ui_shared::inline_object::ObjectMetrics,
 ) -> Option<iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>> {
     if !object.owner.active() {
         return None;
     }
-    let resource = object.resource.downcast_ref::<NativeInlineWidget>()?;
+    let Some(resource) = object.resource.downcast_ref::<NativeInlineWidget>() else {
+        return crate::kitty::placement_element(object, *metrics);
+    };
     let guard = resource.factory.lock().ok()?;
     guard
         .as_ref()

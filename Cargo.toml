@@ -193,7 +193,10 @@ unic-langid = "0.9.6"
 #   glyphs fall back to coverage-ranked monospace candidates instead of the
 #   proportional script/common lists.
 # - `vtparse` (patches/vtparse+0.7.0.patch): bounds the std/alloc OSC and APC
-#   string buffers so hostile peers cannot grow them without limit.
+#   string buffers so hostile peers cannot grow them without limit, and reads a
+#   byte that cuts a UTF-8 sequence short (an `ESC` after a lone lead byte) as
+#   the fresh byte it is instead of dropping it with the sequence, so the
+#   escape sequence it begins is not printed as text.
 # - `deno_permissions` (patches/deno_permissions+0.116.0.patch): adds a host-only
 #   any-host network descriptor so package manifests can express `*` (any internet
 #   host/port) and `*:port` (any internet host on one port) consistently without

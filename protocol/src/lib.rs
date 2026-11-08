@@ -6,6 +6,7 @@
 
 pub mod css_color;
 pub mod gmcp;
+pub mod graphics;
 pub mod json;
 pub mod mccp;
 pub mod msdp;

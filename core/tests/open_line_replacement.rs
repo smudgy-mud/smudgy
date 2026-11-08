@@ -31,6 +31,7 @@ async fn carriage_return_transaction_survives_flush_and_intervening_echo() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -182,6 +183,7 @@ createTrigger("^reload-now$", () => session.reload());
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {

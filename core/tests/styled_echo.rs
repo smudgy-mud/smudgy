@@ -124,6 +124,7 @@ async fn styled_echo_spans_reach_the_buffer() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -393,6 +394,7 @@ async fn styled_splice_edits_incoming_lines() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -645,6 +647,7 @@ async fn styled_links_carry_spans_and_callbacks_fire() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

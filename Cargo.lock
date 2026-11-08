@@ -11346,6 +11346,7 @@ dependencies = [
  "serde",
  "smudgy_cloud",
  "smudgy_core",
+ "smudgy_protocol",
  "smudgy_script",
  "smudgy_ui",
  "smudgy_ui_shared",
@@ -11503,12 +11504,15 @@ version = "0.5.9-ptb"
 name = "smudgy_protocol"
 version = "0.5.9-ptb"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "color-art",
  "encoding_rs",
  "flate2",
  "getrandom 0.2.16",
  "log",
  "memchr",
+ "serde",
  "serde_json",
  "smudgy_session_model",
  "url",
@@ -11618,6 +11622,7 @@ dependencies = [
  "smudgy_i18n",
  "smudgy_map_widget",
  "smudgy_palette",
+ "smudgy_protocol",
  "smudgy_script",
  "smudgy_session_model",
  "smudgy_theme",
@@ -11690,6 +11695,7 @@ name = "smudgy_widgets"
 version = "0.5.9-ptb"
 dependencies = [
  "arc-swap",
+ "bytes",
  "deno_core",
  "deno_error",
  "iced",
@@ -11700,6 +11706,7 @@ dependencies = [
  "serde_json",
  "smudgy_cloud",
  "smudgy_map_widget",
+ "smudgy_protocol",
  "smudgy_session_model",
  "smudgy_theme",
  "smudgy_ui_shared",

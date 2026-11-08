@@ -72,6 +72,7 @@ fn new_connection(runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeAction>)
         ui_tx,
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+        Arc::new(AtomicU32::new(0)),
     )
 }
 

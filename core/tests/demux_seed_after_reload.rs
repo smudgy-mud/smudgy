@@ -47,6 +47,7 @@ async fn promise_chain_drains_on_the_rebuilt_isolate() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
 

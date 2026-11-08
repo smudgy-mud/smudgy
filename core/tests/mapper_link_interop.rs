@@ -109,6 +109,7 @@ async fn link_creation_accepts_area_ids_returned_by_mapper() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

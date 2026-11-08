@@ -136,6 +136,7 @@ async fn script_crud_persisted_user_automations() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let other_params = Arc::new(SessionParams {
         session_id: SessionId::from(9402u32),
@@ -146,6 +147,7 @@ async fn script_crud_persisted_user_automations() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

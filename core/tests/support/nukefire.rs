@@ -162,6 +162,7 @@ pub async fn start_session(server: &str, session_id: u32, mapper: &Mapper) -> Se
         )),
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events: Events = Box::pin(spawn(params));

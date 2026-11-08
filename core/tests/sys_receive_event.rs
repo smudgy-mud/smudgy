@@ -61,6 +61,7 @@ async fn sys_receive_fires_post_trigger_sees_original_and_can_gag() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -177,6 +178,7 @@ async fn continuation_resuming_during_a_later_line_acts_on_that_line() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -282,6 +284,7 @@ async fn continuation_resuming_between_lines_throws() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

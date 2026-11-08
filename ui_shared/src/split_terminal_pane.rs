@@ -104,7 +104,7 @@ struct SplitTerminalPane<'a, Message> {
     /// A plain callback is sufficient because this report does not mutate UI
     /// state; it sends the session's NAWS runtime action directly and is wired
     /// only for the main terminal.
-    pub on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
+    pub on_grid_change: Option<Rc<dyn Fn(GridReport)>>,
     /// Per-pane font override (`docs/panes.md`); `None` follows the global
     /// preference. This widget applies it to scrollback; the pane composition
     /// applies the same value to any input line.
@@ -389,14 +389,30 @@ struct State {
     autoscroll_tick: Option<Instant>,
     /// Fractional lines accumulated but not yet scrolled.
     autoscroll_debt: f32,
-    /// The `(cols, rows)` grid last reported through `on_grid_change`, so layout
-    /// re-runs only fire the callback on an actual grid change.
-    reported_grid: Option<(u16, u16)>,
+    /// The grid last reported through `on_grid_change`, so layout re-runs
+    /// only fire the callback on an actual change.
+    reported_grid: Option<GridReport>,
 }
 
-/// The whole character cells that fit in `extent` pixels of `cell`-sized cells,
-/// clamped to `1..=u16::MAX` (NAWS carries 16-bit dimensions, and a zero report
-/// is a protocol hazard).
+/// What `on_grid_change` reports: the main pane's character grid, and the
+/// cell size it was measured with, in fixed point (zero until a font has
+/// been measured). The grid drives NAWS; the cell size lays terminal
+/// graphics placements out and answers the pixel-size terminal queries
+/// graphics-aware servers send (see `VtProcessor::answer_terminal_query`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridReport {
+    pub cols: u16,
+    pub rows: u16,
+    /// The cell advance in logical pixels times
+    /// [`smudgy_protocol::graphics::CELL_FIXED_SCALE`], rounded to the
+    /// nearest unit ([`smudgy_protocol::graphics::cell_fixed`]): the real
+    /// advance (9.6 px at common sizes) rather than its whole pixels, so an
+    /// image of ten cells covers ten columns, not eleven.
+    pub cell_width: u16,
+    /// The row height, likewise.
+    pub cell_height: u16,
+}
+
 fn whole_cells(extent: f32, cell: f32) -> u16 {
     let cells = (extent / cell).floor();
     // `clamp` propagates NaN (and a NaN cast saturates to 0), so a degenerate
@@ -704,9 +720,15 @@ where
             let full = terminal_pane_limits.max();
             let cols = whole_cells(full.width, advance).min(prefs.line_length.unwrap_or(u16::MAX));
             let rows = whole_cells(full.height, line_height);
-            if state.reported_grid != Some((cols, rows)) {
-                state.reported_grid = Some((cols, rows));
-                on_grid_change(cols, rows);
+            let report = GridReport {
+                cols,
+                rows,
+                cell_width: smudgy_protocol::graphics::cell_fixed(advance),
+                cell_height: smudgy_protocol::graphics::cell_fixed(line_height),
+            };
+            if state.reported_grid != Some(report) {
+                state.reported_grid = Some(report);
+                on_grid_change(report);
             }
         }
 
@@ -945,7 +967,7 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     view: TerminalViewHandle,
     on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
-    on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
+    on_grid_change: Option<Rc<dyn Fn(GridReport)>>,
     font_size: Option<f32>,
     scrolled_layout: ScrolledLayout,
     inline_resolver: Option<crate::inline_object::Resolver>,
@@ -1114,7 +1136,7 @@ mod tests {
             (),
             smudgy_theme::Theme,
             Painter,
-        >(move |_| {
+        >(move |_, _| {
             Some(iced::Element::new(WheelCounter(seen.clone())))
         }));
         type Pane<'a> = super::SplitTerminalPane<'a, ()>;

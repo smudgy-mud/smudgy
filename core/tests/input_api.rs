@@ -51,6 +51,7 @@ fn session_params(session_id: u32, server: &str) -> Arc<SessionParams> {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })
 }
 
@@ -445,6 +446,7 @@ async fn run_capability_case(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory_for(vec![pkg])));

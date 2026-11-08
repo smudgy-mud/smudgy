@@ -27,6 +27,8 @@ A MUD client for Windows, macOS, and Linux, written in Rust.
   uses.
 - **A fast terminal.** GPU rendering, 256-color and truecolor, clickable
   links, and themes.
+- **Inline images.** Servers that speak the kitty graphics protocol can show
+  pictures right in the terminal.
 - **Panes and windows.** Split the window, stack panes into tabs, or tear a
   pane out into its own window. smudgy remembers the layout for each server.
 - **Expansive and growing protocol support.** GMCP, MSDP, MCCP2, MCCP4, TLS, MTTS, NAWS, MNES, and UTF-8 with charset negotiation.

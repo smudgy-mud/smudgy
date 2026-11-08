@@ -455,7 +455,11 @@ fn exercise_native_slider(lines: &[Arc<StyledLine>]) -> Vec<smudgy_widgets::Widg
         .find(|line| line.text == "Duration slider")
         .unwrap();
     let object = &line.objects.as_ref().unwrap()[0];
-    let mut slider = smudgy_widgets::inline_element(object).unwrap();
+    let mut slider = smudgy_widgets::inline_element(
+        object,
+        &smudgy_ui_shared::inline_object::ObjectMetrics::default(),
+    )
+    .unwrap();
     let renderer = native_renderer();
     let mut tree = Tree::new(&slider);
     let size = Size::new(200.0, 32.0);

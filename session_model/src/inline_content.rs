@@ -102,14 +102,53 @@ impl InlineDecoration {
     }
 }
 
+/// Where the text beside an inline object taller than its row sits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Baseline {
+    /// The row's text keeps its baseline centred in the row, and the object
+    /// is centred on it: a script widget sits in the middle of its line.
+    #[default]
+    Centered,
+    /// The text sits on the object's last row, where a terminal leaves the
+    /// cursor after an image; the object is anchored at the row's top.
+    LastRow,
+}
+
+/// Which pass draws an inline object relative to the row's text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// Drawn after the text, over it: every script widget, and a terminal
+    /// placement with a zero or positive z-index.
+    #[default]
+    Over,
+    /// Drawn before the text, under it: a terminal placement with a negative
+    /// z-index, which the protocol says text is rendered on top of. Such an
+    /// object never consumes cells (it is an anchor with an empty range), so
+    /// the text it sits under is the text that follows it on the row.
+    Under,
+}
+
 /// A native attachment. The model owns only opaque, thread-safe lifetime data;
 /// the host that created it supplies its renderer implementation.
+///
+/// An *anchor* is an object with an empty range (`range.start == range.end`):
+/// it consumes no cells and is drawn from the cell at its position, over the
+/// rows that follow, with `paint_outset` saying how far its box can reach.
 #[derive(Clone)]
 pub struct InlineObject {
     pub id: u64,
     pub range: Range<usize>,
     pub started: Instant,
     pub paint_outset: u16,
+    /// How text shares the row with the object when the object is taller.
+    pub baseline: Baseline,
+    /// Whether the object is drawn under or over the row's text.
+    pub layer: Layer,
+    /// The stacking order among objects drawn on one line: ascending `z`,
+    /// ties broken by the host in creation order (a terminal placement's
+    /// image id, per the graphics protocol). Zero for everything but a
+    /// terminal placement that asked for one.
+    pub z: i32,
     pub resource: Arc<dyn std::any::Any + Send + Sync>,
     pub owner: InlineOwner,
 }
@@ -140,11 +179,17 @@ impl InlineObject {
             owner,
             started: Instant::now(),
             paint_outset: 0,
+            baseline: Baseline::default(),
+            layer: Layer::default(),
+            z: 0,
         }
     }
     pub fn instantiate(&self, offset: usize) -> Self {
         Self {
             paint_outset: self.paint_outset,
+            baseline: self.baseline,
+            layer: self.layer,
+            z: self.z,
             ..Self::new(
                 self.range.start + offset..self.range.end + offset,
                 self.resource.clone(),
@@ -530,6 +575,54 @@ mod tests {
         assert!(mounted.elapsed(Instant::now()).is_some());
         item.owner.retire();
         assert!(mounted.elapsed(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn an_object_instance_keeps_its_baseline_policy() {
+        let mut object = InlineObject::new(0..3, Arc::new(()), InlineOwner::default());
+        assert_eq!(object.baseline, Baseline::Centered, "script widgets centre");
+        assert_eq!((object.layer, object.z), (Layer::Over, 0), "and draw over");
+        object.baseline = Baseline::LastRow;
+        object.paint_outset = 4;
+        let mounted = object.instantiate(2);
+        assert_eq!(mounted.range, 2..5);
+        assert_eq!(mounted.baseline, Baseline::LastRow);
+        assert_eq!(mounted.paint_outset, 4);
+    }
+
+    #[test]
+    fn an_object_instance_keeps_its_layer_and_z_through_projection_and_joins() {
+        let mut anchor = InlineObject::new(3..3, Arc::new(()), InlineOwner::default());
+        anchor.layer = Layer::Under;
+        anchor.z = -7;
+        anchor.paint_outset = 96;
+        let mounted = anchor.instantiate(5);
+        assert_eq!(mounted.range, 8..8, "an anchor stays empty");
+        assert_eq!((mounted.layer, mounted.z), (Layer::Under, -7));
+        // The line projection and a fragment join carry the fields too.
+        let content = Arc::new(InlineContent {
+            fonts: Arc::default(),
+            runs: Arc::new(vec![SpliceRun {
+                text: "abc".into(),
+                fg: None,
+                bg: None,
+                attributes: Default::default(),
+                link: None,
+            }]),
+            decorations: Arc::default(),
+            objects: Arc::new(vec![anchor]),
+        });
+        let line = Arc::new(content.line(Style::DEFAULT));
+        let projected = &line.objects.as_ref().unwrap()[0];
+        assert_eq!((projected.layer, projected.z), (Layer::Under, -7));
+        let mut fragments = crate::styled_line::LineFragments::default();
+        fragments.push(line.clone());
+        fragments.push(line);
+        let joined = fragments.take_joined().unwrap();
+        let objects = joined.objects.as_ref().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert!(objects.iter().all(|o| o.layer == Layer::Under && o.z == -7));
+        assert_eq!(objects[1].range, 6..6);
     }
 
     #[test]

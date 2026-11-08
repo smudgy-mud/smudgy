@@ -13,9 +13,18 @@
 //!   against a no-op sink — isolates the memchr IAC-scan fast path from the
 //!   IAC-dense worst case (negotiations, GA prompts, subnegotiations,
 //!   escaped `IAC IAC` literals).
-//! - `ingest_pipeline/{ansi_light,ansi_heavy,iac_dense}`: the real
-//!   composition — `feed_inbound` + `notify_end_of_buffer` per 16 KiB chunk,
-//!   runtime channel drained per pass — with throughput in raw wire bytes.
+//! - `ingest_pipeline/{ansi_light,ansi_heavy,iac_dense,ansi_graphics}`: the
+//!   real composition — `feed_inbound` + `notify_end_of_buffer` per 16 KiB
+//!   chunk, runtime channel drained per pass — with throughput in raw wire
+//!   bytes. Graphics are off there, as on a processor without a server
+//!   configuration: `ansi_graphics` prices the APC parse-and-strip path.
+//! - `ingest_pipeline/ansi_graphics_full`: the same shape of image traffic
+//!   (`WireProfile::AnsiGraphicsFull`) on a processor in
+//!   `GraphicsMode::Full` with a fixed cell size and a stub host
+//!   (`smudgy_bench::graphics`) whose decodes complete after each batch,
+//!   as the connection's `select!` delivers them: records, placements on
+//!   lines, quota eviction and `OK` replies (drained, discarded) — the
+//!   graphics state machine's cost on top of the wire path.
 //! - `styled_line/new_with_raw/{short_plain,long_plain,long_styled}`: the
 //!   per-line cost of `StyledLine::new_with_raw` — the text copy, the
 //!   span-vec allocation (`consume_into_pending_line` drains into a fresh
@@ -44,8 +53,9 @@ use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use smudgy_bench::{
+    graphics::{DecodeQueue, enable_full_graphics},
     load_log_lines,
-    wire::{WireProfile, chunk, dress_lines},
+    wire::{GRAPHICS_EVERY, WireProfile, chunk, dress_lines},
 };
 use smudgy_core::session::{
     connection::{
@@ -148,6 +158,13 @@ struct Pipeline {
     rx: UnboundedReceiver<RuntimeAction>,
     protocol: ProtocolState,
     transcode: Transcode,
+    /// The stub graphics host's pending decodes, when the processor runs
+    /// the full graphics protocol ([`Pipeline::with_full_graphics`]).
+    decodes: Option<DecodeQueue>,
+    /// Decodes completed and reply bytes drained, over every pass: the
+    /// full-graphics profile's proof that its state machine ran.
+    decodes_completed: usize,
+    reply_bytes: usize,
 }
 
 impl Pipeline {
@@ -162,7 +179,20 @@ impl Pipeline {
             rx,
             protocol: ProtocolState::with_fixed_dims(DEFAULT_DIMS),
             transcode: Transcode::default(),
+            decodes: None,
+            decodes_completed: 0,
+            reply_bytes: 0,
         }
+    }
+
+    /// A pipeline whose processor runs [`GraphicsMode::Full`] with a fixed
+    /// cell size and the stub host (`smudgy_bench::graphics`).
+    ///
+    /// [`GraphicsMode::Full`]: smudgy_core::models::server::GraphicsMode::Full
+    fn with_full_graphics() -> Self {
+        let mut pipeline = Self::new();
+        pipeline.decodes = Some(enable_full_graphics(&mut pipeline.vt_processor));
+        pipeline
     }
 
     /// One full pass of the corpus through the real read-loop composition:
@@ -182,7 +212,17 @@ impl Pipeline {
                 &mut self.transcode,
             );
             black_box(self.replies.as_slice());
+            self.reply_bytes += self.replies.len();
             self.vt_processor.notify_end_of_buffer();
+            // Between batches, as the connection's `select!` would: decodes
+            // land, and the replies they settled are written (here dropped).
+            if let Some(decodes) = &mut self.decodes {
+                self.decodes_completed += decodes.complete_all(&mut self.vt_processor);
+                self.replies.clear();
+                self.vt_processor.drain_replies(&mut self.replies);
+                black_box(self.replies.as_slice());
+                self.reply_bytes += self.replies.len();
+            }
         }
     }
 
@@ -590,10 +630,18 @@ fn bench_ingest_pipeline(c: &mut Criterion, lines: &[String]) {
         ("ansi_light", WireProfile::AnsiLight),
         ("ansi_heavy", WireProfile::AnsiHeavy),
         ("iac_dense", WireProfile::IacDense),
+        ("ansi_graphics", WireProfile::AnsiGraphics),
+        ("ansi_graphics_full", WireProfile::AnsiGraphicsFull),
     ] {
         let dressed = dress_lines(lines, profile);
         let chunks = chunk(&dressed, CHUNK_LEN);
-        let mut pipeline = Pipeline::new();
+        let make: fn() -> Pipeline = if profile == WireProfile::AnsiGraphicsFull {
+            verify_full_graphics(&chunks, lines.len() / GRAPHICS_EVERY);
+            Pipeline::with_full_graphics
+        } else {
+            Pipeline::new
+        };
+        let mut pipeline = make();
         // Pre-measured pass: settles accepted-option negotiation (refused
         // options in the opening burst still cost a constant few reply bytes
         // per pass), proves lines actually flow, and reports an absolute
@@ -622,7 +670,7 @@ fn bench_ingest_pipeline(c: &mut Criterion, lines: &[String]) {
         // The same pass with raw capture gated off — the shipped default for
         // profiles with no raw-pattern trigger (the connection latches the
         // trigger manager's raw-wanted flag per line).
-        let mut pipeline = Pipeline::new();
+        let mut pipeline = make();
         let raw_off = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         pipeline.vt_processor.set_raw_wanted_flag(raw_off);
         group.bench_function(BenchmarkId::new(name, "no_raw"), |b| {
@@ -633,6 +681,66 @@ fn bench_ingest_pipeline(c: &mut Criterion, lines: &[String]) {
         });
     }
     group.finish();
+}
+
+/// One pass of the full-graphics corpus on a fresh pipeline, proving the
+/// profile exercises what it is for: every upload decoded and answered
+/// `OK`, every upload's line carrying its placement, and — once the corpus
+/// holds more images than the quota — the oldest records evicted.
+fn verify_full_graphics(chunks: &[&[u8]], uploads: usize) {
+    use smudgy_core::session::styled_line::StyledLine;
+    use smudgy_protocol::graphics::Placement;
+
+    let mut pipeline = Pipeline::with_full_graphics();
+    pipeline.feed(chunks);
+    let (complete, partial) = pipeline.drain_lines();
+    let placements: Vec<Arc<Placement>> = complete
+        .iter()
+        .filter_map(|line: &Arc<StyledLine>| line.objects.clone())
+        .flat_map(|objects| {
+            objects
+                .iter()
+                .filter_map(|object| object.resource.clone().downcast::<Placement>().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let evicted = placements
+        .iter()
+        .filter(|placement| placement.image.is_evicted())
+        .count();
+    let ok = format!("{uploads};OK\x1b\\");
+    assert_eq!(
+        pipeline.decodes_completed, uploads,
+        "every upload is decoded"
+    );
+    assert_eq!(
+        placements.len(),
+        uploads,
+        "every upload is placed on its line"
+    );
+    assert!(
+        pipeline.reply_bytes >= uploads * ok.len(),
+        "every upload is answered"
+    );
+    // The default quota holds this many decoded images.
+    let capacity = usize::try_from(
+        smudgy_protocol::graphics::DEFAULT_QUOTA_BYTES
+            / (u64::from(smudgy_bench::wire::GRAPHICS_FULL_DIMENSION).pow(2) * 4),
+    )
+    .expect("a small count");
+    if uploads > capacity {
+        assert!(
+            evicted > 0,
+            "the quota evicts once {uploads} > {capacity} images"
+        );
+    }
+    eprintln!(
+        "  ingest_pipeline/ansi_graphics_full: {uploads} uploads decoded and placed, \
+         {evicted} evicted by the end of the pass, {} reply bytes, {} complete + {} partial lines",
+        pipeline.reply_bytes,
+        complete.len(),
+        partial.len()
+    );
 }
 
 /// Scaling cases for long Ground runs and parser fallbacks. Each size is one application

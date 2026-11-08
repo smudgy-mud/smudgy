@@ -64,6 +64,7 @@ async fn spawn_session(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events: std::pin::Pin<Box<dyn futures::Stream<Item = _>>> = Box::pin(spawn(params));

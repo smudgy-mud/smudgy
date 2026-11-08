@@ -304,6 +304,7 @@ impl Host {
                 vec![packing_measure::init(extension_sink.clone())]
             }),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         });
         let mut events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = Box::pin(spawn(params));
         let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
