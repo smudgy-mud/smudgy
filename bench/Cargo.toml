@@ -32,6 +32,9 @@ smudgy_cloud = { workspace = true }
 # `src/session.rs` — the live-session harness the interop/churn benches
 # drive — builds on `smudgy_core`'s public session API.
 smudgy_core = { path = "../core", features = ["bench-api"] }
+# `src/graphics.rs` implements the protocol's `GraphicsHost` with a stub
+# decoder for the `ansi_graphics_full` ingest profile.
+smudgy_protocol = { workspace = true }
 # `src/session.rs` installs sandboxed bench packages through the same
 # in-memory provider + consent path the core integration tests use.
 smudgy_script = { workspace = true }

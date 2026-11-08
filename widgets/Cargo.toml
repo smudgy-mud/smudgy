@@ -5,10 +5,15 @@ edition = "2024"
 
 [dependencies]
 arc-swap = { workspace = true }
+# Terminal graphics pixels arrive as `Bytes` and become an image handle without a copy.
+# Same major iced and smudgy_protocol use.
+bytes = "1"
 deno_core = { workspace = true }
 deno_error = { workspace = true }
 tokio = { workspace = true }
 smudgy_session_model = { workspace = true }
+# Kitty graphics placements: the inline-object resource the placement widget draws.
+smudgy_protocol = { workspace = true }
 smudgy_ui_shared = { workspace = true }
 smudgy_theme = { workspace = true }
 smudgy_map_widget = { workspace = true }

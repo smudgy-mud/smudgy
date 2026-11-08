@@ -72,6 +72,7 @@ pub fn session_fixture(
             )]
         }),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     (home, root, params)
 }

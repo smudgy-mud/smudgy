@@ -196,6 +196,7 @@ async fn run_case(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -458,6 +459,7 @@ async fn prompt_trigger_echo_keeps_trigger_subjects_and_physical_rows_separate()
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -584,6 +586,7 @@ async fn hidden_middle_partial_defers_later_fragments_without_replaying_committe
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -712,6 +715,7 @@ async fn external_reload_does_not_make_a_committed_prefix_replay_on_completion()
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let mut tx = loop {
@@ -867,6 +871,7 @@ async fn prompt_boundary_exposes_only_visible_fragments_after_a_hidden_gap() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -1019,6 +1024,7 @@ async fn complete_line_insert_does_not_replay_a_committed_prefix() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let tx = loop {
@@ -1139,6 +1145,7 @@ async fn prompt_trigger_reload_recovers_the_in_flight_partial_before_prompt_boun
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let mut tx = loop {

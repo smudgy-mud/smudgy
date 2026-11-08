@@ -220,6 +220,7 @@ async fn start(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events: Events = Box::pin(spawn(params));
     let tx = wait_for_ready(&mut events, lines).await;

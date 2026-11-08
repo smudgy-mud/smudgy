@@ -143,6 +143,7 @@ async fn capture_matches_object_is_numeric_and_named() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -254,6 +255,7 @@ async fn regexp_flags_are_honored() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -370,6 +372,7 @@ async fn pattern_tag_end_to_end() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -545,6 +548,7 @@ async fn command_tag_end_to_end() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -741,6 +745,7 @@ async fn absent_and_empty_capture_groups() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -816,6 +821,7 @@ async fn arctic_style_module_loads_and_runs_in_session() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -962,6 +968,7 @@ async fn timers_hotkeys_and_mapper_location() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1122,6 +1129,7 @@ async fn script_automation_names_match_ui_rules() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));
@@ -1287,6 +1295,7 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
             package_client: None,
             extra_script_extensions: Arc::new(Vec::new),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         })
     };
 
@@ -1343,6 +1352,7 @@ async fn same_server_sessions_share_directed_events_lifecycle_and_broadcast_chan
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })));
     let gamma_tx = loop {
         let event = tokio::time::timeout(Duration::from_mins(1), gamma_events.next())

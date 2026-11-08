@@ -4,12 +4,20 @@ use std::sync::Arc;
 
 use vtparse::{CsiParam, VTActor, VTParser};
 
+use crate::graphics::placeholder::{
+    PLACEHOLDER, PLACEHOLDER_UTF8, PlaceholderCell, RunBuilder, diacritic_number, is_combining_mark,
+};
+use crate::graphics::{self, GraphicsMode};
+use crate::responders::unpack_dims;
+use crate::sgr::{ExtendedColor, SgrExtras};
 use crate::{json::deep_merge, link_url_host, sgr};
 use smudgy_session_model::{
     InvisiblePolicy, LineFragments, LinkAction, LinkColor, LinkDecoration, LinkMenu, LinkMenuItem,
     LinkMenuTitle, LinkProtocol, LinkSelection, LinkSpan, LinkStyle, LinkTextStyle, LinkTooltip,
     LinkTooltipText, LinkVisibility, LinkVisibilityAction, LinkVisibilityExpire, Style, StyledLine,
-    VtSpan, deceptive_invisible, push_escaped_char,
+    VtSpan, deceptive_invisible,
+    inline_content::{Baseline, InlineObject, InlineOwner, Layer, MAX_INLINE_OBJECTS},
+    push_escaped_char,
 };
 
 pub use sgr::{AnsiColor, Color};
@@ -20,6 +28,22 @@ const MAX_OSC8_URI_LEN: usize = 4096;
 /// The most named OSC 8 presets retained for one connection. Existing names
 /// remain replaceable at the cap so a server can still restyle its presets.
 const MAX_OSC8_PRESETS: usize = 1024;
+
+/// The most Unicode placeholder cells noted on one pending line; the rest
+/// stay text. A line can hold at most [`MAX_INLINE_OBJECTS`] runs anyway,
+/// and this bounds what a line of nothing but placeholders costs.
+const MAX_PLACEHOLDER_CELLS: usize = 4096;
+
+/// A `U+10EEEE` printed into the pending line, with the ids its colours
+/// carried at the time: the graphics image id's low 24 bits from the
+/// foreground and the placement id from the underline colour.
+#[derive(Clone, Copy, Debug)]
+struct PlaceholderStamp {
+    /// The byte position of the placeholder in `buf`.
+    pos: usize,
+    image_low: u32,
+    placement_id: u32,
+}
 
 fn push_display_char(out: &mut String, c: char, prose: bool) {
     push_escaped_char(
@@ -768,21 +792,83 @@ pub trait VtSink: std::fmt::Debug {
     fn emit(&mut self, event: VtEvent);
 }
 
+/// The raw capture's state. One byte, so the per-byte raw push tests one
+/// value for its common path (capture on, nothing pending).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawCapture {
+    /// Nothing of the wire bytes is kept; `buf_raw` stays empty.
+    Off,
+    /// Every byte joins `buf_raw`.
+    On,
+    /// On, and a graphics APC was just cut out of `buf_raw`, leaving the
+    /// `ESC` that ended it as the buffer's last byte; the next raw byte
+    /// decides whether it goes too (a `\` completing `ESC \`, or anything
+    /// superseding it) or begins the next sequence (see
+    /// [`VtProcessor::settle_kept_esc`]). That byte is always on the
+    /// per-byte path, since the `ESC` leaves the parser in its escape state,
+    /// and it always arrives with capture on: a fall clears this with the
+    /// buffer ([`VtProcessor::drop_raw`]), so the state is never stale.
+    KeptEsc,
+}
+
+impl RawCapture {
+    /// Whether wire bytes are being captured at all.
+    fn is_on(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Capture rising, or staying on: a kept-back `ESC` keeps its verdict
+    /// pending.
+    fn on(self) -> Self {
+        if self == Self::Off { Self::On } else { self }
+    }
+}
+
+/// Laid out by hand (`repr(C)`): the fields the per-byte, per-run and
+/// per-line paths touch come first, in the struct's first cache lines,
+/// whatever graphics and link state the connection accumulates after them.
 #[allow(clippy::struct_excessive_bools)] // Independent terminal capture and protocol flags.
 #[derive(Debug)]
+#[repr(C)]
 pub struct VtProcessor<S: VtSink> {
+    // --- Read for every byte, run or line. ---
+    /// Whether wire bytes are captured into `buf_raw` (and whether a
+    /// kept-back `ESC` awaits a verdict, see [`RawCapture`]). This is the
+    /// `raw_wanted` value latched for the lines being accumulated: it FALLS
+    /// at line boundaries but RISES only at read-batch boundaries, so an
+    /// emitted line's raw form is always complete-or-absent — never a torn
+    /// suffix — even though the flag flips concurrently with an in-flight
+    /// parse run (see [`Self::refresh_capture_raw`]).
+    capture: RawCapture,
+    /// Whether `buf_raw` may hold bytes that are not valid UTF-8. Runs from the Ground-state
+    /// bulk path arrive validated (or transcoder-decoded), so only the per-byte path can
+    /// introduce doubt, and only with a high byte: an invalid sequence, or a valid one the
+    /// state machine consumed itself (an OSC payload, an encoded C1). While this is false the
+    /// committed line's raw text is taken from the buffer without a validation pass.
+    raw_unverified: bool,
+    /// Whether the graphics state holds a virtual placement, cached after
+    /// every graphics command and mode change: only then can a `U+10EEEE`
+    /// mean anything, and only then does the print path note one.
+    placeholders_armed: bool,
+    /// Whether the pending line holds graphics: placeholder cells stamped
+    /// into it (`placeholder_cells`) or objects attached to it
+    /// (`pending_objects`). The one flag the per-line path tests; the
+    /// vectors it summarises are read only while it is set.
+    line_has_graphics: bool,
+    /// Whether the current read batch produced any non-empty terminal text.
+    /// Telnet-only traffic and empty line terminators do not qualify.
+    packet_has_displayable_text: bool,
+    /// How this connection treats kitty graphics commands and the terminal
+    /// queries clients send to detect them (DA1, pixel-size reports). `Off`
+    /// for processors built without a server configuration (tests, benches,
+    /// the web engine), so nothing is ever written back unasked.
+    graphics_mode: GraphicsMode,
+    link_preset_overflow_logged: bool,
+    /// The SGR state the cursor style does not carry: the underline colour
+    /// and whether the foreground was last set by palette index, which a
+    /// Unicode placeholder cell encodes its graphics ids in.
+    sgr_extras: SgrExtras,
     cursor_style: Style,
-    buf: String,
-    buf_raw: Vec<u8>,
-    span_info: Vec<VtSpan>,
-    /// Completed link ranges of the pending line (closed OSC 8 links).
-    link_info: Vec<LinkSpan>,
-    /// The active OSC 8 link, applied to every character until `ESC]8;;`.
-    /// Like the cursor style, it survives line commits (a multi-line link)
-    /// and carriage-return overprints.
-    cursor_link: Option<ParsedLink>,
-    /// Where in `buf` the active link's current range began.
-    link_open_pos: usize,
     /// A bare `\r` arrived: the next printable character overwrites the open
     /// line (carriage-return overprint — progress bars, spinners) instead of
     /// appending to it. Holds `buf_raw`'s length at the `\r`, so the restart
@@ -792,19 +878,36 @@ pub struct VtProcessor<S: VtSink> {
     /// clears it, so CRLF stays an ordinary commit. Persists across reads
     /// like the rest of the parse state.
     pending_cr: Option<usize>,
+    buf: String,
+    buf_raw: Vec<u8>,
+    span_info: Vec<VtSpan>,
+    sink: S,
+    // --- Read once per line, or more rarely. ---
+    /// The active OSC 8 link, applied to every character until `ESC]8;;`.
+    /// Like the cursor style, it survives line commits (a multi-line link)
+    /// and carriage-return overprints.
+    cursor_link: Option<ParsedLink>,
+    /// Where in `buf` the active link's current range began.
+    link_open_pos: usize,
+    /// Completed link ranges of the pending line (closed OSC 8 links).
+    link_info: Vec<LinkSpan>,
+    /// How many lines this processor has committed: the sequence number of
+    /// the pending line, stamped on the placements made on it, and the
+    /// bottom of the screen positional graphics deletes are read against.
+    line_seq: u64,
+    /// Characters of the open logical line already flushed as partials
+    /// (`buf` holds only the fragment since): the cursor's column is this
+    /// many past the buffer.
+    flushed_columns: usize,
     /// A line prefix emitted only because a socket read batch ended. This is
     /// deliberately separate from `buf`: the UI gets prompt-like immediacy,
     /// while a later newline still presents the assembled logical line to
     /// normal triggers.
     open_logical_line: LineFragments,
-    sink: S,
     /// Identifies the connection that owns this processor. Packet-completion
     /// markers carry it back to the runtime so a replaced socket cannot
     /// release the next connection's deferred profile send.
     connection_generation: u64,
-    /// Whether the current read batch produced any non-empty terminal text.
-    /// Telnet-only traffic and empty line terminators do not qualify.
-    packet_has_displayable_text: bool,
     /// Whether the runtime still wants packet-completion markers — set while
     /// a deferred profile send awaits this connection's first displayable
     /// packet, cleared when it releases (or the connection ends). Owned by
@@ -818,25 +921,64 @@ pub struct VtProcessor<S: VtSink> {
     /// and read here from the socket runtime; `None` (tests, benches) means
     /// always capture.
     raw_wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The `raw_wanted` value latched for the lines being accumulated: it FALLS
-    /// at line boundaries but RISES only at read-batch boundaries, so an emitted
-    /// line's raw form is always complete-or-absent — never a torn suffix — even
-    /// though the flag flips concurrently with an in-flight parse run (see
-    /// [`Self::refresh_capture_raw`]).
-    capture_raw: bool,
-    /// Whether `buf_raw` may hold bytes that are not valid UTF-8. Runs from the Ground-state
-    /// bulk path arrive validated (or transcoder-decoded), so only the per-byte path can
-    /// introduce doubt, and only with a high byte: an invalid sequence, or a valid one the
-    /// state machine consumed itself (an OSC payload, an encoded C1). While this is false the
-    /// committed line's raw text is taken from the buffer without a validation pass.
-    raw_unverified: bool,
+    /// Objects the processor itself attached to the pending line — a
+    /// graphics placement lands at the cursor as an inline object over
+    /// placeholder columns. They leave with the text they sit in, so every
+    /// partial, fragment and join carries them with the identity minted here.
+    pending_objects: Vec<InlineObject>,
+    /// The placeholder cells printed into the pending line, in order,
+    /// stamped with their ids as they were printed; turned into runs when
+    /// the line is built, cleared with an overprint.
+    placeholder_cells: Vec<PlaceholderStamp>,
+    /// Where in `buf_raw` the APC string now open began (its `ESC _`), from
+    /// the parser's [`VTActor::apc_start`] until the string ends. A batch
+    /// ending inside the string holds the bytes from here back for the next
+    /// fragment, since a graphics string is cut out of the capture only
+    /// when it ends; `0` once the string has straddled a boundary (or began
+    /// before capture rose). `None` outside an APC.
+    apc_raw_start: Option<usize>,
+    // --- Graphics and link configuration. ---
+    /// What this processor owes the server — query answers and the graphics
+    /// protocol's replies — in command order, with slots parked for replies
+    /// still waiting on a decode. The telnet bridge drains the ready head
+    /// into its reply buffer after every feed, so answers reach the wire in
+    /// stream order with the negotiation answers.
+    replies: graphics::ReplyQueue,
+    /// Decodes pixels and reads local media for graphics commands. `None`
+    /// (tests, benches, the web engine, a host without graphics) parses
+    /// graphics commands and drops them.
+    graphics_host: Option<Box<dyn graphics::GraphicsHost>>,
+    /// The main pane's character grid, packed with [`crate::responders::pack_dims`]
+    /// and shared with the runtime, which updates it from UI reports. `None`
+    /// (tests) reports the default grid.
+    window_size: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// The main pane's cell size, packed the same way, in fixed point
+    /// ([`graphics::CELL_FIXED_SCALE`] units to the logical pixel). Zero
+    /// until the UI has measured a font, which the size reports pass on as
+    /// zero, exactly as terminals without pixel information do.
+    cell_size: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// The image table and the graphics command state machine, created by
+    /// the first graphics command a displaying, hosted connection sees. A
+    /// session that never receives one never allocates it.
+    graphics: Option<Box<graphics::GraphicsState>>,
     /// Mudlet-compatible OSC 8 presets live for exactly one connection/
     /// processor lifetime and are never shared across sessions.
     link_presets: HashMap<String, serde_json::Value>,
-    link_preset_overflow_logged: bool,
+    /// Test instrumentation: raw bytes moved to keep held-back bytes at the
+    /// head of the buffer across flushes. A boundary that flushes nothing
+    /// moves nothing, which is what keeps an APC open across many read
+    /// batches linear; the test pins that by this count, not by timing.
+    #[cfg(test)]
+    raw_bytes_moved: usize,
 }
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
+
+/// Our DA1 answer: a VT220-class terminal with no extensions claimed. The
+/// graphics protocol's detection recipe sends its query and then DA1, and
+/// treats a DA1 answer with no graphics answer as "unsupported", so this
+/// must arrive whenever the protocol is on, and never when it is off.
+const DA1_REPLY: &[u8] = b"\x1b[?62;c";
 
 impl<S: VtSink> VtProcessor<S> {
     /// Access host-owned event storage after a parse run.
@@ -866,10 +1008,520 @@ impl<S: VtSink> VtProcessor<S> {
             packet_has_displayable_text: false,
             marker_armed: None,
             raw_wanted: None,
-            capture_raw: true,
+            capture: RawCapture::On,
             raw_unverified: false,
             link_presets: HashMap::new(),
             link_preset_overflow_logged: false,
+            graphics_mode: GraphicsMode::Off,
+            replies: graphics::ReplyQueue::default(),
+            graphics_host: None,
+            window_size: None,
+            cell_size: None,
+            apc_raw_start: None,
+            #[cfg(test)]
+            raw_bytes_moved: 0,
+            pending_objects: Vec::new(),
+            graphics: None,
+            sgr_extras: SgrExtras::default(),
+            placeholders_armed: false,
+            line_has_graphics: false,
+            placeholder_cells: Vec::new(),
+            line_seq: 0,
+            flushed_columns: 0,
+        }
+    }
+
+    /// Set how graphics commands and terminal queries are treated. The
+    /// connection seeds this from the server configuration at connect time.
+    /// Changed on a live processor: a mode that does not reply silences
+    /// every answer still owed (bytes not yet written are dropped, and a
+    /// reply parked for a decode resolves to nothing when it lands, so what
+    /// queues behind it afterwards still flows), and a mode that does not
+    /// display abandons any upload in flight, whose later chunks will be
+    /// dropped unseen. The image table stays: placements already made keep
+    /// drawing, a decode still in flight lands in its record, and a switch
+    /// back finds every image where it was.
+    pub fn set_graphics_mode(&mut self, mode: GraphicsMode) {
+        if !mode.replies() {
+            self.replies.silence();
+        }
+        if !mode.displays()
+            && let Some(state) = self.graphics.as_deref_mut()
+        {
+            state.abandon_upload();
+        }
+        self.graphics_mode = mode;
+        self.refresh_placeholders_armed();
+    }
+
+    /// Re-read whether Unicode placeholders can mean anything: a virtual
+    /// placement exists and this connection displays graphics.
+    fn refresh_placeholders_armed(&mut self) {
+        self.placeholders_armed = self.graphics_mode.displays()
+            && self
+                .graphics
+                .as_deref()
+                .is_some_and(graphics::GraphicsState::has_virtual_placements);
+    }
+
+    /// The cursor's cell on the pending line, from zero: the characters
+    /// printed so far (one cell each; wide characters are not reckoned),
+    /// the fragments already flushed included.
+    fn cursor_column(&self) -> u16 {
+        u16::try_from(self.flushed_columns + self.buf.chars().count()).unwrap_or(u16::MAX)
+    }
+
+    #[must_use]
+    pub fn graphics_mode(&self) -> GraphicsMode {
+        self.graphics_mode
+    }
+
+    /// Share the runtime's grid and cell-size cells so size reports answer
+    /// with what the UI last measured.
+    pub fn set_terminal_geometry(
+        &mut self,
+        window_size: Arc<std::sync::atomic::AtomicU32>,
+        cell_size: Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.window_size = Some(window_size);
+        self.cell_size = Some(cell_size);
+    }
+
+    /// Give this processor its graphics host. Transmits are decoded through
+    /// it; without one every graphics command is parsed (for the raw
+    /// capture) and dropped.
+    pub fn set_graphics_host(&mut self, host: Box<dyn graphics::GraphicsHost>) {
+        self.graphics_host = Some(host);
+    }
+
+    /// Run `run` against the graphics state (created on first use) when this
+    /// connection displays graphics and has a host to decode them; `None`,
+    /// running nothing, otherwise — the web engine, tests and benches parse
+    /// graphics APCs only to keep them out of the raw capture. The command
+    /// acts at the cursor, whose column is counted here (the pending line's
+    /// characters) once per command.
+    fn with_graphics<R>(
+        &mut self,
+        run: impl FnOnce(&mut graphics::GraphicsState, &mut graphics::GraphicsEnv<'_>) -> R,
+    ) -> Option<R> {
+        if !self.graphics_mode.displays() {
+            return None;
+        }
+        let column = self.cursor_column();
+        self.with_graphics_at(column, run)
+    }
+
+    /// [`Self::with_graphics`] for a command that acts at line column
+    /// `column` rather than the cursor: a placeholder run, which acts at its
+    /// own cells, so the cursor column is not counted for each.
+    fn with_graphics_at<R>(
+        &mut self,
+        column: u16,
+        run: impl FnOnce(&mut graphics::GraphicsState, &mut graphics::GraphicsEnv<'_>) -> R,
+    ) -> Option<R> {
+        if !self.graphics_mode.displays() {
+            return None;
+        }
+        let cell = self.cell_fixed();
+        let replies_enabled = self.graphics_mode.replies();
+        let grid = self.grid();
+        let Some(host) = self.graphics_host.as_deref_mut() else {
+            log::debug!("graphics command parsed; no host to show it");
+            return None;
+        };
+        // A pending overprint restarts the line before anything attaches
+        // (`attach_inline_object`), taking the superseded frame's objects
+        // with it, so the line a placement would join is empty.
+        let objects_free = if self.pending_cr.is_some() {
+            MAX_INLINE_OBJECTS
+        } else {
+            MAX_INLINE_OBJECTS.saturating_sub(self.pending_objects.len())
+        };
+        let mut env = graphics::GraphicsEnv {
+            host,
+            replies: &mut self.replies,
+            cell,
+            replies_enabled,
+            objects_free,
+            line_seq: self.line_seq,
+            column,
+            grid,
+        };
+        let state = self.graphics.get_or_insert_with(Box::default);
+        Some(run(state, &mut env))
+    }
+
+    /// Run one whole graphics command and attach the placement it creates,
+    /// if any, at the cursor: placeholder columns in the pending line, with
+    /// text beside the image's last row — or, for an anchor (`C=1`, a
+    /// negative z-index), an empty range at the cursor with the box as its
+    /// outset, drawn under the text when the z-index is negative. Kept out
+    /// of line and in the cold section: it is rare and large, and the
+    /// callbacks around it are hot.
+    #[cold]
+    #[inline(never)]
+    fn graphics_command(&mut self, control: graphics::ControlData, payload: &[u8]) {
+        let outcome = self.with_graphics(|state, env| {
+            let placement = state.command(env, control, payload);
+            (placement, state.take_dirty())
+        });
+        self.refresh_placeholders_armed();
+        let Some((placement, dirty)) = outcome else {
+            return;
+        };
+        // An animation control or a frame delete changes what is drawn
+        // with no decode to announce it.
+        if dirty {
+            self.sink.emit(VtEvent::RequestRepaint);
+        }
+        let Some(placement) = placement else {
+            return;
+        };
+        let geometry = placement.geometry;
+        let mut object = InlineObject::new(0..0, placement.clone(), InlineOwner::default());
+        object.z = geometry.z;
+        let columns = if placement.anchored {
+            object.baseline = Baseline::Centered;
+            object.paint_outset = graphics::anchor_outset(&geometry, self.cell_fixed());
+            object.layer = if geometry.z < 0 {
+                Layer::Under
+            } else {
+                Layer::Over
+            };
+            0
+        } else {
+            object.baseline = Baseline::LastRow;
+            usize::from(geometry.columns)
+        };
+        // The state refused the placement already when the line was full
+        // (`GraphicsEnv::objects_free`), so this attach cannot fail.
+        if self.attach_object(columns, object).is_none() {
+            log::debug!("graphics placement not shown: its line filled under it");
+        }
+    }
+
+    /// Note a `U+10EEEE` about to be printed at byte `pos` of the pending
+    /// line, with the ids its colours carry now: the image id's low 24 bits
+    /// from the foreground (a palette index as itself, a direct colour as
+    /// its 24 bits, a named colour as its index), the placement id from the
+    /// underline colour likewise. Off the hot path: only a placeholder
+    /// while a virtual placement exists gets here.
+    #[cold]
+    #[inline(never)]
+    fn stamp_placeholder(&mut self, pos: usize) {
+        if self.placeholder_cells.len() >= MAX_PLACEHOLDER_CELLS {
+            return;
+        }
+        let rgb = |r: u8, g: u8, b: u8| (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        let image_low = match self.sgr_extras.fg_index {
+            Some(index) => u32::from(index),
+            None => match self.cursor_style.fg {
+                Color::Rgb { r, g, b } => rgb(r, g, b),
+                Color::Ansi { color, bold } => u32::from(sgr::ansi_index(color, bold)),
+                _ => 0,
+            },
+        };
+        let placement_id = match self.sgr_extras.underline_color {
+            Some(ExtendedColor::Indexed(index)) => u32::from(index),
+            Some(ExtendedColor::Rgb { r, g, b }) => rgb(r, g, b),
+            None => 0,
+        };
+        self.placeholder_cells.push(PlaceholderStamp {
+            pos,
+            image_low,
+            placement_id,
+        });
+        self.line_has_graphics = true;
+    }
+
+    /// Note every placeholder in a run about to join the pending line at its
+    /// end. Called only for a run with non-ASCII bytes while placeholders
+    /// are armed; a placeholder's lead byte is rare enough in other text
+    /// that the scan is a `memchr` and a four-byte compare per hit.
+    fn stamp_placeholders_in(&mut self, run: &str) {
+        let base = self.buf.len();
+        let bytes = run.as_bytes();
+        for at in memchr::memchr_iter(PLACEHOLDER_UTF8[0], bytes) {
+            if bytes.get(at..at + PLACEHOLDER_UTF8.len()) == Some(&PLACEHOLDER_UTF8[..]) {
+                self.stamp_placeholder(base + at);
+            }
+        }
+    }
+
+    /// Turn the placeholder cells of the pending line into runs and attach
+    /// a placement over each one that names a virtual placement this
+    /// connection holds (see [`graphics::placeholder`]). Runs that name
+    /// nothing, or that the line has no room for, stay text. Called once
+    /// per line that printed a placeholder while armed, before the line is
+    /// built, so a partial flush splits a run at the batch boundary (each
+    /// part is a run of its own, showing its own cells).
+    #[cold]
+    #[inline(never)]
+    fn attach_placeholder_runs(&mut self) {
+        let stamps = std::mem::take(&mut self.placeholder_cells);
+        if !self.placeholders_armed {
+            return;
+        }
+        let mut builder = RunBuilder::default();
+        let mut runs = Vec::new();
+        let (mut cursor, mut column) = (0, self.flushed_columns);
+        for stamp in &stamps {
+            // A stamp names where a placeholder was printed; anything that
+            // rewrote the line since (an escaped invisible inside a link)
+            // leaves it naming other text, which is skipped.
+            if stamp.pos < cursor
+                || !self.buf.is_char_boundary(stamp.pos)
+                || !self.buf[stamp.pos..].starts_with(PLACEHOLDER)
+            {
+                continue;
+            }
+            column += self.buf[cursor..stamp.pos].chars().count();
+            let cell = self.placeholder_cell(stamp, column);
+            cursor = cell.range.end;
+            column += 1;
+            runs.extend(builder.push(cell));
+        }
+        runs.extend(builder.finish());
+        let mut attached = false;
+        for run in &runs {
+            // The run acts at its own first cell; `placeholder_run` never
+            // reads the column, so the cursor's is not counted for each run.
+            let at = u16::try_from(run.first_cell_column).unwrap_or(u16::MAX);
+            let placed = self.with_graphics_at(at, |state, env| state.placeholder_run(run, env));
+            if let Some(Some((placement, range))) = placed {
+                let mut object = InlineObject::new(range, placement, InlineOwner::default());
+                object.baseline = Baseline::Centered;
+                attached |= self.attach_over(object).is_some();
+            }
+        }
+        if attached {
+            // Objects are kept in line order; a run can start before an
+            // object attached at the cursor earlier.
+            self.pending_objects
+                .sort_by_key(|object| object.range.start);
+        }
+    }
+
+    /// Read the placeholder cell at a stamp: the placeholder and the
+    /// combining marks after it, which kitty keeps in the cell with it and
+    /// reads as the row, the column and the id's high byte (the first
+    /// three; a mark outside the diacritic table means "unknown", like a
+    /// missing one, but is the cell's all the same, so the next placeholder
+    /// stays adjacent). Whose bytes the cell covers.
+    fn placeholder_cell(&self, stamp: &PlaceholderStamp, column: usize) -> PlaceholderCell {
+        let start = stamp.pos;
+        let mut end = start + PLACEHOLDER.len_utf8();
+        let mut values = [None; 3];
+        for (index, c) in self.buf[end..].chars().enumerate() {
+            if !is_combining_mark(c) {
+                break;
+            }
+            if let Some(slot) = values.get_mut(index) {
+                *slot = diacritic_number(c);
+            }
+            end += c.len_utf8();
+        }
+        PlaceholderCell {
+            range: start..end,
+            column,
+            image_low: stamp.image_low,
+            placement_id: stamp.placement_id,
+            row: values[0],
+            col: values[1],
+            msb: values[2],
+        }
+    }
+
+    /// A decode the host was asked for has finished: the pixels land in
+    /// their record, its reply settles into its parked slot, whatever now
+    /// heads the queue can be written, and the image's next frame commands
+    /// (those that waited on the decode) run — through the host when one
+    /// needs a decode. One repaint announces all of it. Called on the
+    /// thread that drives this processor, between feeds — never inside
+    /// one.
+    pub fn graphics_decode_complete(
+        &mut self,
+        ticket: graphics::DecodeTicket,
+        result: graphics::DecodeResult,
+    ) {
+        match (
+            self.graphics.as_deref_mut(),
+            self.graphics_host.as_deref_mut(),
+        ) {
+            (Some(state), Some(host)) => {
+                state.decode_complete(host, &mut self.replies, ticket, result);
+                // A control or frame delete that ran behind the decode is
+                // announced by the repaint below, not left for the next
+                // command to announce again.
+                state.take_dirty();
+            }
+            _ => {
+                if !self.replies.resolve(ticket, result.map(drop)) {
+                    log::debug!("graphics decode {ticket:?} finished for a reply no longer parked");
+                }
+            }
+        }
+        self.sink.emit(VtEvent::RequestRepaint);
+    }
+
+    /// Move every reply that can be written now into `into`, in the order
+    /// they were owed; a reply still waiting on a decode holds back those
+    /// behind it.
+    pub fn drain_replies(&mut self, into: &mut Vec<u8>) {
+        self.replies.drain_into(into);
+    }
+
+    /// Whether a reply can be written now: one check of the queue's head,
+    /// inlined into the telnet bridge's per-data-run call.
+    #[inline]
+    #[must_use]
+    pub fn has_replies(&self) -> bool {
+        self.replies.has_ready()
+    }
+
+    fn grid(&self) -> (u16, u16) {
+        let (cols, rows) = self
+            .window_size
+            .as_ref()
+            .map_or(crate::responders::DEFAULT_DIMS, |cell| {
+                unpack_dims(cell.load(std::sync::atomic::Ordering::Relaxed))
+            });
+        (cols.max(1), rows.max(1))
+    }
+
+    /// The cell size as the UI last reported it, in fixed point
+    /// ([`graphics::CELL_FIXED_SCALE`] units to the logical pixel); zero
+    /// until it has.
+    fn cell_fixed(&self) -> (u16, u16) {
+        self.cell_size.as_ref().map_or((0, 0), |cell| {
+            unpack_dims(cell.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    }
+
+    /// Answer the terminal queries the graphics protocol's clients rely on:
+    /// DA1 (`CSI c`, `CSI 0 c`) and the XTWINOPS size reports `CSI 14 t`
+    /// (text area in pixels), `CSI 16 t` (one cell in pixels) and `CSI 18 t`
+    /// (text area in cells). Private-marker forms (`CSI > c`, `CSI ? c`) are
+    /// other queries and stay unanswered. Everything is in logical pixels, the
+    /// unit placements are sized in, so a client's arithmetic comes out right.
+    ///
+    /// The cell is the pane's advance (carried in fixed point, and used as
+    /// such to lay placements out) truncated to whole pixels — or, before
+    /// the pane has measured a font, the fallback cell placements are laid
+    /// out with meanwhile, so what a client is told always matches what is
+    /// drawn — and the text area is the grid times that cell rather than the
+    /// pane's true pixel width: the three reports then agree exactly (`14 t`
+    /// = `16 t` × `18 t`), so a client that derives the cell size from the
+    /// ratio lays out the same as one that asks for it, and neither is ever
+    /// told a text area wider than the real one (which is under a pixel per
+    /// cell wider), so an image sized to fill it cannot overflow the grid.
+    ///
+    /// Out of line: queries are a handful per session, and the SGR arm
+    /// beside this one runs for every escape in the stream.
+    #[cold]
+    #[inline(never)]
+    fn answer_terminal_query(&mut self, params: &[CsiParam], byte: u8) {
+        match byte {
+            b'c' => {
+                if params
+                    .iter()
+                    .all(|param| matches!(param, CsiParam::Integer(0)))
+                {
+                    self.replies.push(DA1_REPLY);
+                }
+            }
+            b't' => {
+                let Some(CsiParam::Integer(op)) = params.first() else {
+                    return;
+                };
+                let (cols, rows) = self.grid();
+                let (cell_w, cell_h) = graphics::cell_or_fallback(self.cell_fixed());
+                let (cell_w, cell_h) = (
+                    graphics::cell_whole_pixels(cell_w),
+                    graphics::cell_whole_pixels(cell_h),
+                );
+                let report = match op {
+                    14 => format!(
+                        "\x1b[4;{};{}t",
+                        u32::from(rows) * u32::from(cell_h),
+                        u32::from(cols) * u32::from(cell_w)
+                    ),
+                    16 => format!("\x1b[6;{cell_h};{cell_w}t"),
+                    18 => format!("\x1b[8;{rows};{cols}t"),
+                    _ => return,
+                };
+                self.replies.push(report.as_bytes());
+            }
+            _ => {}
+        }
+    }
+
+    /// Cut the graphics APC that just ended out of the raw capture: raw
+    /// triggers match on escape codes, never on base64 image data, and a
+    /// chunked image would otherwise swell one raw line by its whole size.
+    /// `start` is where the string began in `buf_raw` (see
+    /// [`Self::apc_raw_start`]); the string's own `ESC _ G` is searched for
+    /// only if the parser never said. The connection pushes each raw byte
+    /// before the parser sees it, so at dispatch the buffer ends with the
+    /// byte that ended the string; everything from the start goes, and a
+    /// terminator that begins the next sequence stays (see
+    /// [`strip_graphics_apc`]).
+    fn strip_graphics_apc_from_raw(&mut self, start: Option<usize>) {
+        if self.capture.is_on() {
+            let mut kept_esc = self.capture == RawCapture::KeptEsc;
+            strip_graphics_apc(
+                &mut self.buf_raw,
+                &mut self.pending_cr,
+                &mut kept_esc,
+                start,
+            );
+            if kept_esc {
+                self.capture = RawCapture::KeptEsc;
+            }
+        }
+    }
+
+    /// Where the raw bytes that must not flush with the pending line begin
+    /// (see [`held_raw_start`]); `buf_raw.len()` when nothing is held, and
+    /// always while capture is off, when the buffer is empty.
+    fn held_raw_start(&self) -> usize {
+        held_raw_start(&self.buf_raw, self.apc_raw_start)
+    }
+
+    /// Drop the pending line's raw bytes before `raw_end`, now flushed, and
+    /// keep the rest — the bytes held back for the next fragment — at the
+    /// head of the buffer, where an open APC's start now is. The held bytes
+    /// move only here, and a boundary that flushes nothing never gets here:
+    /// an APC that stays open across many read batches moves its bytes
+    /// once, not once per batch, however long it grows.
+    fn flush_raw(&mut self, raw_end: usize) {
+        if raw_end >= self.buf_raw.len() {
+            self.clear_raw();
+        } else if raw_end > 0 {
+            self.buf_raw.drain(..raw_end);
+            // Doubt may have left with the flushed bytes.
+            if self.raw_unverified {
+                self.raw_unverified = self.buf_raw.iter().any(|&b| b >= 0x80);
+            }
+            #[cfg(test)]
+            {
+                self.raw_bytes_moved += self.buf_raw.len();
+            }
+        }
+        if self.apc_raw_start.is_some() {
+            self.apc_raw_start = Some(0);
+        }
+    }
+
+    /// Capture has fallen: nothing of the wire bytes is kept from here on,
+    /// the bytes held back for the next fragment included. While capture is
+    /// off the buffer stays empty and no kept-back `ESC` awaits a verdict,
+    /// so the next rise starts clean; an APC still open then is cut out
+    /// from the rise on.
+    fn drop_raw(&mut self) {
+        self.clear_raw();
+        if self.apc_raw_start.is_some() {
+            self.apc_raw_start = Some(0);
         }
     }
 
@@ -894,7 +1546,11 @@ impl<S: VtSink> VtProcessor<S> {
     /// pattern exists" bit). A drop takes effect at the next line boundary; a
     /// rise waits for the next read-batch boundary.
     pub fn set_raw_wanted_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
-        self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
+        self.capture = if flag.load(std::sync::atomic::Ordering::Relaxed) {
+            self.capture.on()
+        } else {
+            RawCapture::Off
+        };
         self.raw_wanted = Some(flag);
     }
 
@@ -908,10 +1564,15 @@ impl<S: VtSink> VtProcessor<S> {
     /// pushed only from the flip onward. Rises therefore wait for a batch
     /// boundary with no fragmented logical line open
     /// ([`Self::notify_end_of_buffer`]), where no run is in flight and the
-    /// next line can be captured from its first byte.
+    /// next line can be captured from its first byte. A fall drops whatever
+    /// raw bytes were held for the next fragment ([`Self::drop_raw`]).
     fn refresh_capture_raw(&mut self) {
-        if let Some(flag) = &self.raw_wanted {
-            self.capture_raw = self.capture_raw && flag.load(std::sync::atomic::Ordering::Relaxed);
+        if self.capture.is_on()
+            && let Some(flag) = &self.raw_wanted
+            && !flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.capture = RawCapture::Off;
+            self.drop_raw();
         }
     }
 
@@ -921,7 +1582,7 @@ impl<S: VtSink> VtProcessor<S> {
     /// fall is safe under either hoisted branch.
     #[must_use]
     pub fn capture_raw(&self) -> bool {
-        self.capture_raw
+        self.capture.is_on()
     }
 
     /// Close the active link's current range into `link_info` (empty ranges
@@ -960,6 +1621,10 @@ impl<S: VtSink> VtProcessor<S> {
     /// `\r` replaces it. Raw bytes that arrived after the `\r` (up to and
     /// including the character triggering the restart) belong to the new
     /// frame and are kept. The cursor style survives, as on a real terminal.
+    /// Out of line: an overprint is rare next to the runs and characters
+    /// whose print paths test for it.
+    #[cold]
+    #[inline(never)]
     fn restart_open_line(&mut self, raw_mark: usize) {
         self.buf.clear();
         self.span_info.clear();
@@ -967,8 +1632,14 @@ impl<S: VtSink> VtProcessor<S> {
         // ranges already banked for the superseded frame are discarded.
         self.link_info.clear();
         self.link_open_pos = 0;
+        // The superseded frame's objects go with its text: their ranges
+        // meant nothing else, and nor do its placeholder cells.
+        self.pending_objects.clear();
+        self.placeholder_cells.clear();
+        self.line_has_graphics = false;
         self.buf_raw.drain(..raw_mark.min(self.buf_raw.len()));
         self.open_logical_line.clear();
+        self.flushed_columns = 0;
         self.sink.emit(VtEvent::RetractIncomingPartialLine);
     }
 
@@ -986,19 +1657,98 @@ impl<S: VtSink> VtProcessor<S> {
     }
 
     pub fn consume_into_pending_line(&mut self) -> StyledLine {
+        let raw_end = self.buf_raw.len();
+        self.consume_pending_line(raw_end)
+    }
+
+    /// [`Self::consume_into_pending_line`] with the raw text ending at
+    /// `raw_end`: the bytes from there on are held back for the next
+    /// fragment (see [`Self::held_raw_start`]) and stay in the buffer.
+    fn consume_pending_line(&mut self, raw_end: usize) -> StyledLine {
+        if self.line_has_graphics && !self.placeholder_cells.is_empty() {
+            self.attach_placeholder_runs();
+        }
         self.change_style(self.cursor_style);
         // A link still open at the boundary contributes its range so far and
         // stays active: its next range begins at 0 on the next line.
         self.close_link_range(true);
         let spans = self.span_info.drain(..).collect();
-        let mut line = if self.capture_raw {
-            StyledLine::new_with_raw_text(&self.buf, spans, Some(self.raw_text()))
+        let mut line = if self.capture.is_on() {
+            StyledLine::new_with_raw_text(&self.buf, spans, Some(self.raw_text(raw_end)))
         } else {
             StyledLine::new(&self.buf, spans)
         };
         line.links = self.link_info.drain(..).collect();
         self.link_open_pos = 0;
+        if self.line_has_graphics {
+            self.take_line_graphics(&mut line);
+        }
         line
+    }
+
+    /// The objects attached to the pending line leave with it (its
+    /// placeholder cells were turned into them above). Out of line: a line
+    /// carries graphics only when a placement landed on it.
+    #[cold]
+    #[inline(never)]
+    fn take_line_graphics(&mut self, line: &mut StyledLine) {
+        if !self.pending_objects.is_empty() {
+            line.objects = Some(Arc::new(std::mem::take(&mut self.pending_objects)));
+        }
+        self.line_has_graphics = false;
+    }
+
+    /// Attach an inline object at the cursor: `columns` placeholder spaces
+    /// join the pending line and the object covers them, exactly as a
+    /// script-authored widget covers its text. Its identity is minted here,
+    /// on the socket thread, and travels unchanged through every partial,
+    /// fragment and join. A pending overprint restarts the line first, as a
+    /// printed character would, so the per-line cap counts the frame the
+    /// object joins, not the one it replaces. Nothing enters the raw
+    /// capture: raw triggers match wire bytes, and a placement's were cut
+    /// out with its APC. `baseline` says where text beside an object taller
+    /// than its row sits (a placement leaves the cursor on its last row).
+    /// `None` once the line holds the per-line cap.
+    pub fn attach_inline_object(
+        &mut self,
+        columns: usize,
+        resource: Arc<dyn std::any::Any + Send + Sync>,
+        baseline: Baseline,
+    ) -> Option<u64> {
+        let mut object = InlineObject::new(0..0, resource, InlineOwner::default());
+        object.baseline = baseline;
+        self.attach_object(columns, object)
+    }
+
+    /// [`Self::attach_inline_object`] with the object built by the caller
+    /// (its range is set here); zero `columns` attaches an anchor.
+    fn attach_object(&mut self, columns: usize, mut object: InlineObject) -> Option<u64> {
+        if let Some(raw_mark) = self.pending_cr.take() {
+            self.restart_open_line(raw_mark);
+        }
+        if self.pending_objects.len() >= MAX_INLINE_OBJECTS {
+            return None;
+        }
+        let start = self.buf.len();
+        self.buf.extend(std::iter::repeat_n(' ', columns));
+        object.range = start..self.buf.len();
+        let id = object.id;
+        self.pending_objects.push(object);
+        self.line_has_graphics = true;
+        Some(id)
+    }
+
+    /// Attach an object over text already in the pending line (its range
+    /// is the object's): a placeholder run's placement. `None` at the
+    /// per-line cap, like any attach.
+    fn attach_over(&mut self, object: InlineObject) -> Option<u64> {
+        if self.pending_objects.len() >= MAX_INLINE_OBJECTS {
+            return None;
+        }
+        let id = object.id;
+        self.pending_objects.push(object);
+        self.line_has_graphics = true;
+        Some(id)
     }
 
     /// Notifies that the end of a read batch of incoming data has been reached — the
@@ -1010,27 +1760,42 @@ impl<S: VtSink> VtProcessor<S> {
     /// mid-batch on the socket runtime, and the connection task then exits via its
     /// disconnect signal.
     pub fn notify_end_of_buffer(&mut self) {
+        // A read batch ends wherever the socket did, including inside a
+        // graphics APC or on a lone `ESC`: those bytes belong to the next
+        // fragment's capture (where the string's end cuts it out, or the
+        // sequence completes), not to this partial's raw text.
+        let raw_end = self.held_raw_start();
         // A batch can carry terminal state without displayable characters
         // (for example, an SGR-only prompt). Preserve that cursor-style line
-        // for prompt/color-only matching. A truly empty batch stays silent.
+        // for prompt/color-only matching. A truly empty batch stays silent,
+        // and so does one holding only string bytes.
         let has_pending_line = !self.buf.is_empty()
             || !self.span_info.is_empty()
-            || (self.capture_raw && !self.buf_raw.is_empty());
-        let pending_line = Arc::new(self.consume_into_pending_line());
+            || !self.pending_objects.is_empty()
+            || (self.capture.is_on() && raw_end > 0);
         if has_pending_line {
+            let pending_line = Arc::new(self.consume_pending_line(raw_end));
             if !self.buf.is_empty() {
                 self.packet_has_displayable_text = true;
             }
             self.open_logical_line.push(pending_line.clone());
             self.sink
                 .emit(VtEvent::HandleIncomingPartialLine(pending_line));
+            // The cursor's column past the flushed text is read only by
+            // the graphics state, so it is counted only once one exists: a
+            // line flushed before the session's first graphics command
+            // reads its column from the fragments since.
+            if self.graphics.is_some() {
+                self.flushed_columns += self.buf.chars().count();
+            }
             self.buf.clear();
-            self.clear_raw();
+            self.flush_raw(raw_end);
             self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
             self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
             // The frame a pending `\r` marked was just flushed upstream as a
             // partial; the restart's retraction covers it, and no local raw
-            // bytes remain to drop.
+            // bytes remain to drop (what stays is held for the next
+            // fragment).
             if self.pending_cr.is_some() {
                 self.pending_cr = Some(0);
             }
@@ -1055,10 +1820,24 @@ impl<S: VtSink> VtProcessor<S> {
         // starts a fresh line under the new value, and `TelnetBridge::on_data`
         // re-hoists it before any byte flows. Across a fragmented line the old
         // value stays latched, keeping raw text complete-or-absent.
+        // A fall here drops what was held for the next fragment; a rise
+        // finds the buffer empty, as it always is while capture is off.
         if !self.open_logical_line.has_fragments()
             && let Some(flag) = &self.raw_wanted
         {
-            self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
+            let wanted = flag.load(std::sync::atomic::Ordering::Relaxed);
+            if self.capture.is_on() && !wanted {
+                self.drop_raw();
+            }
+            debug_assert!(
+                self.capture.is_on() || self.buf_raw.is_empty(),
+                "raw bytes captured while capture was off"
+            );
+            self.capture = if wanted {
+                self.capture.on()
+            } else {
+                RawCapture::Off
+            };
         }
     }
 
@@ -1078,15 +1857,24 @@ impl<S: VtSink> VtProcessor<S> {
         // A prompt boundary finalizes the line; a `\r` just before it must
         // not overwrite what follows.
         self.pending_cr = None;
+        // A `GA` inside a graphics APC (or between an `ESC` and what it
+        // begins) is as possible as a batch end there, and the bytes are
+        // held back the same way.
+        let raw_end = self.held_raw_start();
         let has_new_pending_line = !self.buf.is_empty()
             || !self.span_info.is_empty()
-            || (self.capture_raw && !self.buf_raw.is_empty());
+            || !self.pending_objects.is_empty()
+            || (self.capture.is_on() && raw_end > 0);
         if !has_new_pending_line && self.open_logical_line.has_fragments() {
             self.open_logical_line.clear();
             self.sink.emit(VtEvent::PromptBoundary);
+            self.refresh_capture_raw();
+            // The prompt's row is final: what comes next is a new line.
+            self.line_seq += 1;
+            self.flushed_columns = 0;
             return;
         }
-        let pending_line = Arc::new(self.consume_into_pending_line());
+        let pending_line = Arc::new(self.consume_pending_line(raw_end));
         if !self.buf.is_empty() {
             self.packet_has_displayable_text = true;
         }
@@ -1098,14 +1886,18 @@ impl<S: VtSink> VtProcessor<S> {
         // become the prefix of the next normal trigger line.
         self.open_logical_line.clear();
         self.buf.clear();
-        self.clear_raw();
+        self.flush_raw(raw_end);
         self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
         self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
         self.refresh_capture_raw();
+        self.line_seq += 1;
+        self.flushed_columns = 0;
     }
 
     fn commit_line(&mut self) {
         let pending_line = Arc::new(self.consume_into_pending_line());
+        self.line_seq += 1;
+        self.flushed_columns = 0;
         if !pending_line.text.is_empty() {
             self.packet_has_displayable_text = true;
         }
@@ -1130,6 +1922,15 @@ impl<S: VtSink> VtProcessor<S> {
         self.buf.push(ch);
     }
 
+    /// A deceptive invisible inside a link joins the line escaped.
+    #[cold]
+    #[inline(never)]
+    fn push_escaped_link_char(&mut self, ch: char) {
+        let mut escaped = String::new();
+        push_display_char(&mut escaped, ch, true);
+        self.buf.push_str(&escaped);
+    }
+
     /// The Ground-state bulk `print`: one `push_str` for a run the byte loop already proved
     /// the parser would print unchanged (see `connection::plain_run`). Equivalent to `print`
     /// per character, including the overprint restart a pending `\r` demands and the
@@ -1138,49 +1939,239 @@ impl<S: VtSink> VtProcessor<S> {
         if let Some(raw_mark) = self.pending_cr.take() {
             self.restart_open_line(raw_mark);
         }
-        if self.cursor_link.is_some() && !run.is_ascii() {
-            for c in run.chars() {
-                self.print(c);
-            }
+        // Only a run inside a link, or one printed while placeholders are
+        // armed, can need more than a `push_str`. Neither flag is set on the
+        // common path, which stays two loads and the append; the rest lives
+        // out of line so the byte loop this inlines into stays small.
+        if self.cursor_link.is_some() || self.placeholders_armed {
+            self.print_run_noted(run);
         } else {
             self.buf.push_str(run);
         }
     }
 
+    /// [`Self::print_run`] inside a link or while placeholders are armed:
+    /// only a run with non-ASCII bytes can need escaping (per character,
+    /// through [`VTActor::print`]) or hold a placeholder to note.
+    #[cold]
+    #[inline(never)]
+    fn print_run_noted(&mut self, run: &str) {
+        if run.is_ascii() {
+            self.buf.push_str(run);
+        } else if self.cursor_link.is_some() {
+            for c in run.chars() {
+                self.print(c);
+            }
+        } else {
+            self.stamp_placeholders_in(run);
+            self.buf.push_str(run);
+        }
+    }
+
     pub fn push_raw_incoming_byte(&mut self, byte: u8) {
-        if self.capture_raw {
+        // One compare for the common path: capture on, nothing pending.
+        if self.capture == RawCapture::On {
+            self.buf_raw.push(byte);
+            self.raw_unverified |= byte >= 0x80;
+        } else if self.capture == RawCapture::KeptEsc {
+            self.push_raw_after_kept_esc(byte);
+        }
+    }
+
+    /// [`Self::push_raw_incoming_byte`] for the byte after an `ESC` kept
+    /// back from a stripped graphics APC: the byte settles the `ESC` first
+    /// and joins the capture unless it completed the string's terminator.
+    /// Out of line: this is the rare branch of a hot path.
+    #[cold]
+    #[inline(never)]
+    fn push_raw_after_kept_esc(&mut self, byte: u8) {
+        if self.settle_kept_esc(byte) {
             self.buf_raw.push(byte);
             self.raw_unverified |= byte >= 0x80;
         }
     }
 
+    /// The verdict on the `ESC` kept back from a stripped graphics APC, in
+    /// the raw byte after it. The `ESC` goes when the byte completes it (a
+    /// `\`, or an 8-bit ST, which spell `ESC \` between them and go with
+    /// it) or supersedes it (another `ESC`, or any C1 byte: the parser takes
+    /// either for a fresh start, so the string's own `ESC` began nothing);
+    /// it stays as the start of anything else. Whether the byte itself is
+    /// to be captured.
+    fn settle_kept_esc(&mut self, byte: u8) -> bool {
+        self.capture = RawCapture::On;
+        let completes = byte == b'\\' || byte == 0x9c;
+        if completes || byte == 0x1b || (0x80..=0x9f).contains(&byte) {
+            self.buf_raw.pop();
+            // An overprint marked after that `ESC` must not reach past the
+            // buffer's end, or the restart would drop the new frame's first
+            // raw byte.
+            if let Some(mark) = self.pending_cr.as_mut() {
+                *mark = (*mark).min(self.buf_raw.len());
+            }
+        }
+        !completes
+    }
+
     /// Raw capture for a run the bulk path validated as UTF-8. A run carries no CR/LF (those
-    /// are controls, which end a run), so nothing needs filtering out.
+    /// are controls, which end a run), so nothing needs filtering out. Nor can a run follow
+    /// an `ESC` kept back for ST: that `ESC` leaves the parser in its escape state, which
+    /// only a byte on the per-byte path can end (CR/LF, the one kind that path does not
+    /// push, keep the parser there), so [`Self::push_raw_incoming_byte`] has always settled
+    /// `raw_skip_st` before the parser is back in Ground and a run can start — and a fall
+    /// of capture, which would skip that push, clears the flag with the buffer.
     pub fn push_raw_incoming_run(&mut self, run: &str) {
-        if self.capture_raw {
+        if self.capture.is_on() {
+            debug_assert!(
+                self.capture != RawCapture::KeptEsc,
+                "a run cannot follow a kept-back ESC"
+            );
             self.buf_raw.extend_from_slice(run.as_bytes());
         }
     }
 
-    /// The pending raw bytes as text: borrowed straight from the buffer when every byte
-    /// arrived verified, lossily re-decoded only when the per-byte path pushed a high byte.
-    fn raw_text(&self) -> Cow<'_, str> {
+    /// The pending raw bytes before `end` as text: borrowed straight from the buffer when
+    /// every byte arrived verified, lossily re-decoded only when the per-byte path pushed a
+    /// high byte. `end` is a hold-back point (see [`held_raw_start`]) or the buffer's
+    /// length: it falls before a trailing ASCII `ESC`, at an open APC's `ESC _` (the
+    /// `_` alone when capture rose between the two) or before the bytes of a character
+    /// the batch cut short, never inside a multibyte character, so it never splits a
+    /// validated run.
+    fn raw_text(&self, end: usize) -> Cow<'_, str> {
+        let raw = &self.buf_raw[..end];
         if self.raw_unverified {
-            String::from_utf8_lossy(&self.buf_raw)
+            String::from_utf8_lossy(raw)
         } else {
-            debug_assert!(std::str::from_utf8(&self.buf_raw).is_ok());
+            debug_assert!(std::str::from_utf8(raw).is_ok());
             // SAFETY: `raw_unverified` is set by every push of a byte >= 0x80 that did not
             // come through a validated run and is cleared only with the buffer, so while it
-            // is false the buffer holds nothing but ASCII and validated UTF-8 runs.
-            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.buf_raw) })
+            // is false the buffer holds nothing but ASCII and validated UTF-8 runs, and
+            // `end` (see above) is the buffer's length or the position of an ASCII byte:
+            // a character boundary.
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(raw) })
         }
     }
 
-    /// Empty the raw buffer for the next line; nothing unverified remains.
+    /// Empty the raw buffer for the next line; nothing unverified remains,
+    /// and no kept-back `ESC` (that state only ever describes the buffer's
+    /// last byte).
     fn clear_raw(&mut self) {
         self.buf_raw.clear();
         self.raw_unverified = false;
+        if self.capture == RawCapture::KeptEsc {
+            self.capture = RawCapture::On;
+        }
     }
+}
+
+// The raw-capture bookkeeping below works on the capture's own fields and
+// lives outside the generic processor: compiled once here, not once per sink
+// type beside the byte loop that each monomorphisation carries.
+
+/// Whether `byte` begins a control sequence or string: `ESC`, or one of the
+/// C1 introducers the parser honours (DCS, SOS, CSI, OSC, PM, APC). Such a
+/// byte ends a string it arrives in and starts the next sequence at once.
+/// Asked only of the byte that ended an APC string, where it is read on
+/// its own (see [`strip_graphics_apc`]); at a batch boundary, where a
+/// trailing C1 value is as likely a character's last byte, only `ESC` is
+/// held back (see [`held_raw_start`]).
+const fn introduces_sequence(byte: u8) -> bool {
+    matches!(byte, 0x1b | 0x90 | 0x98 | 0x9b | 0x9d | 0x9e | 0x9f)
+}
+
+/// Cut a graphics APC out of `buf_raw` from `start` (or from its own
+/// `ESC _ G` when the parser never said where it began), keeping a pending
+/// overprint mark inside the buffer. The byte that ended the string is the
+/// buffer's last: an 8-bit ST, CAN or SUB ends it and begins nothing, and
+/// goes with it; an `ESC` or a C1 introducer ends it by beginning whatever
+/// comes next (`ESC [ … m` straight after a chunk), so it stays — the `ESC`
+/// provisionally, until the next byte says whether it was only half of
+/// `ESC \` ([`VtProcessor::settle_kept_esc`]). That last byte is read for
+/// what it is without doubt: the parser reads a string byte by byte, with
+/// no UTF-8 decoding, so a C1 value there is the control it names and
+/// everything before it in the string goes with the string; in text, where
+/// the parser decodes UTF-8, a character's continuation byte with a C1
+/// value (`œ` ends in `9C`) is taken as the character's and never reaches
+/// the string machinery, so no character is ever cut here.
+fn strip_graphics_apc(
+    buf_raw: &mut Vec<u8>,
+    pending_cr: &mut Option<usize>,
+    raw_skip_st: &mut bool,
+    start: Option<usize>,
+) {
+    let Some(at) = start.or_else(|| memchr::memmem::rfind(buf_raw, b"\x1b_G")) else {
+        return;
+    };
+    let at = at.min(buf_raw.len());
+    let introducer = buf_raw
+        .last()
+        .copied()
+        .filter(|&byte| introduces_sequence(byte));
+    buf_raw.truncate(at);
+    if let Some(mark) = pending_cr.as_mut() {
+        *mark = (*mark).min(at);
+    }
+    if let Some(byte) = introducer {
+        buf_raw.push(byte);
+        if byte == 0x1b {
+            *raw_skip_st = true;
+        }
+    }
+}
+
+/// Where the raw bytes that must not flush with the pending line at a
+/// boundary begin: those of an APC string still open (from
+/// `apc_raw_start`; cut out of the capture when it ends, wherever that is)
+/// or a lone trailing `ESC`, which belongs to whatever follows — the `\`
+/// completing `ESC \` after a stripped graphics string (when it must stay
+/// in the buffer for that `\` to find), or the sequence it begins, which
+/// the next fragment then captures whole — or the bytes of a character the
+/// batch cut short: a lead byte and fewer continuation bytes than it needs
+/// (see [`incomplete_utf8_tail`]), which the parser holds in its UTF-8
+/// state the same way and prints once the rest arrives. Flushed, they
+/// would stand as a replacement character in this fragment and the rest as
+/// another in the next (`語` arriving as `E8 AA` then `9E`), where the
+/// joined text has the character whole. Of the control bytes only an
+/// `ESC` is held: at the end of a batch, a byte with an 8-bit C1
+/// introducer's value is far more likely the last byte of a character the
+/// bulk path validated (`А` is `D0 90`, `語` is `E8 AA 9E`) than a
+/// sequence's start, and holding it back would split the character —
+/// behind `from_utf8_unchecked` when the run was verified — while `ESC`
+/// (0x1B) is never part of one. Nothing is lost by not holding a C1 byte:
+/// the sequence it begins is captured across the two fragments, whose
+/// joined raw text is the same. Held bytes stay at the head of the buffer
+/// across the flush, so a partial line's raw text is never torn and a
+/// joined line's is the same as if nothing had split it. `buf_raw.len()`
+/// when nothing is held.
+fn held_raw_start(buf_raw: &[u8], apc_raw_start: Option<usize>) -> usize {
+    match (apc_raw_start, buf_raw.last()) {
+        (Some(at), _) => at.min(buf_raw.len()),
+        (None, Some(&0x1b)) => buf_raw.len() - 1,
+        (None, Some(&byte)) if byte >= 0x80 => buf_raw.len() - incomplete_utf8_tail(buf_raw),
+        (None, _) => buf_raw.len(),
+    }
+}
+
+/// How many bytes at the end of `buf_raw` begin a UTF-8 character that is
+/// not complete — a lead byte and the continuation bytes so far, fewer than
+/// its length and valid as far as they go, which is exactly what the
+/// parser's UTF-8 state still holds — and so must not flush with the
+/// fragment. Zero when the buffer ends in a complete character, in ASCII
+/// or in bytes no character can begin with (a lone continuation byte, a
+/// lead byte followed by a byte it cannot take): those the parser has
+/// already replaced, and they flush as what they are. At most three, since
+/// a character has at most four bytes.
+fn incomplete_utf8_tail(buf_raw: &[u8]) -> usize {
+    (1..=buf_raw.len().min(3))
+        .find(|&len| {
+            // Incomplete, and nothing else wrong with it: `from_utf8`
+            // reports an unexpected end (no error length) at its start.
+            matches!(
+                std::str::from_utf8(&buf_raw[buf_raw.len() - len..]),
+                Err(err) if err.valid_up_to() == 0 && err.error_len().is_none()
+            )
+        })
+        .unwrap_or(0)
 }
 
 impl<S: VtSink> VTActor for VtProcessor<S> {
@@ -1188,10 +2179,13 @@ impl<S: VtSink> VTActor for VtProcessor<S> {
         if let Some(raw_mark) = self.pending_cr.take() {
             self.restart_open_line(raw_mark);
         }
+        // One compare per printed character; the branch is taken only for
+        // a graphics placeholder while a virtual placement exists.
+        if b == PLACEHOLDER && self.placeholders_armed {
+            self.stamp_placeholder(self.buf.len());
+        }
         if self.cursor_link.is_some() && deceptive_invisible(b, InvisiblePolicy::Prose) {
-            let mut escaped = String::new();
-            push_display_char(&mut escaped, b, true);
-            self.buf.push_str(&escaped);
+            self.push_escaped_link_char(b);
         } else {
             self.push_incoming_char(b);
         }
@@ -1231,9 +2225,16 @@ impl<S: VtSink> VTActor for VtProcessor<S> {
     }
 
     fn csi_dispatch(&mut self, params: &[CsiParam], _parameters_truncated: bool, byte: u8) {
-        if byte == b'm' {
-            let new_style = sgr::process(self.cursor_style, params);
-            self.change_style(new_style);
+        match byte {
+            b'm' => {
+                let new_style =
+                    sgr::process_with_extras(self.cursor_style, params, &mut self.sgr_extras);
+                self.change_style(new_style);
+            }
+            b'c' | b't' if self.graphics_mode.replies() => {
+                self.answer_terminal_query(params, byte);
+            }
+            _ => {}
         }
     }
 
@@ -1306,16 +2307,57 @@ impl<S: VtSink> VTActor for VtProcessor<S> {
         }
     }
 
-    fn apc_dispatch(&mut self, _data: Vec<u8>) {}
+    fn apc_start(&mut self) {
+        // The `ESC _` that opened the string reached the raw capture before
+        // the parser saw it (and nothing did while capture is off, when the
+        // buffer is empty): a graphics string is cut out from there. A
+        // boundary between the two bytes keeps the `ESC` back for the `_`
+        // (see `held_raw_start`); only capture rising between them leaves
+        // fewer behind, and then the buffer holds nothing but the `_`.
+        self.apc_raw_start = Some(self.buf_raw.len().saturating_sub(2));
+    }
+
+    fn apc_dispatch(&mut self, data: Vec<u8>) {
+        let start = self.apc_raw_start.take();
+        // Only graphics APCs are ours; any other APC string stays ignored,
+        // raw capture included, exactly as before.
+        let Some(parsed) = graphics::parse_apc(&data) else {
+            return;
+        };
+        self.strip_graphics_apc_from_raw(start);
+        match parsed {
+            Ok((control, payload)) => self.graphics_command(control, payload),
+            Err(err) => log::debug!("malformed graphics command ignored: {err}"),
+        }
+    }
+
+    fn apc_dispatch_truncated(&mut self, prefix: &[u8]) {
+        let start = self.apc_raw_start.take();
+        // An oversized graphics chunk is a protocol violation (chunks are
+        // capped at 4 KiB of payload); it still must not leave its prefix in
+        // the raw capture, and it ends any upload it may have belonged to.
+        // A session that has never run a graphics command has no upload to
+        // end, and the refusal it would get is not worth allocating the
+        // state for: the violation is dropped.
+        if prefix.first() == Some(&b'G') {
+            self.strip_graphics_apc_from_raw(start);
+            if self.graphics.is_some() {
+                self.with_graphics(|state, env| state.truncated_command(env, prefix));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiColor, Color, MAX_OSC8_PRESETS, MAX_OSC8_URI_LEN, VtEvent, VtProcessor, VtSink,
-        menu_title, parse_link_tooltip_text, sanitize_display_text,
+        AnsiColor, Color, MAX_INLINE_OBJECTS, MAX_OSC8_PRESETS, MAX_OSC8_URI_LEN, VtEvent,
+        VtProcessor, VtSink, held_raw_start, incomplete_utf8_tail, menu_title,
+        parse_link_tooltip_text, sanitize_display_text,
     };
+    use crate::graphics;
     use crate::link_url_host;
+    use smudgy_session_model::inline_content::{Baseline, Layer};
     use std::sync::Arc;
     use std::sync::mpsc::{Receiver, Sender, channel};
     use vtparse::VTParser;
@@ -2680,5 +3722,2210 @@ mod tests {
             (lines[0].links[0].begin_pos, lines[0].links[0].end_pos),
             (0, 3)
         );
+    }
+    // --- kitty graphics: wire layer only (no image table yet) ---
+
+    fn raw_of(h: &mut Harness) -> (String, Option<String>) {
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines.len(), 1, "exactly one committed line expected");
+        (lines[0].text.clone(), lines[0].raw().map(str::to_owned))
+    }
+
+    #[test]
+    fn graphics_apc_is_cut_out_of_text_and_raw_capture() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\def\n");
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+    }
+
+    #[test]
+    fn graphics_apc_ended_by_8bit_st_is_cut_out_of_raw_capture() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x9cdef\n");
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+    }
+
+    #[test]
+    fn graphics_apc_without_st_backslash_keeps_the_following_escape() {
+        // A client that ends the APC with a bare ESC followed by an SGR: the
+        // ESC closes the APC and starts the CSI, which must survive in raw.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b[31mdef\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "abcdef");
+        assert_eq!(lines[0].raw(), Some("abc\x1b[31mdef"));
+    }
+
+    #[test]
+    fn oversized_graphics_chunk_is_cut_out_of_raw_capture() {
+        let mut h = harness();
+        let mut apc = b"abc\x1b_Ga=T,f=24,s=1,v=1,m=1;".to_vec();
+        apc.extend(std::iter::repeat_n(b'A', 9000));
+        apc.extend_from_slice(b"\x1b\\def\n");
+        h.feed(&apc);
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+    }
+
+    #[test]
+    fn malformed_graphics_apc_is_still_cut_out_of_raw_capture() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=zz,f=1;AAAA\x1b\\def\n");
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+    }
+
+    #[test]
+    fn other_apc_strings_stay_in_raw_capture() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_tmux;x\x1b\\def\n");
+        assert_eq!(
+            raw_of(&mut h),
+            ("abcdef".into(), Some("abc\x1b_tmux;x\x1b\\def".into()))
+        );
+    }
+
+    #[test]
+    fn a_pending_overprint_mark_survives_raw_stripping() {
+        let mut h = harness();
+        h.feed(b"10%\r\x1b_Ga=p,i=1\x1b\\20%\n");
+        assert_eq!(raw_of(&mut h), ("20%".into(), Some("20%".into())));
+    }
+
+    #[test]
+    fn graphics_apc_leaves_a_following_backslash_character_alone() {
+        // Only the `\` of `ESC \` is skipped: a literal backslash printed
+        // after an 8-bit-ST-terminated APC is ordinary text.
+        let mut h = harness();
+        h.feed(b"a\x1b_Ga=p,i=1\x9c\\b\n");
+        assert_eq!(raw_of(&mut h), ("a\\b".into(), Some("a\\b".into())));
+    }
+
+    // --- a graphics APC straddling read batches ---
+
+    /// The partial lines' raw texts, then the joined line's.
+    fn raw_fragments(actions: &[VtEvent]) -> (Vec<Option<String>>, Option<String>) {
+        let partials = partial_lines(actions)
+            .iter()
+            .map(|line| line.raw().map(str::to_owned))
+            .collect();
+        let (line, _) = fragmented(actions);
+        (partials, line.raw().map(str::to_owned))
+    }
+
+    #[test]
+    fn a_graphics_apc_split_by_a_batch_end_stays_out_of_raw_capture() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\x1b\\def\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:abc", "line:abcdef"]);
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abcdef".into())),
+            "the open string's bytes wait for the fragment that ends it"
+        );
+        let (_, completion) = fragmented(&actions);
+        assert_eq!(completion.raw(), Some("def"));
+    }
+
+    #[test]
+    fn a_batch_ending_on_the_apc_s_closing_escape_keeps_it_back() {
+        // The ESC ended the APC and may still be half of `ESC \`.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\\def\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:abc", "line:abcdef"]);
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abcdef".into()))
+        );
+        // ...or the start of the next sequence, which then needs it.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"[31mdef\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:abc", "line:abcdef"]);
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abc\x1b[31mdef".into()))
+        );
+    }
+
+    #[test]
+    fn raw_capture_rising_inside_an_apc_skips_the_string_s_tail() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let wanted = Arc::new(AtomicBool::new(false));
+        h.processor.set_raw_wanted_flag(wanted.clone());
+        h.feed(b"abc\n\x1b_Ga=T,f=24,s=1,v=1,i=5;AA");
+        // A trigger with a raw pattern appears while the upload is in
+        // flight: capture rises at this batch boundary (no fragment is
+        // open), inside the string.
+        wanted.store(true, Ordering::Relaxed);
+        h.processor.notify_end_of_buffer();
+        h.feed(b"AA\x1b\\def\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].raw(), None, "captured nothing while unwanted");
+        assert_eq!(
+            (lines[1].text.as_str(), lines[1].raw()),
+            (" def", Some("def")),
+            "the placement's placeholder column is text, never raw"
+        );
+        // The upload itself is whole.
+        let (_, request) = decodes.lock().unwrap().pop().expect("one decode");
+        assert_eq!(request.data, [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_graphics_apc_across_three_batches_leaves_one_clean_join() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"abc\x1b_Ga=T,f=24,s=1,v=1,i=5;");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"AA");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"AA\x1b\\def\n");
+        let actions = h.actions();
+        assert_eq!(
+            transcript(&actions),
+            ["partial:abc", "line:abc def"],
+            "a batch holding only string bytes flushes no partial; the \
+             placement lands at the final chunk's cursor"
+        );
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abcdef".into()))
+        );
+        let (_, request) = decodes.lock().unwrap().pop().expect("one decode");
+        assert_eq!(request.data, [0, 0, 0]);
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert!(out.is_empty(), "the reply waits for the decode: {out:?}");
+    }
+
+    #[test]
+    fn a_prompt_boundary_inside_an_apc_holds_its_bytes_back_too() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1");
+        h.processor.commit_prompt();
+        h.feed(b"\x1b\\def\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:abc", "line:def"]);
+        assert_eq!(partial_lines(&actions)[0].raw(), Some("abc"));
+        assert_eq!(committed_lines(&actions)[0].raw(), Some("def"));
+    }
+
+    #[test]
+    fn another_apc_split_by_a_batch_end_keeps_all_its_bytes_in_raw() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_tmux;x");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\x1b\\def\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (
+                vec![Some("abc".into())],
+                Some("abc\x1b_tmux;x\x1b\\def".into())
+            )
+        );
+    }
+
+    // --- held-back raw bytes against capture falls, boundaries and cost ---
+
+    impl Harness {
+        /// The connection's Ground-state bulk path: a run the byte loop
+        /// validated as UTF-8 reaches the capture and the line in one
+        /// piece, without the parser seeing it.
+        fn feed_run(&mut self, run: &str) {
+            assert!(self.parser.is_ground(), "a run only starts in Ground");
+            self.processor.push_raw_incoming_run(run);
+            self.processor.print_run(run);
+        }
+    }
+
+    #[test]
+    fn a_kept_back_escape_does_not_outlive_a_capture_fall() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let wanted = Arc::new(AtomicBool::new(true));
+        let mut h = harness();
+        h.processor.set_raw_wanted_flag(wanted.clone());
+        // The string's closing ESC is kept back for its `\`...
+        h.feed(b"abc\n\x1b_Ga=p,i=1\x1b");
+        // ...but capture falls at this boundary, so it goes with the
+        // buffer, and the `\` that follows is seen by nothing.
+        wanted.store(false, Ordering::Relaxed);
+        h.processor.notify_end_of_buffer();
+        assert!(!h.processor.capture_raw() && h.processor.buf_raw.is_empty());
+        h.feed(b"\\");
+        wanted.store(true, Ordering::Relaxed);
+        h.processor.notify_end_of_buffer();
+        assert!(h.processor.capture_raw());
+        // A validated run is captured whole: no stale verdict pops its
+        // last byte (which would tear the character and, in release, feed
+        // invalid UTF-8 to the unchecked raw text).
+        h.feed_run("é");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[1].text.as_str(), lines[1].raw()), ("é", Some("é")));
+    }
+
+    #[test]
+    fn held_apc_bytes_do_not_leak_into_raw_after_capture_falls_and_rises() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for prompt_boundary in [false, true] {
+            let wanted = Arc::new(AtomicBool::new(true));
+            let mut h = harness();
+            h.processor.set_raw_wanted_flag(wanted.clone());
+            h.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=5;AA");
+            // Capture falls at a boundary inside the string: the bytes held
+            // for the next fragment go with it, since nothing will strip
+            // them while capture is off.
+            wanted.store(false, Ordering::Relaxed);
+            if prompt_boundary {
+                h.processor.commit_prompt();
+            } else {
+                h.processor.notify_end_of_buffer();
+            }
+            assert!(
+                h.processor.buf_raw.is_empty(),
+                "prompt boundary: {prompt_boundary}"
+            );
+            h.feed(b"AA\x1b\\");
+            wanted.store(true, Ordering::Relaxed);
+            h.processor.notify_end_of_buffer();
+            h.feed(b"def\n");
+            let lines = committed_lines(&h.actions());
+            assert_eq!(lines.len(), 1);
+            assert_eq!(
+                (lines[0].text.as_str(), lines[0].raw()),
+                ("def", Some("def")),
+                "prompt boundary: {prompt_boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_apc_open_across_many_batches_moves_its_bytes_once() {
+        // Linear by construction: a boundary that flushes nothing leaves
+        // the buffer alone, so the string's bytes move to the head of the
+        // buffer once (with the text before them flushed), however many
+        // batches the string spans. A stray unterminated `ESC _` keeps
+        // this up until an ESC or C1 byte arrives, so this is the cost of
+        // every batch meanwhile.
+        let mut h = harness();
+        let open = b"\x1b_Gm=1;";
+        h.feed(b"abc");
+        h.feed(open);
+        h.processor.notify_end_of_buffer();
+        assert_eq!(h.processor.raw_bytes_moved, open.len());
+        assert_eq!(h.processor.apc_raw_start, Some(0));
+        let chunk = vec![b'A'; 16 * 1024];
+        for _ in 0..32 {
+            h.feed(&chunk);
+            h.processor.notify_end_of_buffer();
+            assert_eq!(h.processor.raw_bytes_moved, open.len());
+            assert_eq!(h.processor.apc_raw_start, Some(0));
+        }
+        assert_eq!(h.processor.buf_raw.len(), open.len() + 32 * chunk.len());
+        assert_eq!(transcript(&h.actions()), ["partial:abc"]);
+        // The (oversized) string still ends cleanly.
+        h.feed(b"\x1b\\def\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["line:abcdef"]);
+        assert_eq!(fragmented(&actions).0.raw(), Some("abcdef"));
+    }
+
+    #[test]
+    fn a_boundary_between_escape_and_underscore_keeps_the_escape_back() {
+        // Every chunk of a chunked upload begins `ESC _`, and a read (or a
+        // prompt boundary) can fall between the two bytes.
+        for prompt_boundary in [false, true] {
+            let mut h = harness();
+            h.feed(b"abc\x1b");
+            if prompt_boundary {
+                h.processor.commit_prompt();
+            } else {
+                h.processor.notify_end_of_buffer();
+            }
+            h.feed(b"_Ga=p,i=1\x1b\\def\n");
+            let actions = h.actions();
+            assert_eq!(
+                partial_lines(&actions)[0].raw(),
+                Some("abc"),
+                "prompt boundary: {prompt_boundary}"
+            );
+            let lines = committed_lines(&actions);
+            let expected = if prompt_boundary { "def" } else { "abcdef" };
+            assert_eq!(
+                (lines[0].text.as_str(), lines[0].raw()),
+                (expected, Some(expected)),
+                "prompt boundary: {prompt_boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_trailing_escape_is_flushed_with_the_sequence_it_begins() {
+        // A CSI...
+        let mut h = harness();
+        h.feed(b"abc\x1b");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"[31mdef\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abc\x1b[31mdef".into()))
+        );
+        assert_eq!(fragmented(&actions).1.raw(), Some("\x1b[31mdef"));
+        // ...an OSC...
+        let mut h = harness();
+        h.feed(b"abc\x1b");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"]8;;http://x.y\x1b\\def\x1b]8;;\x1b\\\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (
+                vec![Some("abc".into())],
+                Some("abc\x1b]8;;http://x.y\x1b\\def\x1b]8;;\x1b\\".into())
+            )
+        );
+        assert_eq!(fragmented(&actions).0.text, "abcdef");
+        // ...or a stray `ESC \` with no string to end: wire bytes, kept.
+        let mut h = harness();
+        h.feed(b"abc\x1b");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\\def\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc".into())], Some("abc\x1b\\def".into()))
+        );
+    }
+
+    #[test]
+    fn a_flush_leaves_the_held_bytes_verified_on_their_own() {
+        // The doubt a high byte cast on the buffer leaves with that byte,
+        // so the fragment after it can borrow its raw text unchecked.
+        let mut h = harness();
+        h.feed("é\x1b_Ga=p,i=1".as_bytes());
+        assert!(h.processor.raw_unverified);
+        h.processor.notify_end_of_buffer();
+        assert!(!h.processor.raw_unverified);
+        h.feed(b"\x1b\\def\n");
+        assert_eq!(
+            raw_fragments(&h.actions()),
+            (vec![Some("é".into())], Some("édef".into()))
+        );
+    }
+
+    #[test]
+    fn an_overprint_marked_after_the_kept_back_escape_is_clamped_when_it_goes() {
+        // `ESC CR \`: the mark counted the kept-back ESC; once the `\`
+        // takes it, the mark must not reach past the buffer, or the restart
+        // would drop the new frame's first raw byte.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b\r\\def\n");
+        assert_eq!(raw_of(&mut h), ("def".into(), Some("def".into())));
+    }
+
+    #[test]
+    fn a_c1_introducer_ending_the_apc_begins_the_next_sequence() {
+        // The CSI's own introducer ended the string: it is the next
+        // sequence's and stays (a replacement character in the text form,
+        // like any lone high byte).
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x9b31mdef\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "abcdef");
+        assert_eq!(lines[0].raw(), Some("abc\u{FFFD}31mdef"));
+        // Unlike an ESC it is not held back when a batch ends on it (a
+        // trailing C1 value is usually a character's last byte, see
+        // `held_raw_start`): it flushes with the partial, and the joined
+        // line's raw text is the same.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x9b");
+        h.processor.notify_end_of_buffer();
+        assert!(h.processor.buf_raw.is_empty());
+        h.feed(b"31mdef\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (
+                vec![Some("abc\u{FFFD}".into())],
+                Some("abc\u{FFFD}31mdef".into())
+            )
+        );
+        assert_eq!(fragmented(&actions).1.raw(), Some("31mdef"));
+    }
+
+    #[test]
+    fn a_second_escape_after_the_apc_s_own_supersedes_it() {
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b\x1b[31mdef\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "abcdef");
+        assert_eq!(lines[0].raw(), Some("abc\x1b[31mdef"));
+        // So does a C1 introducer...
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b\x9b31mdef\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "abcdef");
+        assert_eq!(lines[0].raw(), Some("abc\u{FFFD}31mdef"));
+        // ...while an 8-bit ST completes it, like `\`.
+        let mut h = harness();
+        h.feed(b"abc\x1b_Ga=p,i=1\x1b\x9cdef\n");
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+    }
+
+    /// The connection's bulk path for a run of validated text: the raw
+    /// capture first, then the print.
+    fn feed_run(h: &mut Harness, run: &str) {
+        h.processor.push_raw_incoming_run(run);
+        h.processor.print_run(run);
+    }
+
+    /// Characters whose last UTF-8 byte has a C1 introducer's value: `Ð`
+    /// is `C3 90`, `А` is `D0 90`, `П` is `D0 9F`, `ẞ` is `E1 BA 9E`, `語`
+    /// is `E8 AA 9E`.
+    const C1_TAILED: [&str; 5] = ["Ð", "А", "П", "ẞ", "語"];
+
+    #[test]
+    fn a_run_ending_in_a_c1_value_is_borrowed_whole_at_a_batch_end() {
+        // The minimal case: a validated run is the whole capture, and its
+        // raw text is borrowed unchecked. Holding its last byte back as an
+        // introducer split it (a tripped assertion here; an invalid `&str`
+        // in a release build).
+        let mut h = harness();
+        feed_run(&mut h, "Ð");
+        h.processor.notify_end_of_buffer();
+        assert!(h.processor.buf_raw.is_empty(), "nothing is held back");
+        let partials = partial_lines(&h.actions());
+        assert_eq!(partials.len(), 1);
+        assert_eq!(
+            (partials[0].text.as_str(), partials[0].raw()),
+            ("Ð", Some("Ð"))
+        );
+    }
+
+    #[test]
+    fn a_boundary_after_a_character_ending_in_a_c1_value_keeps_it_whole() {
+        // Through the bulk path (where the raw text is borrowed unchecked)
+        // and the per-byte path (where it is re-decoded), at a batch end
+        // and at a prompt boundary: the character flushes whole with the
+        // partial, and what follows joins it as if nothing had split them.
+        for text in C1_TAILED {
+            for (bulk, prompt_boundary) in [(true, false), (true, true), (false, false)] {
+                let case = format!("{text}, bulk: {bulk}, prompt boundary: {prompt_boundary}");
+                let mut h = harness();
+                feed_run(&mut h, "abc");
+                if bulk {
+                    feed_run(&mut h, text);
+                } else {
+                    h.feed(text.as_bytes());
+                }
+                if prompt_boundary {
+                    h.processor.commit_prompt();
+                } else {
+                    h.processor.notify_end_of_buffer();
+                }
+                assert!(
+                    h.processor.buf_raw.is_empty(),
+                    "{case}: nothing is held back"
+                );
+                let partials = partial_lines(&h.actions());
+                let whole = format!("abc{text}");
+                assert_eq!(partials.len(), 1, "{case}");
+                assert_eq!(
+                    (partials[0].text.as_str(), partials[0].raw()),
+                    (whole.as_str(), Some(whole.as_str())),
+                    "{case}"
+                );
+                h.feed(b"def\n");
+                let lines = committed_lines(&h.actions());
+                let expected = if prompt_boundary {
+                    "def".to_owned()
+                } else {
+                    format!("abc{text}def")
+                };
+                assert_eq!(
+                    (lines[0].text.as_str(), lines[0].raw()),
+                    (expected.as_str(), Some(expected.as_str())),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A read batch, or a prompt, ending inside a character on the per-byte
+    /// path: its bytes so far are held back for the fragment the rest
+    /// completes, so neither fragment shows a replacement character and the
+    /// joined line's raw text has the character whole, like its text. Two-,
+    /// three- and four-byte characters, split after each byte.
+    #[test]
+    fn a_boundary_inside_a_character_holds_its_bytes_back_for_the_rest() {
+        for text in ["é", "語", "🎉"] {
+            let bytes = text.as_bytes();
+            for split in 1..bytes.len() {
+                for prompt_boundary in [false, true] {
+                    let case = format!(
+                        "{text} split after {split} of {} bytes, prompt boundary: {prompt_boundary}",
+                        bytes.len()
+                    );
+                    let mut h = harness();
+                    feed_run(&mut h, "ab");
+                    h.feed(&bytes[..split]);
+                    assert!(h.processor.raw_unverified, "{case}");
+                    if prompt_boundary {
+                        h.processor.commit_prompt();
+                    } else {
+                        h.processor.notify_end_of_buffer();
+                    }
+                    assert_eq!(
+                        h.processor.buf_raw,
+                        bytes[..split],
+                        "{case}: the character's bytes so far are held back"
+                    );
+                    assert!(
+                        h.processor.raw_unverified,
+                        "{case}: the held bytes keep their doubt"
+                    );
+                    let partials = partial_lines(&h.actions());
+                    assert_eq!(partials.len(), 1, "{case}");
+                    assert_eq!(
+                        (partials[0].text.as_str(), partials[0].raw()),
+                        ("ab", Some("ab")),
+                        "{case}: the partial ends before the character"
+                    );
+                    h.feed(&bytes[split..]);
+                    h.feed(b"c\n");
+                    let lines = committed_lines(&h.actions());
+                    let expected = if prompt_boundary {
+                        format!("{text}c")
+                    } else {
+                        format!("ab{text}c")
+                    };
+                    assert_eq!(
+                        (lines[0].text.as_str(), lines[0].raw()),
+                        (expected.as_str(), Some(expected.as_str())),
+                        "{case}"
+                    );
+                    assert!(!h.processor.raw_unverified, "{case}: cleared with the line");
+                }
+            }
+        }
+    }
+
+    /// A batch that brought nothing but the first bytes of a character
+    /// emits no fragment (there is nothing to show) and keeps them for the
+    /// next; a prompt boundary there closes the open line without them.
+    #[test]
+    fn a_batch_holding_only_the_start_of_a_character_flushes_nothing() {
+        for prompt_boundary in [false, true] {
+            let mut h = harness();
+            feed_run(&mut h, "ab");
+            h.processor.notify_end_of_buffer();
+            h.feed(b"\xe8\xaa");
+            if prompt_boundary {
+                h.processor.commit_prompt();
+            } else {
+                h.processor.notify_end_of_buffer();
+            }
+            assert_eq!(h.processor.buf_raw, b"\xe8\xaa");
+            let actions = h.actions();
+            assert_eq!(partial_lines(&actions).len(), 1, "only the first batch's");
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, VtEvent::PromptBoundary))
+                    .count(),
+                usize::from(prompt_boundary)
+            );
+            h.feed(b"\x9ec\n");
+            let lines = committed_lines(&h.actions());
+            let expected = if prompt_boundary { "語c" } else { "ab語c" };
+            assert_eq!(
+                (lines[0].text.as_str(), lines[0].raw()),
+                (expected, Some(expected))
+            );
+        }
+    }
+
+    /// A lone lead byte at the end of a batch is held like any start of a
+    /// character; when the next byte does not continue it, the parser
+    /// prints a replacement character for it and the raw text shows the
+    /// same, in the fragment the verdict came in.
+    #[test]
+    fn a_lead_byte_the_next_batch_does_not_continue_flushes_as_a_replacement() {
+        let mut h = harness();
+        feed_run(&mut h, "ab");
+        h.feed(b"\xe8");
+        h.processor.notify_end_of_buffer();
+        assert_eq!(h.processor.buf_raw, b"\xe8", "the lead byte is held");
+        let partials = partial_lines(&h.actions());
+        assert_eq!(
+            (partials[0].text.as_str(), partials[0].raw()),
+            ("ab", Some("ab"))
+        );
+        h.feed(b"c\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(
+            (lines[0].text.as_str(), lines[0].raw()),
+            ("ab\u{FFFD}c", Some("ab\u{FFFD}c"))
+        );
+        // Bytes no character can begin with are not held: the parser has
+        // dealt with them already (a lone continuation byte in Ground is
+        // the C1 control of its value, and prints nothing), and they flush
+        // as what they are.
+        let mut h = harness();
+        feed_run(&mut h, "ab");
+        h.feed(b"\x80");
+        h.processor.notify_end_of_buffer();
+        assert!(
+            h.processor.buf_raw.is_empty(),
+            "a lone continuation byte flushes"
+        );
+        let partials = partial_lines(&h.actions());
+        assert_eq!(
+            (partials[0].text.as_str(), partials[0].raw()),
+            ("ab", Some("ab\u{FFFD}"))
+        );
+    }
+
+    #[test]
+    fn incomplete_utf8_tails_are_measured_as_the_parser_holds_them() {
+        for (bytes, held) in [
+            (&b""[..], 0),
+            (b"a", 0),
+            (b"ab\xc3", 1),
+            (b"\xc3\xa9", 0),
+            (b"\xe8", 1),
+            (b"\xe8\xaa", 2),
+            (b"\xe8\xaa\x9e", 0),
+            (b"\xf0\x9f", 2),
+            (b"\xf0\x9f\x8e", 3),
+            (b"\xf0\x9f\x8e\x89", 0),
+            (b"\xc3\xa9\xe8", 1),
+            (b"\xe8\xaa\x9e\xf0\x9f", 2),
+            // Nothing a character can begin with, or continue: replaced
+            // by the parser already.
+            (b"\x80", 0),
+            (b"\xaa\x9e", 0),
+            (b"\xff", 0),
+            (b"\xc0", 0),
+            (b"\xe0\x80", 0),
+            (b"\xed\xa0", 0),
+            (b"\xf4\x90", 0),
+            (b"\xf5\x80", 0),
+        ] {
+            assert_eq!(incomplete_utf8_tail(bytes), held, "{bytes:?}");
+            assert_eq!(held_raw_start(bytes, None), bytes.len() - held, "{bytes:?}");
+        }
+        // An open APC or a trailing `ESC` take precedence, as before.
+        assert_eq!(held_raw_start(b"ab\x1b_Ga=p\xe8", Some(2)), 2);
+        assert_eq!(held_raw_start(b"ab\xe8\x1b", None), 3);
+    }
+
+    #[test]
+    fn a_character_ending_in_a_c1_value_after_a_stripped_apc_stays_whole() {
+        // The `\` settled the string's kept-back `ESC`, the parser is back
+        // in Ground and the character comes through the bulk path: its
+        // last byte is the character's, not an introducer to hold back.
+        for text in C1_TAILED {
+            for prompt_boundary in [false, true] {
+                let case = format!("{text}, prompt boundary: {prompt_boundary}");
+                let mut h = harness();
+                feed_run(&mut h, "abc");
+                h.feed(b"\x1b_Ga=p,i=1\x1b\\");
+                feed_run(&mut h, text);
+                if prompt_boundary {
+                    h.processor.commit_prompt();
+                } else {
+                    h.processor.notify_end_of_buffer();
+                }
+                assert!(
+                    h.processor.buf_raw.is_empty(),
+                    "{case}: nothing is held back"
+                );
+                let partials = partial_lines(&h.actions());
+                let whole = format!("abc{text}");
+                assert_eq!(partials.len(), 1, "{case}");
+                assert_eq!(
+                    (partials[0].text.as_str(), partials[0].raw()),
+                    (whole.as_str(), Some(whole.as_str())),
+                    "{case}"
+                );
+                h.feed(b"def\n");
+                let lines = committed_lines(&h.actions());
+                let expected = if prompt_boundary {
+                    "def".to_owned()
+                } else {
+                    format!("abc{text}def")
+                };
+                assert_eq!(
+                    (lines[0].text.as_str(), lines[0].raw()),
+                    (expected.as_str(), Some(expected.as_str())),
+                    "{case}"
+                );
+            }
+        }
+        // An APC ended by an 8-bit ST leaves the parser in Ground too; the
+        // capture is unverified from the ST, and re-decodes whole.
+        let mut h = harness();
+        feed_run(&mut h, "abc");
+        h.feed(b"\x1b_Ga=p,i=1\x9c");
+        feed_run(&mut h, "語");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"def\n");
+        let actions = h.actions();
+        assert_eq!(
+            raw_fragments(&actions),
+            (vec![Some("abc語".into())], Some("abc語def".into()))
+        );
+    }
+
+    #[test]
+    fn a_c1_value_inside_a_character_never_ends_an_apc() {
+        // `œ` is `C5 9C`. In text the parser's UTF-8 decoding takes the
+        // `9C` as the character's, so no string ends on it and nothing is
+        // stripped around it...
+        let mut h = harness();
+        feed_run(&mut h, "abcœ");
+        h.feed(b"\x1b_Ga=p,i=1\x1b\\");
+        feed_run(&mut h, "œdef");
+        h.feed(b"\n");
+        assert_eq!(raw_of(&mut h), ("abcœœdef".into(), Some("abcœœdef".into())));
+        // ...and the same through the per-byte path, where the parser
+        // decodes the character itself.
+        let mut h = harness();
+        h.feed("abcœ\x1b_Ga=p,i=1\x1b\\œdef\n".as_bytes());
+        assert_eq!(raw_of(&mut h), ("abcœœdef".into(), Some("abcœœdef".into())));
+        // Inside the string the parser reads bytes one by one: the `C5` is
+        // ignored there and the `9C` is ST, and both go with the string.
+        let mut h = harness();
+        feed_run(&mut h, "abc");
+        h.feed(b"\x1b_Ga=p,i=1\xc5\x9cdef\n");
+        assert_eq!(raw_of(&mut h), ("abcdef".into(), Some("abcdef".into())));
+        // A C1 introducer ending the string after a character with a C1
+        // tail: the introducer is the next sequence's, the character is
+        // whole.
+        let mut h = harness();
+        feed_run(&mut h, "abc語");
+        h.feed(b"\x1b_Ga=p,i=1\x9b31mdef\n");
+        assert_eq!(
+            raw_of(&mut h),
+            ("abc語def".into(), Some("abc語\u{FFFD}31mdef".into()))
+        );
+    }
+
+    #[test]
+    fn an_esc_cutting_a_utf8_sequence_short_begins_its_sequence() {
+        // The parser (the patched vtparse) prints one replacement
+        // character for the truncated sequence and then reads the `ESC`
+        // afresh. A CSI: the SGR applies to what follows.
+        let mut h = harness();
+        h.feed(b"\xe3\x1b[31mdef\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].text, "\u{FFFD}def");
+        assert_eq!(lines[0].raw(), Some("\u{FFFD}\x1b[31mdef"));
+        assert!(lines[0].spans.iter().any(|span| matches!(
+            span.style.fg,
+            Color::Ansi {
+                color: AnsiColor::Red,
+                bold: false
+            }
+        ) && &lines[0].text
+            [span.begin_pos..span.end_pos]
+            == "def"));
+        // A graphics APC: cut out of the text and the raw capture like any
+        // other, rather than printed as text.
+        let mut h = harness();
+        h.feed(b"\xe3\x1b_Ga=d\x1b\\x\r\n");
+        assert_eq!(
+            raw_of(&mut h),
+            ("\u{FFFD}x".into(), Some("\u{FFFD}x".into()))
+        );
+        // Plain ASCII cutting a sequence short prints after the
+        // replacement character, whatever the sequence's length.
+        let mut h = harness();
+        h.feed(b"\xe3abc\xf0\x9f\x98d\n");
+        assert_eq!(
+            raw_of(&mut h),
+            (
+                "\u{FFFD}abc\u{FFFD}d".into(),
+                Some("\u{FFFD}abc\u{FFFD}d".into())
+            )
+        );
+    }
+
+    fn replies_after(h: &mut Harness, bytes: &[u8]) -> Vec<u8> {
+        h.feed(bytes);
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        out
+    }
+
+    #[test]
+    fn da1_is_answered_only_with_the_full_protocol_on() {
+        let mut h = harness();
+        assert!(
+            replies_after(&mut h, b"\x1b[c").is_empty(),
+            "off by default"
+        );
+        h.processor
+            .set_graphics_mode(crate::graphics::GraphicsMode::DisplayOnly);
+        assert!(replies_after(&mut h, b"\x1b[c").is_empty());
+        h.processor
+            .set_graphics_mode(crate::graphics::GraphicsMode::Full);
+        assert_eq!(replies_after(&mut h, b"\x1b[c"), b"\x1b[?62;c");
+        assert_eq!(replies_after(&mut h, b"\x1b[0c"), b"\x1b[?62;c");
+        assert!(
+            replies_after(&mut h, b"\x1b[>c").is_empty(),
+            "DA2 is a different question"
+        );
+        assert!(replies_after(&mut h, b"\x1b[?c").is_empty());
+        assert!(!h.processor.has_replies());
+        // The query bytes never reach the text.
+        h.feed(b"x\n");
+        assert_eq!(raw_of(&mut h).0, "x");
+    }
+
+    #[test]
+    fn size_reports_use_the_shared_geometry() {
+        use crate::responders::pack_dims;
+        use std::sync::atomic::AtomicU32;
+        let mut h = harness();
+        h.processor
+            .set_graphics_mode(crate::graphics::GraphicsMode::Full);
+        // No geometry shared: the default grid, and the 9x18 fallback cell
+        // placements are laid out with until the pane measures a font, so
+        // the reports describe what is drawn rather than saying zero.
+        assert_eq!(replies_after(&mut h, b"\x1b[18t"), b"\x1b[8;24;80t");
+        assert_eq!(replies_after(&mut h, b"\x1b[16t"), b"\x1b[6;18;9t");
+        assert_eq!(replies_after(&mut h, b"\x1b[14t"), b"\x1b[4;432;720t");
+
+        let window = Arc::new(AtomicU32::new(pack_dims(100, 40)));
+        let cell = Arc::new(AtomicU32::new(pack_dims(
+            graphics::cell_fixed(9.0),
+            graphics::cell_fixed(19.0),
+        )));
+        h.processor
+            .set_terminal_geometry(window.clone(), cell.clone());
+        assert_eq!(replies_after(&mut h, b"\x1b[18t"), b"\x1b[8;40;100t");
+        assert_eq!(replies_after(&mut h, b"\x1b[16t"), b"\x1b[6;19;9t");
+        assert_eq!(replies_after(&mut h, b"\x1b[14t"), b"\x1b[4;760;900t");
+        // A fractional cell reports its whole pixels: 9.6 px cells say 9, so
+        // 100 columns report 900 px, inside the 960 px they really span.
+        cell.store(
+            pack_dims(graphics::cell_fixed(9.6), graphics::cell_fixed(19.2)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(replies_after(&mut h, b"\x1b[16t"), b"\x1b[6;19;9t");
+        assert_eq!(replies_after(&mut h, b"\x1b[14t"), b"\x1b[4;760;900t");
+        // The runtime updates the cells in place; the next report sees it.
+        window.store(pack_dims(80, 24), std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(replies_after(&mut h, b"\x1b[18t"), b"\x1b[8;24;80t");
+        // Other XTWINOPS requests stay silent.
+        assert!(replies_after(&mut h, b"\x1b[8;50;100t").is_empty());
+        assert!(replies_after(&mut h, b"\x1b[t").is_empty());
+        h.processor
+            .set_graphics_mode(crate::graphics::GraphicsMode::Off);
+        assert!(replies_after(&mut h, b"\x1b[16t").is_empty());
+    }
+
+    // --- decode completion and reply order ---
+
+    type Decodes = Arc<std::sync::Mutex<Vec<(graphics::DecodeTicket, graphics::DecodeRequest)>>>;
+
+    /// A host that only records what it was asked to decode; the test plays
+    /// the completion back itself.
+    #[derive(Debug)]
+    struct RecordingHost(Decodes);
+
+    impl graphics::GraphicsHost for RecordingHost {
+        fn decode(&mut self, ticket: graphics::DecodeTicket, request: graphics::DecodeRequest) {
+            self.0.lock().unwrap().push((ticket, request));
+        }
+
+        fn read_media(
+            &mut self,
+            _medium: graphics::Medium,
+            _name: &[u8],
+            _offset: u32,
+            _size: u32,
+        ) -> Result<Vec<u8>, graphics::GraphicsError> {
+            Err(graphics::GraphicsError::bad_file())
+        }
+    }
+
+    fn hosted(mode: graphics::GraphicsMode) -> (Harness, Decodes) {
+        let mut h = harness();
+        h.processor.set_graphics_mode(mode);
+        let decodes: Decodes = Arc::default();
+        h.processor
+            .set_graphics_host(Box::new(RecordingHost(decodes.clone())));
+        (h, decodes)
+    }
+
+    fn one_pixel() -> graphics::DecodedPixels {
+        graphics::DecodedPixels {
+            width: 1,
+            height: 1,
+            rgba: bytes::Bytes::from_static(&[0, 0, 0, 255]),
+        }
+    }
+
+    #[test]
+    fn a_query_answer_waits_behind_a_transmit_still_decoding() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AAAA\x1b\\\x1b[c");
+        assert!(
+            !h.processor.has_replies(),
+            "DA1's answer is queued behind the parked transmit reply"
+        );
+        let (ticket, request) = decodes.lock().unwrap().pop().expect("one decode requested");
+        assert_eq!(
+            request,
+            graphics::DecodeRequest {
+                format: graphics::Format::Rgb,
+                compression: graphics::Compression::None,
+                width: 1,
+                height: 1,
+                data: vec![0, 0, 0],
+                compose: None,
+            }
+        );
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b_Gi=7;OK\x1b\\\x1b[?62;c");
+        assert!(matches!(h.actions().last(), Some(VtEvent::RequestRepaint)));
+    }
+
+    #[test]
+    fn a_frame_waits_for_its_root_and_a_control_asks_for_a_repaint() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(
+            b"\x1b_Ga=t,f=24,s=1,v=1,i=7;AAAA\x1b\\\
+              \x1b_Ga=f,f=24,s=1,v=1,i=7,z=50,c=1;AAAA\x1b\\\
+              \x1b_Ga=a,i=7,s=3\x1b\\",
+        );
+        assert_eq!(
+            decodes.lock().unwrap().len(),
+            1,
+            "the frame waits for the root"
+        );
+        assert!(
+            !h.actions()
+                .iter()
+                .any(|action| matches!(action, VtEvent::RequestRepaint)),
+            "a control still waiting changes nothing yet"
+        );
+        let (ticket, _) = decodes.lock().unwrap().remove(0);
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let (ticket, request) = decodes
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("the frame goes to the host once the root landed");
+        let compose = request.compose.expect("a frame decode");
+        assert_eq!((compose.base, compose.canvas), (Some(one_pixel()), (1, 1)));
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let image = graphics_state(&h).unwrap().image(7).unwrap();
+        assert_eq!(image.animation().state, graphics::AnimationState::Running);
+        assert_eq!(image.frame(2).unwrap().gap_ms, 50);
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b_Gi=7;OK\x1b\\\x1b_Gi=7,r=2;OK\x1b\\");
+        // A control on an idle image repaints at once, with no decode.
+        h.actions();
+        h.feed(b"\x1b_Ga=a,i=7,s=1\x1b\\");
+        assert!(
+            h.actions()
+                .iter()
+                .any(|action| matches!(action, VtEvent::RequestRepaint))
+        );
+        assert_eq!(image.animation().state, graphics::AnimationState::Stopped);
+        assert!(decodes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_frame_delete_queued_behind_a_decode_repaints_once_when_it_runs() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(
+            b"\x1b_Ga=t,f=24,s=1,v=1,i=7;AAAA\x1b\\\
+              \x1b_Ga=f,f=24,s=1,v=1,i=7;AAAA\x1b\\\
+              \x1b_Ga=d,d=f,i=7,r=1\x1b\\",
+        );
+        let repaints = |actions: &[VtEvent]| {
+            actions
+                .iter()
+                .filter(|action| matches!(action, VtEvent::RequestRepaint))
+                .count()
+        };
+        assert_eq!(repaints(&h.actions()), 0, "everything waits for the root");
+        let (ticket, _) = decodes.lock().unwrap().remove(0);
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        assert_eq!(repaints(&h.actions()), 1, "the root landed");
+        let (ticket, _) = decodes.lock().unwrap().remove(0);
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        assert_eq!(
+            repaints(&h.actions()),
+            1,
+            "the frame landed and the delete ran behind it: one repaint for both"
+        );
+        let image = graphics_state(&h).unwrap().image(7).unwrap();
+        assert_eq!(
+            image.frame_count(),
+            1,
+            "the root went, leaving frame 2 as the root"
+        );
+        h.feed(b"\x1b_Ga=p,i=99\x1b\\");
+        assert_eq!(
+            repaints(&h.actions()),
+            0,
+            "the delete's repaint is spent: an unrelated command announces nothing"
+        );
+        assert!(decodes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_or_silenced_decode_settles_its_slot_in_place() {
+        // `q=1` suppresses OK but still reports the failure, in order.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b[c\x1b_Ga=T,f=24,s=1,v=1,i=7,q=1;AAAA\x1b\\\x1b[16t");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(
+            out, b"\x1b[?62;c",
+            "what came before the transmit goes out at once"
+        );
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Err(graphics::GraphicsError::invalid("no")));
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[?62;c\x1b_Gi=7;EINVAL:no\x1b\\\x1b[6;18;9t");
+
+        // `q=2` says nothing either way, but the size report still waits.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=7,q=2;AAAA\x1b\\\x1b[16t");
+        assert!(!h.processor.has_replies());
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[6;18;9t");
+    }
+
+    #[test]
+    fn a_malformed_transmit_answers_at_once_and_asks_for_no_decode() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b[c\x1b_Ga=T,f=24,i=9;AAAA\x1b\\");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(
+            out,
+            b"\x1b[?62;c\x1b_Gi=9;EINVAL:packed pixel data needs non-zero s and v\x1b\\"
+        );
+        assert!(decodes.lock().unwrap().is_empty());
+        // A command without an id gets no reply at all.
+        h.feed(b"\x1b_Ga=T,f=24;AAAA\x1b\\");
+        assert!(!h.processor.has_replies());
+    }
+
+    #[test]
+    fn display_only_decodes_but_never_answers() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::DisplayOnly);
+        h.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AAAA\x1b\\\x1b[c");
+        let (ticket, _) = decodes.lock().unwrap().pop().expect("still decoded");
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert!(out.is_empty(), "{out:?}");
+        // Without a host nothing is decoded and nothing owed.
+        let mut h = harness();
+        h.processor.set_graphics_mode(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AAAA\x1b\\\x1b[c");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[?62;c");
+    }
+
+    #[test]
+    fn a_query_without_an_id_is_refused_without_a_decode() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b_Ga=q,f=24,s=1,v=1;AAAA\x1b\\\x1b[c");
+        assert!(decodes.lock().unwrap().is_empty(), "nothing to answer for");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[?62;c", "and nothing holds DA1 back");
+        // An image number is no id: kitty refuses that query the same way.
+        h.feed(b"\x1b_Ga=q,f=24,s=1,v=1,I=3;AAAA\x1b\\\x1b[c");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[?62;c");
+        // With an id it is checked and answered at once, still without a
+        // decode.
+        h.feed(b"\x1b_Ga=q,f=24,s=1,v=1,i=3;AAAA\x1b\\\x1b[c");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b_Gi=3;OK\x1b\\\x1b[?62;c");
+        assert!(decodes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_indexed_format_probe_gets_kitty_s_answer() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"\x1b_Ga=q,i=31,s=1,v=1,f=8;AA==\x1b\\");
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b_Gi=31;EINVAL:Unknown image format: 8\x1b\\");
+        assert!(decodes.lock().unwrap().is_empty());
+    }
+
+    // --- placements through the processor ---
+
+    /// The placements a line's inline objects carry, downcast as the UI's
+    /// resolver does.
+    fn placements_of(line: &super::StyledLine) -> Vec<Arc<graphics::Placement>> {
+        line.objects
+            .iter()
+            .flat_map(|objects| objects.iter())
+            .map(|object| {
+                object
+                    .resource
+                    .clone()
+                    .downcast::<graphics::Placement>()
+                    .expect("a graphics placement")
+            })
+            .collect()
+    }
+
+    fn graphics_state(h: &Harness) -> Option<&graphics::GraphicsState> {
+        h.processor.graphics.as_deref()
+    }
+
+    /// `ESC _ G <keys> ; <base64 of len zero bytes> ESC \`.
+    fn transmit(keys: &str, len: usize) -> Vec<u8> {
+        format!(
+            "\x1b_G{keys};{}\x1b\\",
+            graphics::encode_payload(&vec![0; len])
+        )
+        .into_bytes()
+    }
+
+    /// Share a whole-pixel cell of `width` x `height` with the processor.
+    fn with_cell(h: &mut Harness, width: u16, height: u16) {
+        use crate::responders::pack_dims;
+        use std::sync::atomic::AtomicU32;
+        h.processor.set_terminal_geometry(
+            Arc::new(AtomicU32::new(pack_dims(80, 24))),
+            Arc::new(AtomicU32::new(pack_dims(
+                width * graphics::CELL_FIXED_SCALE,
+                height * graphics::CELL_FIXED_SCALE,
+            ))),
+        );
+    }
+
+    #[test]
+    fn a_transmit_and_display_lands_as_an_inline_object_at_the_cursor() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        h.feed(b"ab");
+        h.feed(&transmit("a=T,i=1,p=2,f=24,s=25,v=30", 25 * 30 * 3));
+        h.feed(b"cd\n");
+        let actions = h.actions();
+        let line = &committed_lines(&actions)[0];
+        assert_eq!(
+            line.text, "ab   cd",
+            "25 px over 10 px cells: three columns"
+        );
+        assert_eq!(line.raw(), Some("abcd"));
+        let objects = line.objects.as_ref().expect("one object");
+        assert_eq!(objects[0].range, 2..5);
+        assert_eq!(objects[0].baseline, Baseline::LastRow);
+        let placement = placements_of(line).pop().unwrap();
+        assert_eq!((placement.id, placement.image.id), (2, 1));
+        assert_eq!(
+            (placement.geometry.columns, placement.geometry.rows),
+            (3, 2)
+        );
+        assert_eq!(placement.image.data(), graphics::ImageData::Pending);
+        // The decode lands: the record is ready and the reply goes out.
+        let (ticket, request) = decodes.lock().unwrap().pop().unwrap();
+        assert_eq!((request.width, request.height), (25, 30));
+        h.processor.graphics_decode_complete(
+            ticket,
+            Ok(graphics::DecodedPixels {
+                width: 25,
+                height: 30,
+                rgba: vec![0; 25 * 30 * 4].into(),
+            }),
+        );
+        assert!(placement.pixels().is_some());
+        assert!(matches!(h.actions().last(), Some(VtEvent::RequestRepaint)));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b_Gi=1,p=2;OK\x1b\\");
+    }
+
+    #[test]
+    fn a_chunked_upload_lands_at_the_final_chunk_s_cursor() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(b"abc\x1b_Ga=T,i=1,f=24,s=2,v=1,m=1;AAAA\x1b\\def");
+        h.feed(b"\x1b_Gm=0;AAAA\x1b\\ghi\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, "abcdef ghi");
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 6..7);
+        assert_eq!(decodes.lock().unwrap()[0].1.data, [0; 6]);
+    }
+
+    #[test]
+    fn placements_use_the_reported_cell_or_the_fallback() {
+        let (mut h, _) = hosted(graphics::GraphicsMode::Full);
+        h.feed(&transmit("a=T,f=24,s=18,v=36", 18 * 36 * 3));
+        h.feed(b"|\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, "  |", "no cell reported yet: 9x18");
+        assert_eq!(placements_of(line)[0].geometry.rows, 2);
+        with_cell(&mut h, 6, 12);
+        h.feed(&transmit("a=T,f=24,s=18,v=36", 18 * 36 * 3));
+        h.feed(b"|\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, "   |");
+        assert_eq!(placements_of(line)[0].geometry.rows, 3);
+    }
+
+    #[test]
+    fn display_only_shows_placements_and_answers_nothing() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::DisplayOnly);
+        h.feed(&transmit("a=T,i=1,f=24,s=1,v=1", 3));
+        h.feed(b"\x1b_Ga=p,i=1\x1b\\\x1b_Ga=p,i=9\x1b\\\x1b_Ga=q,i=2,e=T\x1b\\\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(placements_of(line).len(), 2);
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn without_display_or_a_host_commands_are_parsed_and_dropped() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Off);
+        h.feed(&transmit("a=T,i=1,f=24,s=1,v=1", 3));
+        h.feed(b"x\x1b_Ga=q,i=2,e=T\x1b\\\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!((line.text.as_str(), line.objects.is_none()), ("x", true));
+        assert!(decodes.lock().unwrap().is_empty());
+        assert!(graphics_state(&h).is_none(), "no state is ever created");
+
+        let mut h = harness();
+        h.processor.set_graphics_mode(graphics::GraphicsMode::Full);
+        h.feed(&transmit("a=T,i=1,f=24,s=1,v=1", 3));
+        h.feed(b"x\x1b_Ga=q,i=2,e=T\x1b\\\x1b[c\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!((line.text.as_str(), line.objects.is_none()), ("x", true));
+        assert!(graphics_state(&h).is_none());
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert_eq!(out, b"\x1b[?62;c", "a client sees no graphics support");
+    }
+
+    #[test]
+    fn the_spec_s_detection_probe_gets_its_answers_in_order() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let out = replies_after(
+            &mut h,
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
+              \x1b_Ga=q,i=32,e=T,U=1\x1b\\\
+              \x1b_Ga=q,i=33,e=f\x1b\\\
+              \x1b[c",
+        );
+        assert_eq!(
+            out, b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32,e=T,U=1;OK\x1b\\\x1b_Gi=33,e=f;OK\x1b\\\x1b[?62;c",
+            "U=1 is echoed: the client's check for placeholder support; e=f: for animation"
+        );
+        assert!(decodes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_upload_cut_short_by_can_is_refused_rather_than_decoded() {
+        // CAN ends the APC early, and vtparse dispatches what arrived.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let out = replies_after(&mut h, b"\x1b_Ga=T,i=4,f=24,s=2,v=1;AAAA\x18x\n");
+        assert_eq!(
+            out,
+            b"\x1b_Gi=4;ENODATA:Insufficient image data: 3 < 6\x1b\\"
+        );
+        assert!(decodes.lock().unwrap().is_empty());
+        assert_eq!(committed_lines(&h.actions())[0].text, "x");
+    }
+
+    #[test]
+    fn an_oversized_command_on_a_session_without_graphics_state_allocates_none() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let mut bytes = b"\x1b_Ga=T,i=1,f=24,s=100,v=100;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', 9000));
+        bytes.extend_from_slice(b"\x1b\\x\n");
+        let out = replies_after(&mut h, &bytes);
+        assert!(out.is_empty(), "not worth a state to refuse: {out:?}");
+        assert!(graphics_state(&h).is_none());
+        assert!(decodes.lock().unwrap().is_empty());
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, "x");
+        assert_eq!(line.raw(), Some("x"), "but still cut out of raw");
+    }
+
+    #[test]
+    fn a_batch_of_transmits_is_placed_and_answered_whole() {
+        // Decodes report back only between read batches: one batch of a
+        // hundred icons must not lose any to a bound on decodes in flight.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let mut bytes = Vec::new();
+        for id in 1..=100 {
+            bytes.extend_from_slice(&transmit(&format!("a=T,i={id},f=24,s=1,v=1"), 3));
+            bytes.push(b'\n');
+        }
+        h.feed(&bytes);
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines.len(), 100);
+        assert!(lines.iter().all(|line| placements_of(line).len() == 1));
+        let requested: Vec<_> = std::mem::take(&mut *decodes.lock().unwrap());
+        assert_eq!(requested.len(), 100);
+        assert!(!h.processor.has_replies());
+        for (ticket, _) in requested {
+            h.processor
+                .graphics_decode_complete(ticket, Ok(one_pixel()));
+        }
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        let expected: Vec<u8> = (1..=100)
+            .flat_map(|id| format!("\x1b_Gi={id};OK\x1b\\").into_bytes())
+            .collect();
+        assert_eq!(out, expected);
+        assert!(
+            lines
+                .iter()
+                .all(|line| placements_of(line)[0].pixels().is_some())
+        );
+    }
+
+    #[test]
+    fn a_put_on_a_full_line_is_refused_and_the_next_line_takes_it() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(&transmit("a=t,i=1,f=24,s=1,v=1", 3));
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        for _ in 0..MAX_INLINE_OBJECTS {
+            h.processor
+                .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+                .unwrap();
+        }
+        let out = replies_after(&mut h, b"\x1b_Ga=p,i=1,p=65\x1b\\\n");
+        assert_eq!(
+            out,
+            b"\x1b_Gi=1,p=65;ENOSPC:too many placements on this line\x1b\\"
+        );
+        let full = &committed_lines(&h.actions())[0];
+        assert_eq!(full.objects.as_ref().unwrap().len(), MAX_INLINE_OBJECTS);
+        assert_eq!(full.text.len(), MAX_INLINE_OBJECTS, "no placeholder for it");
+        let out = replies_after(&mut h, b"\x1b_Ga=p,i=1,p=66\x1b\\\n");
+        assert_eq!(out, b"\x1b_Gi=1,p=66;OK\x1b\\");
+        let next = &committed_lines(&h.actions())[0];
+        assert_eq!(placements_of(next)[0].id, 66);
+    }
+
+    #[test]
+    fn a_pending_overprint_makes_room_on_a_full_line() {
+        // Sixty-four placements, `\r`, then a put: the overprint restarts the
+        // line, so the put has the whole line and is not refused for the
+        // frame it replaces.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        h.feed(&transmit("a=t,i=1,f=24,s=1,v=1", 3));
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        for _ in 0..MAX_INLINE_OBJECTS {
+            h.processor
+                .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+                .unwrap();
+        }
+        h.feed(b"\r");
+        let out = replies_after(&mut h, b"\x1b_Ga=p,i=1,p=65\x1b\\\n");
+        assert_eq!(out, b"\x1b_Gi=1,p=65;OK\x1b\\");
+        let line = &committed_lines(&h.actions())[0];
+        let placements = placements_of(line);
+        assert_eq!(placements.len(), 1, "the superseded frame's objects went");
+        assert_eq!(placements[0].id, 65);
+        assert_eq!(line.text, " ", "one placeholder column");
+    }
+
+    #[test]
+    fn switching_graphics_off_silences_what_is_owed_and_keeps_what_is_shown() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        // A placement whose image is still decoding, DA1 queued behind the
+        // transmit's reply, and an upload half way through.
+        h.feed(&transmit("a=T,i=1,f=24,s=1,v=1", 3));
+        h.feed(b"\n\x1b[c\x1b_Ga=T,i=2,f=24,s=2,v=1,m=1;AAAA\x1b\\");
+        assert!(graphics_state(&h).unwrap().upload_in_flight());
+        assert!(!h.processor.has_replies());
+        h.processor.set_graphics_mode(graphics::GraphicsMode::Off);
+        assert!(
+            !graphics_state(&h).unwrap().upload_in_flight(),
+            "the upload is abandoned"
+        );
+        // Its final chunk is dropped unseen, and the command after it too.
+        h.feed(b"\x1b_Gm=0;AAAA\x1b\\");
+        h.feed(&transmit("a=T,i=3,f=24,s=1,v=1", 3));
+        h.feed(b"x\n");
+        let lines = committed_lines(&h.actions());
+        let shown = placements_of(&lines[0])
+            .pop()
+            .expect("placed before the switch");
+        assert_eq!(
+            (lines[1].text.as_str(), lines[1].objects.is_none()),
+            ("x", true)
+        );
+        assert_eq!(decodes.lock().unwrap().len(), 1, "only image 1 was decoded");
+        // The decode in flight lands — the placement made before the switch
+        // fills in — and nothing is written for it or for the DA1 behind it.
+        let (ticket, _) = decodes.lock().unwrap().pop().unwrap();
+        h.processor
+            .graphics_decode_complete(ticket, Ok(one_pixel()));
+        assert!(shown.pixels().is_some());
+        assert!(!h.processor.has_replies());
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+        assert!(out.is_empty(), "{out:?}");
+        let state = graphics_state(&h).unwrap();
+        assert_eq!(state.decodes_in_flight(), 0);
+        assert!(state.image(3).is_none(), "nothing stored while off");
+        // Back on, the table is where it was and the queue flows.
+        h.processor.set_graphics_mode(graphics::GraphicsMode::Full);
+        let out = replies_after(&mut h, b"\x1b_Ga=p,i=1,p=4\x1b\\\x1b[c");
+        assert_eq!(out, b"\x1b_Gi=1,p=4;OK\x1b\\\x1b[?62;c");
+    }
+
+    #[test]
+    fn an_oversized_chunk_abandons_the_upload_and_is_refused() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        let mut bytes = b"\x1b_Ga=T,i=1,f=24,s=100,v=100,m=1;AAAA\x1b\\\x1b_Gm=1;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', 9000));
+        bytes.extend_from_slice(b"\x1b\\\x1b_Gm=0;AAAA\x1b\\done\n");
+        let out = replies_after(&mut h, &bytes);
+        assert_eq!(
+            out,
+            b"\x1b_Gi=1;EINVAL:graphics command exceeds the size limit\x1b\\"
+        );
+        assert!(decodes.lock().unwrap().is_empty());
+        let state = graphics_state(&h).unwrap();
+        assert!(!state.upload_in_flight() && state.image(1).is_none());
+        assert_eq!(committed_lines(&h.actions())[0].text, "done");
+    }
+
+    #[test]
+    fn a_delete_leaves_the_placement_s_box_in_its_line() {
+        let (mut h, _) = hosted(graphics::GraphicsMode::Full);
+        h.feed(&transmit("a=T,i=1,f=24,s=9,v=18", 9 * 18 * 3));
+        h.feed(b"x\n");
+        let line = &committed_lines(&h.actions())[0];
+        h.feed(b"\x1b_Ga=d,d=I,i=1\x1b\\");
+        let placement = placements_of(line).pop().unwrap();
+        assert!(placement.is_deleted() && placement.image.is_evicted());
+        assert_eq!(line.text, " x", "nothing reflows");
+    }
+
+    // --- objects born on the socket thread ---
+
+    fn objects_of(line: &super::StyledLine) -> Vec<(u64, std::ops::Range<usize>)> {
+        line.objects.as_ref().map_or_else(Vec::new, |objects| {
+            objects.iter().map(|o| (o.id, o.range.clone())).collect()
+        })
+    }
+
+    fn partial_lines(actions: &[VtEvent]) -> Vec<Arc<super::StyledLine>> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                VtEvent::HandleIncomingPartialLine(line) => Some(line.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fragmented(actions: &[VtEvent]) -> (Arc<super::StyledLine>, Arc<super::StyledLine>) {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                VtEvent::HandleIncomingFragmentedLine {
+                    line,
+                    completion_fragment,
+                } => Some((line.clone(), completion_fragment.clone())),
+                _ => None,
+            })
+            .expect("a fragmented completion")
+    }
+
+    #[test]
+    fn an_object_attached_mid_line_keeps_its_identity_across_a_batch_split() {
+        let mut h = harness();
+        h.feed(b"abc");
+        let id = h
+            .processor
+            .attach_inline_object(3, Arc::new(()), Baseline::LastRow)
+            .expect("under the cap");
+        h.feed(b"def");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"ghi\n");
+        let actions = h.actions();
+        assert_eq!(
+            transcript(&actions),
+            ["partial:abc   def", "line:abc   defghi"]
+        );
+        let partial = &partial_lines(&actions)[0];
+        assert_eq!(objects_of(partial), [(id, 3..6)]);
+        assert_eq!(
+            partial.objects.as_ref().unwrap()[0].baseline,
+            Baseline::LastRow,
+            "a placement's text sits on its last row"
+        );
+        assert_eq!(
+            partial.raw(),
+            Some("abcdef"),
+            "placeholders stay out of raw"
+        );
+        let (line, completion) = fragmented(&actions);
+        assert_eq!(
+            objects_of(&line),
+            [(id, 3..6)],
+            "the join keeps the object's id and range"
+        );
+        assert!(
+            completion.objects.is_none(),
+            "the completion fragment carries only the new text"
+        );
+        assert_eq!(line.raw(), Some("abcdefghi"));
+    }
+
+    #[test]
+    fn an_object_in_a_prompt_snapshot_stays_with_the_prompt_row() {
+        let mut h = harness();
+        h.feed(b"HP> ");
+        let id = h
+            .processor
+            .attach_inline_object(2, Arc::new(()), Baseline::LastRow)
+            .unwrap();
+        h.processor.commit_prompt();
+        h.feed(b"look\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:HP>   ", "line:look"]);
+        assert!(actions.iter().any(|a| matches!(a, VtEvent::PromptBoundary)));
+        assert_eq!(objects_of(&partial_lines(&actions)[0]), [(id, 4..6)]);
+        let committed = committed_lines(&actions);
+        assert!(
+            committed[0].objects.is_none(),
+            "the next logical line starts without the prompt's object"
+        );
+    }
+
+    #[test]
+    fn a_zero_column_anchor_still_flushes_as_a_partial_line() {
+        // A `C=1` placement is a zero-size anchor: no text, but a line.
+        let mut h = harness();
+        let id = h
+            .processor
+            .attach_inline_object(0, Arc::new(()), Baseline::LastRow)
+            .unwrap();
+        h.processor.notify_end_of_buffer();
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["partial:"]);
+        assert_eq!(objects_of(&partial_lines(&actions)[0]), [(id, 0..0)]);
+    }
+
+    #[test]
+    fn a_carriage_return_overprint_drops_the_superseded_frame_s_objects() {
+        let mut h = harness();
+        h.feed(b"10%");
+        h.processor
+            .attach_inline_object(2, Arc::new(()), Baseline::LastRow)
+            .unwrap();
+        h.feed(b"\r20%\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["retract", "line:20%"]);
+        assert!(committed_lines(&actions)[0].objects.is_none());
+        // A placement arriving after the `\r` restarts the frame itself.
+        let mut h = harness();
+        h.feed(b"10%\r");
+        let id = h
+            .processor
+            .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+            .unwrap();
+        h.feed(b"x\n");
+        let actions = h.actions();
+        assert_eq!(transcript(&actions), ["retract", "line: x"]);
+        assert_eq!(objects_of(&committed_lines(&actions)[0]), [(id, 0..1)]);
+    }
+
+    #[test]
+    fn the_per_line_cap_holds_per_fragment_and_the_join_keeps_the_newest() {
+        let mut h = harness();
+        for _ in 0..MAX_INLINE_OBJECTS {
+            assert!(
+                h.processor
+                    .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+                    .is_some()
+            );
+        }
+        assert!(
+            h.processor
+                .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+                .is_none(),
+            "the cap refuses a 65th object on one fragment"
+        );
+        h.processor.notify_end_of_buffer();
+        // A later batch starts a fresh count on the same logical line...
+        let late = h
+            .processor
+            .attach_inline_object(1, Arc::new(()), Baseline::LastRow)
+            .unwrap();
+        h.feed(b"\n");
+        let actions = h.actions();
+        let first = objects_of(&partial_lines(&actions)[0])[0].0;
+        let (line, _) = fragmented(&actions);
+        let joined = objects_of(&line);
+        // ...and the join trims the OLDEST back down to the cap.
+        assert_eq!(joined.len(), MAX_INLINE_OBJECTS);
+        assert_eq!(joined.last().map(|o| o.0), Some(late));
+        assert!(joined.iter().all(|o| o.0 != first));
+    }
+
+    #[test]
+    fn graphics_commands_do_not_disturb_styles_or_links() {
+        let mut h = harness();
+        h.feed(b"\x1b[31mred\x1b_Ga=T,f=100;iVBORw0KGgo=\x1b\\still red\x1b[0m\n");
+        let lines = committed_lines(&h.actions());
+        let mut plain = harness();
+        plain.feed(b"\x1b[31mredstill red\x1b[0m\n");
+        let baseline = committed_lines(&plain.actions());
+        assert_eq!(lines[0].text, "redstill red");
+        assert_eq!(
+            lines[0].spans, baseline[0].spans,
+            "styling as if no APC arrived"
+        );
+        assert_eq!(lines[0].raw(), Some("\x1b[31mredstill red\x1b[0m"));
+    }
+
+    // --- anchors, layers and line sequence numbers ---
+
+    /// Image 1, ready: 20x40 px, two 10x20 cells tall and two wide.
+    fn ready_image(h: &mut Harness, decodes: &Decodes, id: u32, (width, height): (u32, u32)) {
+        h.feed(&transmit(
+            &format!("a=t,i={id},f=24,s={width},v={height}"),
+            (width * height * 3) as usize,
+        ));
+        let (ticket, _) = decodes.lock().unwrap().pop().expect("a decode");
+        h.processor.graphics_decode_complete(
+            ticket,
+            Ok(graphics::DecodedPixels {
+                width,
+                height,
+                rgba: vec![0; (width * height * 4) as usize].into(),
+            }),
+        );
+        let mut out = Vec::new();
+        h.processor.drain_replies(&mut out);
+    }
+
+    #[test]
+    fn cursor_keeping_and_negative_z_placements_attach_as_anchors() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        ready_image(&mut h, &decodes, 1, (20, 40));
+        h.feed(b"ab\x1b_Ga=p,i=1,C=1\x1b\\cd\x1b_Ga=p,i=1,z=-3\x1b\\ef\x1b_Ga=p,i=1,z=2\x1b\\gh\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(
+            line.text, "abcdef  gh",
+            "anchors take no cells; z=2 takes its two"
+        );
+        let objects = line.objects.as_ref().unwrap();
+        assert_eq!(objects.len(), 3);
+        let kept = &objects[0];
+        assert_eq!(kept.range, 2..2, "an empty range at the cursor");
+        assert_eq!(kept.baseline, Baseline::Centered, "no riser");
+        assert_eq!(
+            kept.paint_outset, 40,
+            "the box: 2x2 cells of 10x20 is 20 by 40"
+        );
+        assert_eq!((kept.layer, kept.z), (Layer::Over, 0));
+        let under = &objects[1];
+        assert_eq!(under.range, 4..4);
+        assert_eq!((under.layer, under.z), (Layer::Under, -3));
+        assert_eq!(under.baseline, Baseline::Centered);
+        let over = &objects[2];
+        assert_eq!(over.range, 6..8);
+        assert_eq!((over.layer, over.z), (Layer::Over, 2));
+        assert_eq!(over.baseline, Baseline::LastRow);
+        let placements = placements_of(line);
+        assert!(placements[0].anchored && placements[1].anchored && !placements[2].anchored);
+        assert_eq!(placements[0].column, 2);
+        assert_eq!(placements[2].column, 6);
+    }
+
+    #[test]
+    fn placements_carry_the_sequence_number_of_their_line() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        ready_image(&mut h, &decodes, 1, (1, 1));
+        h.feed(b"one\ntwo\n");
+        h.feed(b"HP> ");
+        h.processor.commit_prompt();
+        h.feed(b"\x1b_Ga=p,i=1\x1b\\");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\x1b_Ga=p,i=1\x1b\\\n");
+        let actions = h.actions();
+        let (line, _) = fragmented(&actions);
+        let placements = placements_of(&line);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(
+            (placements[0].line_seq, placements[1].line_seq),
+            (3, 3),
+            "two commits and a prompt before it; a partial flush is the same line"
+        );
+        assert_eq!((placements[0].column, placements[1].column), (0, 1));
+        // A delete at the cursor: the second placement ended at the cursor,
+        // so neither is under it; an anchor there is.
+        h.feed(b"\x1b_Ga=p,i=1,C=1\x1b\\\x1b_Ga=d,d=c\x1b\\x\n");
+        let line = &committed_lines(&h.actions())[0];
+        let anchor = placements_of(line).pop().unwrap();
+        assert!(anchor.is_deleted());
+        assert!(!placements[0].is_deleted() && !placements[1].is_deleted());
+        assert_eq!(anchor.line_seq, 4);
+    }
+
+    #[test]
+    fn a_placement_after_a_partial_flush_sits_past_the_flushed_text() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        ready_image(&mut h, &decodes, 1, (10, 20));
+        h.feed(b"abc");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"de\x1b_Ga=p,i=1\x1b\\\n");
+        let actions = h.actions();
+        let (line, completion) = fragmented(&actions);
+        assert_eq!(line.text, "abcde ");
+        assert_eq!(
+            placements_of(&completion).pop().unwrap().column,
+            5,
+            "three characters flushed and two in the buffer"
+        );
+        // Every flush adds its fragment.
+        h.feed(b"xy");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"z");
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\x1b_Ga=p,i=1\x1b\\\n");
+        let (line, completion) = fragmented(&h.actions());
+        assert_eq!(line.text, "xyz ");
+        assert_eq!(placements_of(&completion).pop().unwrap().column, 3);
+    }
+
+    // --- unicode placeholders ---
+
+    const CELL: &str = "\u{10EEEE}";
+    /// The diacritics for 0, 1 and 2.
+    const D0: &str = "\u{0305}";
+    const D1: &str = "\u{030D}";
+    const D2: &str = "\u{030E}";
+
+    /// Image `id` of `size`, ready, with a virtual placement of `keys`.
+    fn virtual_image(h: &mut Harness, decodes: &Decodes, id: u32, size: (u32, u32), keys: &str) {
+        ready_image(h, decodes, id, size);
+        h.feed(format!("\x1b_Ga=p,U=1,i={id},q=2,{keys}\x1b\\").as_bytes());
+    }
+
+    fn sources(line: &super::StyledLine) -> Vec<graphics::SourceRect> {
+        placements_of(line)
+            .iter()
+            .map(|p| p.geometry.source)
+            .collect()
+    }
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> graphics::SourceRect {
+        graphics::SourceRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn the_spec_s_two_by_two_placeholder_shows_the_image_in_a_grid() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        // A 20x40 image fills a 2x2 box of 10x20 cells exactly.
+        virtual_image(&mut h, &decodes, 42, (20, 40), "c=2,r=2");
+        let first = format!("\x1b[38;5;42m{CELL}{D0}{D0}{CELL}{D0}{D1}\x1b[39m\n");
+        let second = format!("\x1b[38;5;42m{CELL}{D1}{D0}{CELL}{D1}{D1}\x1b[39m\n");
+        h.feed(first.as_bytes());
+        h.feed(second.as_bytes());
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines.len(), 2);
+        let texts = [
+            format!("{CELL}{D0}{D0}{CELL}{D0}{D1}"),
+            format!("{CELL}{D1}{D0}{CELL}{D1}{D1}"),
+        ];
+        for ((line, y), text) in lines.iter().zip([0, 20]).zip(&texts) {
+            assert_eq!(&line.text, text, "placeholder text stays");
+            let objects = line.objects.as_ref().expect("one run");
+            assert_eq!(objects.len(), 1);
+            assert_eq!(
+                objects[0].range,
+                0..16,
+                "both cells: placeholder plus two diacritics each"
+            );
+            assert_eq!(objects[0].baseline, Baseline::Centered);
+            assert_eq!((objects[0].layer, objects[0].z), (Layer::Over, 0));
+            let placement = &placements_of(line)[0];
+            assert!(placement.placeholder);
+            assert_eq!(
+                (placement.geometry.columns, placement.geometry.rows),
+                (2, 1)
+            );
+            assert_eq!(placement.geometry.source, rect(0, y, 20, 20), "row {y}");
+            assert_eq!(
+                placement.geometry.fit,
+                graphics::Fit::Box {
+                    columns: 2,
+                    rows: 1
+                }
+            );
+            assert!(placement.pixels().is_some());
+            assert_eq!(
+                (placement.line_seq, placement.column),
+                (u64::from(y != 0), 0)
+            );
+        }
+        assert!(
+            lines[0].raw().unwrap().contains(CELL),
+            "and so does the raw text"
+        );
+        assert!(!h.processor.has_replies(), "q=2 on the virtual placement");
+    }
+
+    #[test]
+    fn the_third_diacritic_names_the_image_id_s_high_byte() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42 + (2 << 24), (20, 40), "c=2,r=2");
+        let line = format!("\x1b[38;5;42m{CELL}{D0}{D0}{D2}{CELL}{D0}{D1}{D2}\n");
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let placement = &placements_of(line)[0];
+        assert_eq!(placement.image.id, 42 + (2 << 24));
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 0..20);
+        // Without the high byte, image 42 does not exist: the cells stay text.
+        let plain = format!("\x1b[38;5;42m{CELL}{D0}{D0}{CELL}{D0}{D1}\n");
+        h.feed(plain.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        assert!(line.objects.is_none());
+    }
+
+    #[test]
+    fn row_only_cells_continue_the_run_to_the_right() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        // 2 rows by 3 columns, one row diacritic per line.
+        virtual_image(&mut h, &decodes, 42, (30, 40), "c=3,r=2");
+        let first = format!("\x1b[38;5;42m{CELL}{D0}{CELL}{CELL}\n");
+        let second = format!("\x1b[38;5;42m{CELL}{D1}{CELL}{CELL}\n");
+        h.feed(first.as_bytes());
+        h.feed(second.as_bytes());
+        let lines = committed_lines(&h.actions());
+        assert_eq!(sources(&lines[0]), [rect(0, 0, 30, 20)]);
+        assert_eq!(sources(&lines[1]), [rect(0, 20, 30, 20)]);
+        assert_eq!(lines[1].objects.as_ref().unwrap()[0].range, 0..14);
+        assert_eq!(placements_of(&lines[1])[0].geometry.columns, 3);
+    }
+
+    #[test]
+    fn runs_break_at_colour_changes_text_and_unknown_ids() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (30, 40), "c=3,r=2");
+        virtual_image(&mut h, &decodes, 43, (30, 40), "c=3,r=2");
+        // Two cells of 42, one of 43, text, then a cell of 42 again, and a
+        // cell of an image that does not exist.
+        let line = format!(
+            "\x1b[38;5;42m{CELL}{D0}{CELL}\x1b[38;5;43m{CELL}{D1}{D2}\x1b[38;5;42m-{CELL}{D1}{D1}\x1b[38;5;99m{CELL}{D0}\x1b[m\n"
+        );
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let objects = line.objects.as_ref().unwrap();
+        let placements = placements_of(line);
+        assert_eq!(
+            placements.len(),
+            3,
+            "image 99 has no virtual placement: text"
+        );
+        assert_eq!(
+            objects.iter().map(|o| o.range.clone()).collect::<Vec<_>>(),
+            [0..10, 10..18, 19..27]
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.image.id).collect::<Vec<_>>(),
+            [42, 43, 42]
+        );
+        assert_eq!(
+            sources(line),
+            [
+                rect(0, 0, 20, 20),
+                rect(20, 20, 10, 20),
+                rect(10, 20, 10, 20)
+            ]
+        );
+        assert_eq!(placements[2].column, 4, "after the dash");
+    }
+
+    #[test]
+    fn the_underline_colour_names_the_virtual_placement() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (20, 40), "c=2,r=2,p=5");
+        h.feed(b"\x1b_Ga=p,U=1,i=42,c=1,r=1,p=6,q=2\x1b\\");
+        // Placement 5 is 2x2: row 1 exists. Placement 6 is 1x1: row 1 is
+        // outside it. No underline colour: the newest, 6.
+        let line = format!(
+            "\x1b[38;5;42;58;5;5m{CELL}{D1}{D0}\x1b[58;5;6m{CELL}{D1}{D0}\x1b[59m{CELL}{D0}{D0}\x1b[58;2;0;0;7m{CELL}{D0}{D0}\x1b[m\n"
+        );
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let placements = placements_of(line);
+        assert_eq!(
+            placements.len(),
+            2,
+            "placement 6 has no row 1; placement 7 does not exist"
+        );
+        assert_eq!(
+            sources(line),
+            [rect(0, 20, 10, 20), rect(0, 0, 20, 40)],
+            "one cell of the 2x2 placement 5, then the whole image in the 1x1 placement 6"
+        );
+        let objects = line.objects.as_ref().unwrap();
+        assert_eq!(
+            objects.iter().map(|o| o.range.clone()).collect::<Vec<_>>(),
+            [0..8, 16..24]
+        );
+    }
+
+    #[test]
+    fn direct_and_named_foreground_colours_carry_the_image_id_too() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 0x0001_0203, (10, 20), "c=1,r=1");
+        virtual_image(&mut h, &decodes, 1, (10, 20), "c=1,r=1");
+        virtual_image(&mut h, &decodes, 9, (10, 20), "c=1,r=1");
+        // A 256-colour index that the palette maps to RGB still means itself.
+        virtual_image(&mut h, &decodes, 200, (10, 20), "c=1,r=1");
+        let line = format!(
+            "\x1b[38;2;1;2;3m{CELL}{D0}{D0} \x1b[31m{CELL}{D0}{D0} \x1b[91m{CELL}{D0}{D0} \x1b[38;5;200m{CELL}{D0}{D0} \x1b[39m{CELL}{D0}{D0}\n"
+        );
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(
+            placements_of(line)
+                .iter()
+                .map(|p| p.image.id)
+                .collect::<Vec<_>>(),
+            [0x0001_0203, 1, 9, 200],
+            "the default foreground is id 0: no image"
+        );
+    }
+
+    #[test]
+    fn placeholders_printed_before_a_virtual_placement_exists_stay_text() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        ready_image(&mut h, &decodes, 42, (10, 20));
+        let cell = format!("\x1b[38;5;42m{CELL}{D0}{D0}");
+        h.feed(cell.as_bytes());
+        // The virtual placement arrives mid-line: the cell before it was
+        // printed as text and stays so; one printed after it is a run.
+        h.feed(b"\x1b_Ga=p,U=1,i=42,c=1,r=1,q=2\x1b\\");
+        h.feed(cell.as_bytes());
+        h.feed(b"\n");
+        let line = &committed_lines(&h.actions())[0];
+        let objects = line.objects.as_ref().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].range, 8..16);
+        // Without a host, or with graphics off, placeholders are text.
+        h.processor.set_graphics_mode(graphics::GraphicsMode::Off);
+        h.feed(cell.as_bytes());
+        h.feed(b"\n");
+        assert!(committed_lines(&h.actions())[0].objects.is_none());
+        let mut plain = harness();
+        plain.feed(cell.as_bytes());
+        plain.feed(b"\n");
+        let line = &committed_lines(&plain.actions())[0];
+        assert!(line.objects.is_none());
+        assert_eq!(line.text, format!("{CELL}{D0}{D0}"));
+    }
+
+    #[test]
+    fn placeholders_in_a_bulk_run_are_found_like_printed_ones() {
+        // The connection's byte loop hands Ground-state text over as runs
+        // (`print_run`), which is where a placeholder line nearly always
+        // arrives: right after its SGR.
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (20, 40), "c=2,r=2");
+        h.feed(b"\x1b[38;5;42m");
+        let run = format!("ab{CELL}{D1}{D0}{CELL}{D1}{D1}cd");
+        h.processor.print_run(&run);
+        h.feed(b"\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, run);
+        let objects = line.objects.as_ref().expect("one run");
+        assert_eq!(objects[0].range, 2..18);
+        assert_eq!(sources(line), [rect(0, 20, 20, 20)]);
+        assert_eq!(placements_of(line)[0].column, 2);
+        // An ASCII run never looks; a non-ASCII run without placeholders
+        // finds none.
+        h.processor.print_run("plain text");
+        h.processor.print_run("caf\u{e9}");
+        h.feed(b"\n");
+        assert!(committed_lines(&h.actions())[0].objects.is_none());
+        // Inside a link the per-character path takes the run, and still
+        // notes the placeholder.
+        h.feed(b"\x1b]8;;https://example.com\x1b\\");
+        h.processor.print_run(&run);
+        h.feed(b"\x1b]8;;\x1b\\\n");
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 2..18);
+    }
+
+    #[test]
+    fn a_run_split_by_a_batch_boundary_becomes_two_placements() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (20, 40), "c=2,r=2");
+        h.feed(format!("\x1b[38;5;42m{CELL}{D0}{D0}").as_bytes());
+        h.processor.notify_end_of_buffer();
+        h.feed(format!("{CELL}{D0}{D1}\n").as_bytes());
+        let actions = h.actions();
+        let partial = &partial_lines(&actions)[0];
+        assert_eq!(sources(partial), [rect(0, 0, 10, 20)]);
+        let (line, completion) = fragmented(&actions);
+        assert_eq!(sources(&completion), [rect(10, 0, 10, 20)]);
+        assert_eq!(sources(&line), [rect(0, 0, 10, 20), rect(10, 0, 10, 20)]);
+        assert_eq!(
+            line.objects
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|o| o.range.clone())
+                .collect::<Vec<_>>(),
+            [0..8, 8..16]
+        );
+    }
+
+    #[test]
+    fn three_combining_marks_belong_to_a_placeholder_cell_whatever_they_are() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42 + (1 << 24), (20, 20), "c=2,r=1");
+        // The first cell's column mark is a combining acute, which names
+        // nothing: the column is unknown (zero at a run's start), the id
+        // byte after it still reads, and the next cell is still adjacent.
+        let line = format!("\x1b[38;5;42m{CELL}{D0}\u{0301}{D1}{CELL}{D0}{D1}{D1}\n");
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let placements = placements_of(line);
+        assert_eq!(placements.len(), 1, "one run of two cells");
+        assert_eq!(placements[0].image.id, 42 + (1 << 24));
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 0..20);
+        assert_eq!(sources(line), [rect(0, 0, 20, 20)]);
+        // A fourth mark is the cell's too, and means nothing.
+        let line = format!("\x1b[38;5;42m{CELL}{D0}{D0}{D1}{D0}{CELL}{D0}{D1}{D1}\n");
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(placements_of(line).len(), 1);
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 0..22);
+    }
+
+    #[test]
+    fn style_changes_between_placeholder_cells_keep_the_run() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (30, 20), "c=3,r=1");
+        // Bold, then a background, between the cells: a run reads only the
+        // foreground and the underline colour, as kitty's does.
+        let line = format!(
+            "\x1b[38;5;42m{CELL}{D0}{D0}\x1b[1m{CELL}{D0}{D1}\x1b[48;5;3m{CELL}{D0}{D2}\x1b[m\n"
+        );
+        h.feed(line.as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(placements_of(line).len(), 1);
+        assert_eq!(line.objects.as_ref().unwrap()[0].range, 0..24);
+        assert_eq!(sources(line), [rect(0, 0, 30, 20)]);
+    }
+
+    #[test]
+    fn a_carriage_return_overprint_drops_the_frame_s_placeholders() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (10, 20), "c=1,r=1");
+        h.feed(format!("\x1b[38;5;42m{CELL}{D0}{D0}\rx\n").as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        assert_eq!(line.text, "x");
+        assert!(line.objects.is_none());
+        // Objects stay in line order when a run starts before an object
+        // attached at the cursor earlier.
+        h.feed(format!("{CELL}{D0}{D0}\x1b_Ga=p,i=42\x1b\\\n").as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let objects = line.objects.as_ref().unwrap();
+        assert_eq!(
+            objects.iter().map(|o| o.range.clone()).collect::<Vec<_>>(),
+            [0..8, 8..9]
+        );
+    }
+
+    #[test]
+    fn deleting_the_virtual_placement_takes_the_runs_in_the_lines() {
+        let (mut h, decodes) = hosted(graphics::GraphicsMode::Full);
+        with_cell(&mut h, 10, 20);
+        virtual_image(&mut h, &decodes, 42, (10, 20), "c=1,r=1,p=3");
+        h.feed(format!("\x1b[38;5;42m{CELL}{D0}{D0}\n").as_bytes());
+        let line = &committed_lines(&h.actions())[0];
+        let run = placements_of(line).pop().unwrap();
+        h.feed(b"\x1b_Ga=d,d=i,i=42,p=3\x1b\\");
+        assert!(run.is_deleted());
+        assert_eq!(
+            line.text,
+            format!("{CELL}{D0}{D0}"),
+            "the text is the client's"
+        );
+        // With the virtual placement gone the next line is text again.
+        h.feed(format!("{CELL}{D0}{D0}\n").as_bytes());
+        assert!(committed_lines(&h.actions())[0].objects.is_none());
     }
 }

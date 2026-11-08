@@ -4,6 +4,7 @@ use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use smudgy_cloud::{AtlasId, MapStorage};
+pub use smudgy_protocol::graphics::GraphicsMode;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -75,6 +76,21 @@ pub struct ServerConfig {
     /// On by default; off accepts any certificate (self-signed MUD ports — insecure).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub tls_verify: bool,
+    /// How this server's kitty graphics commands are treated: shown and
+    /// answered (the default), shown silently, or ignored. "Answered" also
+    /// covers the terminal queries (DA1, pixel-size reports) graphics-aware
+    /// servers send to detect support; a server that would mistake those
+    /// answers for typed commands wants `display_only`.
+    #[serde(default, skip_serializing_if = "is_default_graphics")]
+    pub graphics: GraphicsMode,
+    /// Let this server read images from local files and shared memory
+    /// (the graphics protocol's `t=f`, `t=t` and `t=s`); only honoured for
+    /// a loopback address. Off by default: a loopback address is not proof
+    /// the server runs on this machine (an SSH tunnel, a forwarded or
+    /// published port, another user's process bound to it), and a server
+    /// allowed this learns which files the user can read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graphics_local_files: bool,
     /// Binary Telnet over a secure WebSocket. Legacy host/port fields remain
     /// populated for server identity and backwards-compatible metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +107,11 @@ pub struct ServerConfig {
 
 const fn default_true() -> bool {
     true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // the signature serde's skip_serializing_if wants
+fn is_default_graphics(value: &GraphicsMode) -> bool {
+    *value == GraphicsMode::default()
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // the signature serde's skip_serializing_if wants
@@ -112,6 +133,8 @@ impl ServerConfig {
             mccp4_compression: None,
             tls: false,
             tls_verify: true,
+            graphics: GraphicsMode::Full,
+            graphics_local_files: false,
             wss_url: None,
             default_cloud_atlas: None,
             default_local_atlas: None,
@@ -852,5 +875,31 @@ mod link_trust_tests {
         config.tls = true;
         config.tls_verify = false;
         assert!(config.validate_transport().is_err());
+    }
+}
+
+#[cfg(test)]
+mod graphics_local_files_tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn local_files_are_off_by_default_and_stored_only_when_on() {
+        let config = ServerConfig::new("mud.example.org".to_owned(), 4000);
+        assert!(!config.graphics_local_files);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("graphics_local_files"), "{json}");
+        let parsed: ServerConfig =
+            serde_json::from_str(r#"{"host":"mud.example.org","port":4000}"#).unwrap();
+        assert!(
+            !parsed.graphics_local_files,
+            "a configuration written before the setting"
+        );
+
+        let mut config = config;
+        config.graphics_local_files = true;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""graphics_local_files":true"#), "{json}");
+        let parsed: ServerConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.graphics_local_files);
     }
 }

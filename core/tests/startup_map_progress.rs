@@ -47,6 +47,7 @@ async fn map_loading_progress_reaches_the_ui_before_the_cloud_answers() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })));
 
     tokio::time::timeout(Duration::from_secs(15), async {

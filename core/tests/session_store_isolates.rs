@@ -112,6 +112,7 @@ async fn run_session(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory));
@@ -924,6 +925,7 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
             package_client: None,
             extra_script_extensions: Arc::new(Vec::new),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         })
     };
 
@@ -1148,6 +1150,7 @@ async fn a_package_is_its_name_to_events_procedures_and_the_catalogue() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn_with_package_provider(
         params,

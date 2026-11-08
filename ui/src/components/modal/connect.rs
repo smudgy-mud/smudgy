@@ -12,7 +12,8 @@ use smudgy_core::models::profile::{
     ProfileCas, clear_profile_password_if_unchanged, has_profile_password,
 };
 use smudgy_core::models::server::{
-    ServerCas, link_url_host, load_server, update_server_if_unchanged, with_server_if_unchanged,
+    GraphicsMode, ServerCas, link_url_host, load_server, update_server_if_unchanged,
+    with_server_if_unchanged,
 };
 use smudgy_core::models::{profile::Profile, server::Server};
 use smudgy_session_model::connect::OpenSessions;
@@ -107,6 +108,8 @@ pub enum Message {
     ConfirmDeleteServer,                    // User confirms deletion
     // Server Form Interaction
     UpdateServerFormField(ServerFormField, String),
+    UpdateServerGraphics(GraphicsMode),
+    ToggleServerGraphicsLocalFiles(bool),
     ToggleServerCompression(bool),
     ToggleServerMccp4Compression(bool),
     ToggleServerTls(bool),
@@ -205,6 +208,12 @@ pub struct ServerConfigFormData {
     /// The encoding dropdown's display value; [`server::DEFAULT_ENCODING_CHOICE`]
     /// stands for "no override" (UTF-8, `ServerConfig::encoding = None`).
     pub encoding: String,
+    /// How the server's kitty graphics commands are treated (`ServerConfig::graphics`).
+    pub graphics: GraphicsMode,
+    /// Whether the server may send images from local files and shared memory
+    /// (`ServerConfig::graphics_local_files`). Kept while the graphics mode is
+    /// `Off`, where its checkbox is hidden.
+    pub graphics_local_files: bool,
     /// Whether inbound MCCP2 compression offers are accepted.
     pub compression: bool,
     /// Whether inbound MCCP4 compression offers are accepted.
@@ -223,6 +232,8 @@ impl Default for ServerConfigFormData {
             destination: String::new(),
             port: String::new(),
             encoding: server::DEFAULT_ENCODING_CHOICE.to_string(),
+            graphics: GraphicsMode::default(),
+            graphics_local_files: false,
             compression: true,
             mccp4_compression: true,
             tls: false,
@@ -1434,6 +1445,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                         .encoding
                         .clone()
                         .unwrap_or_else(|| server::DEFAULT_ENCODING_CHOICE.to_string()),
+                    graphics: server_to_edit.config.graphics,
+                    graphics_local_files: server_to_edit.config.graphics_local_files,
                     compression: server_to_edit.config.compression,
                     mccp4_compression: server_to_edit.config.accepts_mccp4_compression(),
                     // A WSS server's stored TLS flag comes from its scheme, not
@@ -1576,6 +1589,26 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     ServerFormField::Encoding => state.server_form_data.encoding = value,
                 }
                 state.server_crud_error = None; // Clear error when user types
+                advance_server_form_revision(state);
+            }
+        }
+        Message::UpdateServerGraphics(mode) => {
+            // A dropdown pick, handled like the encoding dropdown's.
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.graphics = mode;
+                state.server_crud_error = None;
+                advance_server_form_revision(state);
+            }
+        }
+        Message::ToggleServerGraphicsLocalFiles(value) => {
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.graphics_local_files = value;
                 advance_server_form_revision(state);
             }
         }

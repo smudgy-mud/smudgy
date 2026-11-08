@@ -22,6 +22,7 @@ use crate::{
 
 pub mod config;
 pub mod connection;
+mod graphics_media;
 pub mod registry;
 pub mod runtime;
 pub mod styled_line;
@@ -340,6 +341,10 @@ pub struct SessionParams {
     /// Reset hook for embedder state coupled to one engine generation (see [`EngineResetHook`]);
     /// `None` when the embedder holds no such state (tests, headless).
     pub on_engine_rebuild: Option<EngineResetHook>,
+    /// Decodes terminal graphics transmits off the socket thread, handed to every
+    /// connection this session makes; `None` (tests, headless) parses graphics commands
+    /// and drops them.
+    pub graphics_decoder: Option<Arc<dyn connection::GraphicsDecoder>>,
 }
 
 /// The UI subscription owns a session runtime's lifetime. Dropping the
@@ -616,6 +621,7 @@ fn try_spawn_inner(
         package_provider_override,
         params.extra_script_extensions.clone(),
         params.on_engine_rebuild.clone(),
+        params.graphics_decoder.clone(),
         audio_scope,
         ui_tx,
         ui_commands,
@@ -653,6 +659,7 @@ mod publication_tests {
             on_engine_rebuild: Some(Arc::new(move || {
                 rebuild_count.fetch_add(1, Ordering::AcqRel);
             })),
+            graphics_decoder: None,
         };
 
         registry::inject_next_publication_unwind();

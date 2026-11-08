@@ -179,6 +179,7 @@ mod ingest {
     }
 
     impl telnet::TelnetSink for TelnetBridge<'_> {
+        #[inline]
         fn on_data(&mut self, data: &[u8]) {
             if self.transcode.is_passthrough() {
                 // UTF-8 (the overwhelming default): bytes flow exactly as ever.
@@ -188,6 +189,12 @@ mod ingest {
                 // therefore see decoded text, not wire bytes.
                 let utf8 = self.transcode.decode(data);
                 feed_str(self.vt_parser, self.vt_processor, utf8);
+            }
+            // Terminal-query answers the processor owes (DA1, pixel sizes) join
+            // the negotiation replies here, in stream order. One branch on an
+            // empty Vec per data run; nothing per byte.
+            if self.vt_processor.has_replies() {
+                self.vt_processor.drain_replies(self.replies);
             }
         }
 
@@ -1070,6 +1077,207 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// which never answers costs one noticeable pause and nothing worse.
 const CHARSET_HOLD_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Decodes a graphics transmit's pixels off the socket thread. The UI
+/// implements this on its `smudgy-images` runtime; each connect task wraps it
+/// into the [`smudgy_protocol::graphics::GraphicsHost`] its VT processor drives
+/// and routes every completion back through its own `select!`.
+///
+/// A request arrives validated as far as its bytes allow without inflating
+/// or decoding them: its dimensions are within kitty's 10000-pixel limit and
+/// the session quota (`width * height * 4` bytes at most), and uncompressed
+/// packed data has exactly [`smudgy_protocol::graphics::Format::expected_len`]
+/// bytes. What is left is the decoder's: inflate `o=z` data (for packed
+/// formats capped at `expected_len`, a longer stream being `EINVAL`), expand
+/// RGB to RGBA, decode PNG, and produce exactly `width` x `height` RGBA
+/// pixels; anything else fails the transmit.
+///
+/// An animation frame carries [`smudgy_protocol::graphics::DecodeRequest::compose`]:
+/// the decoded `width` x `height` rectangle (checked to lie inside the
+/// image) is then composed at its `x`, `y` onto the base frame — or, with no
+/// base, onto a canvas filled with the `background` colour — by straight
+/// alpha blending or overwriting, and the result is the whole canvas,
+/// [`smudgy_protocol::graphics::Compose::canvas`] in size.
+/// [`smudgy_protocol::graphics::Compose::apply`] is the reference
+/// implementation. A frame-to-frame compose (`a=c`) arrives the same way
+/// but carries no data: [`smudgy_protocol::graphics::Compose::source`]
+/// names the frame and the rectangle to read from it, so the decoder
+/// decodes nothing and composes straight from that frame (`Compose::apply`
+/// with empty data). The processor sends at most one frame request per
+/// image at a time, so a base or source is always a frame that has landed.
+pub trait GraphicsDecoder: Send + Sync + 'static {
+    /// Decode `request`, then call `done` exactly once, from any thread.
+    fn decode(
+        &self,
+        request: smudgy_protocol::graphics::DecodeRequest,
+        done: Box<dyn FnOnce(smudgy_protocol::graphics::DecodeResult) + Send + 'static>,
+    );
+}
+
+/// A finished decode, on its way back to the socket task.
+type DecodeDone = (
+    smudgy_protocol::graphics::DecodeTicket,
+    smudgy_protocol::graphics::DecodeResult,
+);
+
+/// A decode's way back to the socket task, carried into the decoder's
+/// callback. The decoder must call it once; if it drops the callback
+/// unrun instead (a panicking or shut-down decode task), the drop reports
+/// the failure, so the reply parked for this decode — and every answer
+/// queued behind it — is never held back forever.
+struct DecodeCompletion {
+    ticket: smudgy_protocol::graphics::DecodeTicket,
+    done: tokio::sync::mpsc::UnboundedSender<DecodeDone>,
+    sent: bool,
+}
+
+impl DecodeCompletion {
+    fn complete(mut self, result: smudgy_protocol::graphics::DecodeResult) {
+        self.sent = true;
+        // A closed channel means the connection ended mid-decode.
+        let _ = self.done.send((self.ticket, result));
+    }
+}
+
+impl Drop for DecodeCompletion {
+    fn drop(&mut self) {
+        if !self.sent {
+            let _ = self.done.send((
+                self.ticket,
+                Err(smudgy_protocol::graphics::GraphicsError::invalid(
+                    "decoder dropped the request",
+                )),
+            ));
+        }
+    }
+}
+
+/// One connection's graphics host: decodes through the UI's decoder and
+/// sends each completion to the socket task, whose `select!` hands it to
+/// [`VtProcessor::graphics_decode_complete`]. It lives in the processor, so
+/// it dies with the connection; a decode finishing later finds the channel
+/// closed and its result is dropped, as the host contract allows.
+struct ChannelGraphicsHost {
+    decoder: Arc<dyn GraphicsDecoder>,
+    done: tokio::sync::mpsc::UnboundedSender<DecodeDone>,
+    /// Whether `t=f`, `t=t` and `t=s` transmits may read this machine's
+    /// files and shared memory: only when the server is allowed local files
+    /// (`ServerConfig::graphics_local_files`) and the peer is a loopback
+    /// address (see [`local_media_allowed_for`]). A remote server names
+    /// paths on a machine it does not share, and a loopback address is no
+    /// proof the server is on this one (an SSH tunnel, a forwarded or
+    /// published port, another user's process bound to it), so the user
+    /// says which servers are. Refused, the command is answered `EBADF`
+    /// without the filesystem being touched.
+    local_media_allowed: bool,
+}
+
+impl ChannelGraphicsHost {
+    /// The host for a connection to `peer` (`None` when the transport could
+    /// not say), for a server allowed local files when `local_files`.
+    fn new(
+        decoder: Arc<dyn GraphicsDecoder>,
+        done: tokio::sync::mpsc::UnboundedSender<DecodeDone>,
+        peer: Option<SocketAddr>,
+        local_files: bool,
+    ) -> Self {
+        let local_media_allowed = local_files && local_media_allowed_for(peer);
+        debug!(
+            "graphics local media {} for peer {peer:?} (local files {} for this server)",
+            if local_media_allowed {
+                "allowed"
+            } else {
+                "refused"
+            },
+            if local_files { "enabled" } else { "disabled" }
+        );
+        Self {
+            decoder,
+            done,
+            local_media_allowed,
+        }
+    }
+}
+
+/// The connected peer's socket address: the TCP socket's under TLS and
+/// under a WebSocket alike (so a WSS URL naming a host that resolved to a
+/// loopback address counts as loopback). `None` when the transport cannot
+/// say.
+fn graphics_peer_addr(stream: &GameStream) -> Option<SocketAddr> {
+    let tcp = match stream {
+        GameStream::Plain(tcp) => tcp,
+        GameStream::Tls(tls) => tls.get_ref().0,
+        GameStream::Wss(ws) => match ws.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp,
+            MaybeTlsStream::Rustls(tls) => tls.get_ref().0,
+            _ => return None,
+        },
+    };
+    tcp.peer_addr().ok()
+}
+
+/// Whether a peer could be allowed local media (`t=f`, `t=t`, `t=s`): only
+/// one at a loopback address, an IPv4-mapped IPv6 one included, can share
+/// this machine's files. An unknown peer cannot. Necessary, not
+/// sufficient: a loopback address is reached through tunnels and forwarded
+/// ports too, so the server must be allowed local files as well
+/// ([`ChannelGraphicsHost::new`]).
+fn local_media_allowed_for(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+}
+
+impl std::fmt::Debug for ChannelGraphicsHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelGraphicsHost")
+            .field("done", &self.done)
+            .field("local_media_allowed", &self.local_media_allowed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl smudgy_protocol::graphics::GraphicsHost for ChannelGraphicsHost {
+    fn decode(
+        &mut self,
+        ticket: smudgy_protocol::graphics::DecodeTicket,
+        request: smudgy_protocol::graphics::DecodeRequest,
+    ) {
+        let completion = DecodeCompletion {
+            ticket,
+            done: self.done.clone(),
+            sent: false,
+        };
+        self.decoder
+            .decode(request, Box::new(move |result| completion.complete(result)));
+    }
+
+    fn read_media(
+        &mut self,
+        medium: smudgy_protocol::graphics::Medium,
+        name: &[u8],
+        offset: u32,
+        size: u32,
+    ) -> Result<Vec<u8>, smudgy_protocol::graphics::GraphicsError> {
+        if !self.local_media_allowed {
+            // The one `EBADF` every refusal gets, before anything is looked at.
+            debug!(
+                "graphics {medium:?} transmit refused: local files are not allowed for this server, or the peer is not on this machine"
+            );
+            return Err(smudgy_protocol::graphics::GraphicsError::bad_file());
+        }
+        // The read blocks the thread, and the socket runtime has two
+        // workers shared by every connection: on it, tokio is told so, and
+        // hands the other tasks on this worker elsewhere meanwhile. Outside
+        // a runtime (tests), or on a current-thread one, where that is not
+        // possible, the read simply runs.
+        let read = || super::graphics_media::read_local_media(medium, name, offset, size);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(read)
+            }
+            _ => read(),
+        }
+    }
+}
+
 pub struct Connection {
     disconnect: Option<oneshot::Sender<()>>,
     runtime_tx: UnboundedSender<RuntimeAction>,
@@ -1092,6 +1300,21 @@ pub struct Connection {
     /// reports the real size in its first NAWS answer; later changes ride
     /// [`OutboundFrame::WindowSize`].
     window_size: Arc<std::sync::atomic::AtomicU32>,
+    /// The session's main-pane cell size in logical pixels, packed like
+    /// `window_size` and owned the same way; the VT processor reads it to
+    /// answer pixel-size queries.
+    cell_size: Arc<std::sync::atomic::AtomicU32>,
+    /// How the next connect task's VT processor treats graphics commands and
+    /// terminal queries. Set from the server configuration before each connect.
+    graphics_mode: smudgy_protocol::graphics::GraphicsMode,
+    /// What the next connect task's VT processor decodes graphics transmits
+    /// with. `None` parses and drops them.
+    graphics_decoder: Option<Arc<dyn GraphicsDecoder>>,
+    /// Whether the next connect task's graphics host may read this
+    /// machine's files and shared memory for `t=f`, `t=t` and `t=s`
+    /// (`ServerConfig::graphics_local_files`); honoured for a loopback peer
+    /// only. Off until the server configuration says otherwise.
+    graphics_local_files: bool,
     /// Zero-progress write budget handed to each connect task
     /// ([`WRITE_STALL_TIMEOUT`]); a field so tests can shrink it.
     write_stall_timeout: Duration,
@@ -1114,8 +1337,13 @@ impl std::fmt::Debug for Connection {
             .field("ui_tx", &self.ui_tx)
             .field("socket_tx", &self.socket_tx)
             .field("generation", &self.generation)
+            .field("marker_armed", &self.marker_armed)
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
+            .field("cell_size", &self.cell_size)
+            .field("graphics_mode", &self.graphics_mode)
+            .field("graphics_decoder", &self.graphics_decoder.is_some())
+            .field("graphics_local_files", &self.graphics_local_files)
             .field("write_stall_timeout", &self.write_stall_timeout)
             .finish()
     }
@@ -1128,8 +1356,9 @@ impl Connection {
         ui_tx: futures::channel::mpsc::Sender<TaggedSessionEvent>,
         raw_wanted: Arc<std::sync::atomic::AtomicBool>,
         window_size: Arc<std::sync::atomic::AtomicU32>,
+        cell_size: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        Self::with_generation(runtime_tx, ui_tx, raw_wanted, window_size, 0)
+        Self::with_generation(runtime_tx, ui_tx, raw_wanted, window_size, cell_size, 0)
     }
 
     #[must_use]
@@ -1138,6 +1367,7 @@ impl Connection {
         ui_tx: futures::channel::mpsc::Sender<TaggedSessionEvent>,
         raw_wanted: Arc<std::sync::atomic::AtomicBool>,
         window_size: Arc<std::sync::atomic::AtomicU32>,
+        cell_size: Arc<std::sync::atomic::AtomicU32>,
         generation: u64,
     ) -> Self {
         Self {
@@ -1149,8 +1379,34 @@ impl Connection {
             marker_armed: None,
             raw_wanted,
             window_size,
+            cell_size,
+            graphics_mode: smudgy_protocol::graphics::GraphicsMode::Off,
+            graphics_decoder: None,
+            graphics_local_files: false,
             write_stall_timeout: WRITE_STALL_TIMEOUT,
         }
+    }
+
+    /// Give the next connect task the decoder its graphics host decodes
+    /// through. Takes effect at the next `connect`, like the mode.
+    pub fn set_graphics_decoder(&mut self, decoder: Arc<dyn GraphicsDecoder>) {
+        self.graphics_decoder = Some(decoder);
+    }
+
+    /// Set how the next connect task treats graphics commands and terminal
+    /// queries. Takes effect at the next `connect`; a live socket keeps the
+    /// mode it was spawned with, like its encoding.
+    pub fn set_graphics_mode(&mut self, mode: smudgy_protocol::graphics::GraphicsMode) {
+        self.graphics_mode = mode;
+    }
+
+    /// Set whether the next connect task's graphics host may read this
+    /// machine's files and shared memory for `t=f`, `t=t` and `t=s`
+    /// (`ServerConfig::graphics_local_files`); honoured only when the peer
+    /// turns out to be a loopback address. Takes effect at the next
+    /// `connect`, like the mode.
+    pub fn set_graphics_local_files(&mut self, allowed: bool) {
+        self.graphics_local_files = allowed;
     }
 
     /// Wake the live socket task after the shared size cell changed; the task re-reads the
@@ -1284,6 +1540,10 @@ impl Connection {
         let marker_armed = self.marker_armed.clone();
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
+        let cell_size = self.cell_size.clone();
+        let graphics_mode = self.graphics_mode;
+        let graphics_decoder = self.graphics_decoder.clone();
+        let graphics_local_files = self.graphics_local_files;
         let write_stall_timeout = self.write_stall_timeout;
 
         spawn_io_task(async move {
@@ -1296,6 +1556,17 @@ impl Connection {
             if let Some(marker_armed) = marker_armed {
                 vt_processor.set_marker_armed_flag(marker_armed);
             }
+            vt_processor.set_graphics_mode(graphics_mode);
+            vt_processor.set_terminal_geometry(window_size.clone(), cell_size);
+            // Decode completions re-enter this task through the read loop's
+            // `select!`, between read batches, so one never splits a batch and
+            // its reply joins the queue in command order. The host keeps a
+            // sender; this one keeps the receive arm armed when there is no host.
+            // The host itself is installed once connected, when the peer's
+            // address (which decides whether local media are allowed) is known.
+            let (decode_done_tx, mut decode_done_rx) =
+                tokio::sync::mpsc::unbounded_channel::<DecodeDone>();
+            let mut graphics_decoder = graphics_decoder;
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
             let mut telnet = telnet::TelnetParser::new();
@@ -1370,6 +1641,15 @@ impl Connection {
                         // `RuntimeAction::Connected` below advances the session's
                         // connection rule to "Connected to …"; this side only logs.
                         info!("Connected");
+
+                        if let Some(decoder) = graphics_decoder.take() {
+                            vt_processor.set_graphics_host(Box::new(ChannelGraphicsHost::new(
+                                decoder,
+                                decode_done_tx.clone(),
+                                graphics_peer_addr(&stream),
+                                graphics_local_files,
+                            )));
+                        }
 
                         {
                             let Ok(mut sender) = socket_tx.write() else {
@@ -1762,6 +2042,30 @@ impl Connection {
                                             tokio::task::yield_now().await;
                                         }
                                 }
+                                // A pixel decode landed: settle its parked reply, then write
+                                // whatever now heads the reply queue — in command order, and
+                                // never inside a read batch, since this arm only runs between
+                                // them. Held back like the write arm during a CHARSET hold?
+                                // No: replies to the server are protocol, like negotiation
+                                // answers, which the read arm writes through the hold too.
+                                Some((ticket, result)) = decode_done_rx.recv() => {
+                                    vt_processor.graphics_decode_complete(ticket, result);
+                                    vt_processor.sink_mut().flush_lines();
+                                    if vt_processor.has_replies() {
+                                        telnet_replies.clear();
+                                        vt_processor.drain_replies(&mut telnet_replies);
+                                        if let Err(err) = stream
+                                            .write_all_stall_guarded(
+                                                &telnet_replies,
+                                                write_stall_timeout,
+                                            )
+                                            .await
+                                        {
+                                            warn!("Failed to write graphics reply to {addr}: {err}");
+                                            break;
+                                        }
+                                    }
+                                }
                                 // RFC 2066 §5: while a CHARSET subnegotiation of ours is in
                                 // progress, outbound data waits. The whole queue waits, not
                                 // just its text frames — `Raw` sends are ordered against
@@ -1977,6 +2281,7 @@ mod tests {
                 ui_tx,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+                Arc::new(AtomicU32::new(0)),
             ),
             runtime_rx,
         )
@@ -2305,6 +2610,71 @@ mod tests {
         let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
         let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
         ingest_buffer_with(input, &mut protocol, &mut transcode)
+    }
+
+    /// Terminal-query answers the VT processor owes ride the bridge's reply buffer, in
+    /// stream order with negotiation replies, and only when the server's graphics mode
+    /// asks for them.
+    #[test]
+    fn terminal_queries_answer_through_the_bridge_reply_buffer() {
+        use smudgy_protocol::graphics::GraphicsMode;
+        let run = |mode: GraphicsMode| {
+            let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut telnet = telnet::TelnetParser::new();
+            let mut vt_parser = VTParser::new();
+            let mut vt_processor = VtProcessor::new(runtime_tx.clone());
+            vt_processor.set_graphics_mode(mode);
+            vt_processor.set_terminal_geometry(
+                Arc::new(AtomicU32::new(responders::pack_dims(100, 30))),
+                Arc::new(AtomicU32::new(responders::pack_dims(
+                    smudgy_protocol::graphics::cell_fixed(8.0),
+                    smudgy_protocol::graphics::cell_fixed(17.0),
+                ))),
+            );
+            let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+            let mut transcode = transcode::Transcode::new(encoding_rs::UTF_8);
+            let mut replies = Vec::new();
+            // DA1, then a TTYPE SEND the responder answers, then a cell-size report:
+            // the answers must come out in that order.
+            let input = b"hello\x1b[c\xff\xfa\x18\x01\xff\xf0\x1b[16tworld\r\n";
+            let consumed = ingest::feed_inbound(
+                input,
+                &mut telnet,
+                &mut vt_parser,
+                &mut vt_processor,
+                &mut replies,
+                &runtime_tx,
+                &mut protocol,
+                &mut transcode,
+            );
+            assert_eq!(consumed, input.len());
+            drop(runtime_tx);
+            let mut lines = Vec::new();
+            while let Ok(action) = runtime_rx.try_recv() {
+                if let RuntimeAction::HandleIncomingLine(line) = action {
+                    lines.push(line.text.clone());
+                }
+            }
+            (replies, lines)
+        };
+
+        let (replies, lines) = run(GraphicsMode::Full);
+        assert_eq!(lines, ["helloworld"]);
+        let find = |needle: &[u8]| replies.windows(needle.len()).position(|w| w == needle);
+        let da1 = find(b"\x1b[?62;c").expect("DA1 answered");
+        let ttype = find(&[0xff, 0xfa, 0x18]).expect("TTYPE answered");
+        let size = find(b"\x1b[6;17;8t").expect("cell size reported");
+        assert!(
+            da1 < ttype && ttype < size,
+            "stream order kept: {replies:?}"
+        );
+
+        let (replies, lines) = run(GraphicsMode::DisplayOnly);
+        assert_eq!(lines, ["helloworld"]);
+        assert!(
+            !replies.windows(2).any(|w| w == b"\x1b["),
+            "no terminal answers without the full protocol: {replies:?}"
+        );
     }
 
     /// [`ingest_buffer`] against caller-owned responder/transcode state, for tests that
@@ -3025,6 +3395,384 @@ mod tests {
         drop(socket_tx);
     }
 
+    /// What the decoder contract asks of a packed-format decode, minus the
+    /// threads: inflate within the exact length the size demands, refuse
+    /// any other length, expand RGB to RGBA, and compose an animation frame
+    /// onto its canvas — or, for an `a=c`, which carries no data, compose
+    /// the source frame's rectangle onto it.
+    fn decode_packed(
+        request: &smudgy_protocol::graphics::DecodeRequest,
+    ) -> smudgy_protocol::graphics::DecodeResult {
+        use smudgy_protocol::graphics::{Compression, DecodedPixels, Format, GraphicsError};
+        let from_source = request
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.source.is_some());
+        let rgba: Vec<u8> = if from_source {
+            Vec::new()
+        } else {
+            let expected = request
+                .format
+                .expected_len(request.width, request.height)
+                .ok_or_else(|| GraphicsError::invalid("only packed formats decode here"))?;
+            let expected = usize::try_from(expected).expect("validated sizes fit");
+            let data = match request.compression {
+                Compression::None => request.data.clone(),
+                Compression::Zlib => smudgy_protocol::graphics::inflate(&request.data, expected)
+                    .map_err(|_| GraphicsError::invalid("Too much image data"))?,
+            };
+            if data.len() != expected {
+                return Err(GraphicsError::invalid("Insufficient image data"));
+            }
+            if request.format == Format::Rgb {
+                data.chunks_exact(3)
+                    .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 0xff])
+                    .collect()
+            } else {
+                data
+            }
+        };
+        let (width, height, rgba) = match &request.compose {
+            Some(compose) => {
+                let canvas = compose.apply(&rgba, request.width, request.height)?;
+                (compose.canvas.0, compose.canvas.1, canvas)
+            }
+            None => (request.width, request.height, rgba),
+        };
+        Ok(DecodedPixels {
+            width,
+            height,
+            rgba: rgba.into(),
+        })
+    }
+
+    /// A decoder that completes on a timer, as the UI's off-thread decode would.
+    struct TimerDecoder {
+        delay: Duration,
+        decodes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GraphicsDecoder for TimerDecoder {
+        fn decode(
+            &self,
+            request: smudgy_protocol::graphics::DecodeRequest,
+            done: Box<dyn FnOnce(smudgy_protocol::graphics::DecodeResult) + Send + 'static>,
+        ) {
+            self.decodes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delay = self.delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                done(decode_packed(&request));
+            });
+        }
+    }
+
+    type GatedDecode = (
+        smudgy_protocol::graphics::DecodeRequest,
+        Box<dyn FnOnce(smudgy_protocol::graphics::DecodeResult) + Send + 'static>,
+    );
+
+    /// A decoder that holds every request until the test completes it.
+    #[derive(Default)]
+    struct GateDecoder {
+        held: std::sync::Mutex<Vec<GatedDecode>>,
+    }
+
+    impl GraphicsDecoder for GateDecoder {
+        fn decode(
+            &self,
+            request: smudgy_protocol::graphics::DecodeRequest,
+            done: Box<dyn FnOnce(smudgy_protocol::graphics::DecodeResult) + Send + 'static>,
+        ) {
+            self.held.lock().unwrap().push((request, done));
+        }
+    }
+
+    impl GateDecoder {
+        async fn next(&self) -> GatedDecode {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(held) = self.held.lock().unwrap().pop() {
+                        return held;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a decode should be requested")
+        }
+    }
+
+    /// A decoder that loses the request: the callback is dropped unrun, as a
+    /// decode task that panicked or was shut down would.
+    struct DroppingDecoder(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl GraphicsDecoder for DroppingDecoder {
+        fn decode(
+            &self,
+            _request: smudgy_protocol::graphics::DecodeRequest,
+            done: Box<dyn FnOnce(smudgy_protocol::graphics::DecodeResult) + Send + 'static>,
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(done);
+        }
+    }
+
+    /// A one-pixel transmit that must be answered, then DA1.
+    const TRANSMIT_THEN_DA1: &[u8] = b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AAAA\x1b\\\x1b[c";
+
+    /// A server that sends [`TRANSMIT_THEN_DA1`] and collects what comes back
+    /// until `done` says so, returning the bytes and how long after sending
+    /// the first byte arrived.
+    async fn graphics_server(
+        listener: TcpListener,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> (Vec<u8>, Option<Duration>) {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        socket
+            .write_all(TRANSMIT_THEN_DA1)
+            .await
+            .expect("send the commands");
+        let sent = std::time::Instant::now();
+        let mut first_reply = None;
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while !done(&received) {
+            let n = timeout(Duration::from_secs(5), socket.read(&mut chunk))
+                .await
+                .expect("the client should answer or hang up")
+                .expect("read");
+            if n == 0 {
+                break;
+            }
+            first_reply.get_or_insert_with(|| sent.elapsed());
+            received.extend_from_slice(&chunk[..n]);
+        }
+        (received, first_reply)
+    }
+
+    #[tokio::test]
+    async fn a_graphics_reply_waits_for_its_decode_and_keeps_command_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(graphics_server(listener, |received| {
+            received.windows(7).any(|w| w == b"\x1b[?62;c")
+        }));
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(Arc::new(TimerDecoder {
+            delay: Duration::from_millis(150),
+            decodes: decodes.clone(),
+        }));
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        let (received, first_reply) = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=7;OK\x1b\\\x1b[?62;c",
+            "the transmit's OK precedes DA1's answer"
+        );
+        assert!(
+            first_reply.is_some_and(|waited| waited >= Duration::from_millis(150)),
+            "nothing was answered before the decode finished: {first_reply:?}"
+        );
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_decoder_that_drops_the_request_still_settles_its_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(graphics_server(listener, |received| {
+            received.windows(7).any(|w| w == b"\x1b[?62;c")
+        }));
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(Arc::new(DroppingDecoder(decodes.clone())));
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        let (received, _) = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=7;EINVAL:decoder dropped the request\x1b\\\x1b[?62;c",
+            "the lost decode fails its reply, and DA1's answer follows instead of waiting forever"
+        );
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_decode_finishing_after_disconnect_is_dropped_without_a_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        // Collect until the client hangs up.
+        let server = tokio::spawn(graphics_server(listener, |_| false));
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(Arc::new(TimerDecoder {
+            delay: Duration::from_millis(400),
+            decodes: decodes.clone(),
+        }));
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        // Let the transmit parse and its decode start, then hang up under it.
+        timeout(Duration::from_secs(5), async {
+            while decodes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the decode should start");
+        connection.disconnect();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    runtime_rx.recv().await,
+                    Some(RuntimeAction::Disconnected { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the socket task should end on disconnect");
+        let (received, _) = server.await.expect("server task");
+        assert!(
+            received.is_empty(),
+            "no reply may be written for a decode that outlived its connection: {received:?}"
+        );
+        // The timer fires into a closed channel; nothing panics, nothing leaks a reply.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The whole pipeline: a compressed transmit-and-display arrives, the
+    /// line it landed on reaches the runtime carrying the placement, the
+    /// decode is handed over still compressed, and once it completes the
+    /// record is ready and the reply goes out ahead of DA1's.
+    #[tokio::test]
+    async fn a_placement_reaches_the_buffer_and_its_reply_follows_the_decode() {
+        use smudgy_protocol::graphics::{Compression, ImageData, Placement, encode_payload};
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut commands = b"ab".to_vec();
+        commands.extend_from_slice(
+            format!(
+                "\x1b_Ga=T,i=7,f=24,s=2,v=1,o=z;{}\x1b\\",
+                encode_payload(&compressed)
+            )
+            .as_bytes(),
+        );
+        commands.extend_from_slice(b"cd\r\n\x1b[c");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            socket
+                .write_all(&commands)
+                .await
+                .expect("send the commands");
+            let mut received = Vec::new();
+            let mut chunk = [0_u8; 256];
+            while !received.windows(7).any(|w| w == b"\x1b[?62;c") {
+                let n = timeout(Duration::from_secs(5), socket.read(&mut chunk))
+                    .await
+                    .expect("the client should answer")
+                    .expect("read");
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            received
+        });
+        let decoder = Arc::new(GateDecoder::default());
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(decoder.clone());
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+
+        let line = timeout(Duration::from_secs(5), async {
+            loop {
+                let lines = match runtime_rx.recv().await.expect("the session is live") {
+                    RuntimeAction::HandleIncomingLine(line) => vec![line],
+                    RuntimeAction::HandleIncomingLines(lines) => lines,
+                    _ => continue,
+                };
+                if let Some(line) = lines.into_iter().find(|line| line.objects.is_some()) {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("the line with the placement reaches the runtime");
+        // No cell size reported yet: 2 px wide in a 9 px fallback cell.
+        assert_eq!(line.text, "ab cd");
+        let object = &line.objects.as_ref().unwrap()[0];
+        assert_eq!(object.range, 2..3);
+        let placement = object
+            .resource
+            .clone()
+            .downcast::<Placement>()
+            .expect("the resource is the placement");
+        assert_eq!((placement.image.id, placement.geometry.columns), (7, 1));
+        assert_eq!(placement.image.data(), ImageData::Pending);
+
+        let (request, done) = decoder.next().await;
+        assert_eq!(request.compression, Compression::Zlib);
+        assert_eq!(request.data, compressed, "inflating is the decoder's job");
+        assert_eq!((request.width, request.height), (2, 1));
+        assert!(
+            !server.is_finished(),
+            "DA1's answer waits behind the transmit's parked reply"
+        );
+        done(decode_packed(&request));
+
+        let received = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=7;OK\x1b\\\x1b[?62;c",
+            "the transmit's OK precedes DA1's answer"
+        );
+        let pixels = placement.pixels().expect("the record is ready");
+        assert_eq!(
+            &pixels.rgba[..],
+            [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]
+        );
+    }
+
     #[tokio::test]
     async fn legacy_encoding_rejects_an_unmappable_command_without_wire_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3716,5 +4464,316 @@ mod tests {
 
         release_tx.send(()).ok();
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn local_media_are_allowed_only_for_loopback_peers() {
+        let peer = |addr: &str| Some(addr.parse::<SocketAddr>().expect("a socket address"));
+        assert!(local_media_allowed_for(peer("127.0.0.1:4000")));
+        assert!(local_media_allowed_for(peer("127.1.2.3:4000")));
+        assert!(local_media_allowed_for(peer("[::1]:4000")));
+        assert!(local_media_allowed_for(peer("[::ffff:127.0.0.1]:4000")));
+        assert!(!local_media_allowed_for(peer("192.0.2.7:4000")));
+        assert!(!local_media_allowed_for(peer("10.0.0.1:4000")));
+        assert!(!local_media_allowed_for(peer("0.0.0.0:4000")));
+        assert!(!local_media_allowed_for(peer("[2001:db8::1]:4000")));
+        assert!(!local_media_allowed_for(peer("[::ffff:192.0.2.7]:4000")));
+        assert!(!local_media_allowed_for(None));
+    }
+
+    /// A host for a remote peer, for an unknown one, or for a loopback peer
+    /// of a server not allowed local files answers `EBADF` without looking:
+    /// a temporary file that a read would delete is still there after it.
+    #[test]
+    fn local_media_need_the_servers_opt_in_and_a_loopback_peer() {
+        use smudgy_protocol::graphics::{GraphicsError, GraphicsHost as _, Medium};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tty-graphics-protocol-host.rgb");
+        std::fs::write(&path, [1, 2, 3, 4, 5, 6]).expect("write the pixels");
+        let name = path.to_str().expect("a UTF-8 path").as_bytes();
+        let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let decoder: Arc<dyn GraphicsDecoder> = Arc::new(GateDecoder::default());
+        let loopback: Option<SocketAddr> = Some("127.0.0.1:4000".parse().expect("an address"));
+        let remote: Option<SocketAddr> = Some("192.0.2.7:4000".parse().expect("an address"));
+
+        for (peer, local_files) in [(remote, true), (None, true), (loopback, false)] {
+            let mut host =
+                ChannelGraphicsHost::new(decoder.clone(), done.clone(), peer, local_files);
+            assert!(
+                !host.local_media_allowed,
+                "{peer:?}, local files {local_files}"
+            );
+            for medium in [Medium::File, Medium::TempFile, Medium::SharedMemory] {
+                let err = host
+                    .read_media(medium, name, 0, 0)
+                    .expect_err("local media are refused");
+                assert_eq!(err, GraphicsError::bad_file());
+            }
+            assert!(path.exists(), "the refused read never touched the file");
+        }
+
+        let mut local = ChannelGraphicsHost::new(decoder, done, loopback, true);
+        assert!(local.local_media_allowed);
+        assert_eq!(
+            local.read_media(Medium::TempFile, name, 0, 0),
+            Ok(vec![1, 2, 3, 4, 5, 6])
+        );
+        assert!(
+            !path.exists(),
+            "the loopback read deleted the temporary file"
+        );
+    }
+
+    /// A host allowed local media, with a file for it to read.
+    fn local_media_host() -> (ChannelGraphicsHost, tempfile::TempDir, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("pixels.rgb");
+        std::fs::write(&path, [7, 8, 9]).expect("write the pixels");
+        let name = path.to_str().expect("a UTF-8 path").as_bytes().to_vec();
+        let (done, _done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = ChannelGraphicsHost::new(
+            Arc::new(GateDecoder::default()),
+            done,
+            Some("127.0.0.1:4000".parse().expect("an address")),
+            true,
+        );
+        (host, dir, name)
+    }
+
+    /// `read_media` blocks the thread it runs on. On the socket runtime (a
+    /// multi-thread one) it tells tokio so; outside a runtime, or on a
+    /// current-thread one, where it cannot, it simply reads.
+    #[test]
+    fn read_media_reads_outside_a_runtime() {
+        use smudgy_protocol::graphics::{GraphicsHost as _, Medium};
+        let (mut host, _dir, name) = local_media_host();
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert_eq!(host.read_media(Medium::File, &name, 1, 0), Ok(vec![8, 9]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_media_reads_on_a_multi_thread_runtime() {
+        use smudgy_protocol::graphics::{GraphicsHost as _, Medium};
+        let (mut host, _dir, name) = local_media_host();
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+        assert_eq!(host.read_media(Medium::File, &name, 0, 2), Ok(vec![7, 8]));
+    }
+
+    #[tokio::test]
+    async fn read_media_reads_on_a_current_thread_runtime() {
+        use smudgy_protocol::graphics::{GraphicsHost as _, Medium};
+        let (mut host, _dir, name) = local_media_host();
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
+        assert_eq!(
+            host.read_media(Medium::File, &name, 0, 0),
+            Ok(vec![7, 8, 9])
+        );
+    }
+
+    /// Send `commands` to the first client and collect what it writes back
+    /// until DA1's answer arrives.
+    async fn graphics_exchange(listener: TcpListener, commands: Vec<u8>) -> Vec<u8> {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        socket
+            .write_all(&commands)
+            .await
+            .expect("send the commands");
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 256];
+        while !received.windows(7).any(|w| w == b"\x1b[?62;c") {
+            let n = timeout(Duration::from_secs(5), socket.read(&mut chunk))
+                .await
+                .expect("the client should answer")
+                .expect("read");
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..n]);
+        }
+        received
+    }
+
+    /// The local-media pipeline over a loopback connection: a `t=f`
+    /// transmit-and-display names a file of packed RGB, the client reads
+    /// it, hands the bytes to the decoder, places the image, and answers
+    /// `OK` once the record is ready.
+    #[tokio::test]
+    async fn a_loopback_peer_transmits_from_a_file() {
+        use smudgy_protocol::graphics::{Compression, Format, Placement, encode_payload};
+        let pixels = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let file = tempfile::Builder::new()
+            .prefix("tty-graphics-protocol-")
+            .suffix(".rgb")
+            .tempfile()
+            .expect("temp file");
+        std::fs::write(file.path(), pixels).expect("write the pixels");
+        let name = file.path().to_str().expect("a UTF-8 path");
+        let mut commands = b"ab".to_vec();
+        commands.extend_from_slice(
+            format!(
+                "\x1b_Ga=T,t=f,f=24,s=2,v=1,i=9;{}\x1b\\",
+                encode_payload(name.as_bytes())
+            )
+            .as_bytes(),
+        );
+        commands.extend_from_slice(b"cd\r\n\x1b[c");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(graphics_exchange(listener, commands));
+        let decoder = Arc::new(GateDecoder::default());
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(decoder.clone());
+        connection.set_graphics_local_files(true);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+
+        let line = timeout(Duration::from_secs(5), async {
+            loop {
+                let lines = match runtime_rx.recv().await.expect("the session is live") {
+                    RuntimeAction::HandleIncomingLine(line) => vec![line],
+                    RuntimeAction::HandleIncomingLines(lines) => lines,
+                    _ => continue,
+                };
+                if let Some(line) = lines.into_iter().find(|line| line.objects.is_some()) {
+                    return line;
+                }
+            }
+        })
+        .await
+        .expect("the line with the placement reaches the runtime");
+        assert_eq!(line.text, "ab cd");
+        let placement = line.objects.as_ref().unwrap()[0]
+            .resource
+            .clone()
+            .downcast::<Placement>()
+            .expect("the resource is the placement");
+        assert_eq!(placement.image.id, 9);
+
+        let (request, done) = decoder.next().await;
+        assert_eq!(request.data, pixels, "the file's bytes reach the decoder");
+        assert_eq!(
+            (
+                request.format,
+                request.compression,
+                request.width,
+                request.height
+            ),
+            (Format::Rgb, Compression::None, 2, 1)
+        );
+        done(decode_packed(&request));
+
+        let received = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=9;OK\x1b\\\x1b[?62;c",
+            "the transmit's OK precedes DA1's answer"
+        );
+        let ready = placement.pixels().expect("the record is ready");
+        assert_eq!(
+            &ready.rgba[..],
+            [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]
+        );
+        assert!(file.path().exists(), "t=f leaves the file alone");
+    }
+
+    /// Without the server's opt-in a loopback peer is refused local media
+    /// before the filesystem is looked at: the temporary file a `t=t` would
+    /// delete is still there, and nothing is decoded.
+    #[tokio::test]
+    async fn a_loopback_peer_without_the_opt_in_is_refused_local_media() {
+        use smudgy_protocol::graphics::encode_payload;
+        let file = tempfile::Builder::new()
+            .prefix("tty-graphics-protocol-")
+            .suffix(".rgb")
+            .tempfile()
+            .expect("temp file");
+        std::fs::write(file.path(), [1, 2, 3, 4, 5, 6]).expect("write the pixels");
+        let commands = format!(
+            "\x1b_Ga=T,t=t,f=24,s=2,v=1,i=11;{}\x1b\\\x1b[c",
+            encode_payload(file.path().to_str().expect("a UTF-8 path").as_bytes())
+        )
+        .into_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(graphics_exchange(listener, commands));
+        let decoder = Arc::new(GateDecoder::default());
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(decoder.clone());
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        let received = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=11;EBADF:Failed to read image file\x1b\\\x1b[?62;c",
+            "refused without the opt-in, then DA1"
+        );
+        assert!(file.path().exists(), "the file was never touched");
+        assert!(
+            decoder.held.lock().unwrap().is_empty(),
+            "nothing was decoded"
+        );
+    }
+
+    /// A local-media query for a file that is not there answers the one
+    /// `EBADF` every local-media failure gets.
+    #[tokio::test]
+    async fn a_local_media_query_for_a_missing_file_answers_ebadf() {
+        use smudgy_protocol::graphics::encode_payload;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("tty-graphics-protocol-missing.rgb");
+        let commands = format!(
+            "\x1b_Ga=q,t=f,f=24,s=2,v=1,i=10;{}\x1b\\\x1b[c",
+            encode_payload(missing.to_str().expect("a UTF-8 path").as_bytes())
+        )
+        .into_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(graphics_exchange(listener, commands));
+        let decoder = Arc::new(GateDecoder::default());
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.set_graphics_mode(smudgy_protocol::graphics::GraphicsMode::Full);
+        connection.set_graphics_decoder(decoder.clone());
+        connection.set_graphics_local_files(true);
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            InboundCompression::ALL,
+            TlsMode::Off,
+        );
+        expect_connected(&mut runtime_rx).await;
+        let received = server.await.expect("server task");
+        assert_eq!(
+            received, b"\x1b_Gi=10;EBADF:Failed to read image file\x1b\\\x1b[?62;c",
+            "the failed read answers EBADF, then DA1"
+        );
+        assert!(
+            decoder.held.lock().unwrap().is_empty(),
+            "nothing was decoded"
+        );
     }
 }

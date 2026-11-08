@@ -1,6 +1,7 @@
 mod canvas;
 mod extension;
 mod image_store;
+mod kitty;
 mod map;
 mod shader_budget;
 mod text_editor;
@@ -15,6 +16,7 @@ pub use smudgy_session_model::native_callback::CallbackLease as WidgetCallback;
 pub use image_store::{
     DecodedImage, EntryState, FetchError, FileStamp, ImageEntryCell, ImageFetcher, ImageStore,
 };
+pub use kitty::with_image_store_context;
 pub use map::{MapReapGuard, MapReaper, MapStore, MapWidgetId, with_store_context};
 pub use text_editor::{TextEditorStore, with_text_store_context};
 pub use widget::WidgetMessage;

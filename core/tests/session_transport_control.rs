@@ -142,6 +142,7 @@ fn prepare(id: u32) -> Arc<SessionParams> {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })
 }
 
@@ -168,6 +169,8 @@ fn connect_action(port: u16, tls: TlsMode) -> RuntimeAction {
         encoding: None,
         compression: InboundCompression::NONE,
         tls,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     }
 }
 

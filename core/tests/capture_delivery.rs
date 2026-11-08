@@ -123,6 +123,7 @@ async fn functions_scripts_and_templates_preserve_capture_delivery() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     })));
     let mut tx = None;
     let mut transcript = Vec::new();

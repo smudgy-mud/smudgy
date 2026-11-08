@@ -14,7 +14,7 @@ use crate::i18n::{t, ts};
 use crate::theme::Element;
 use crate::theme::builtins;
 
-use smudgy_core::models::server::{ServerCas, ServerConfig, parse_wss_address};
+use smudgy_core::models::server::{GraphicsMode, ServerCas, ServerConfig, parse_wss_address};
 use smudgy_session_model::connect::OpenSessions;
 
 use super::{
@@ -68,6 +68,27 @@ const ENCODING_CHOICES: [EncodingChoice; 15] = [
 fn form_encoding_to_config(choice: &str) -> Option<String> {
     (choice != DEFAULT_ENCODING_CHOICE).then(|| choice.to_string())
 }
+
+/// One entry in the terminal-graphics dropdown, labelled in the active locale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphicsChoice(GraphicsMode);
+
+impl fmt::Display for GraphicsChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            GraphicsMode::Full => ts!("server-graphics-full"),
+            GraphicsMode::DisplayOnly => ts!("server-graphics-display-only"),
+            GraphicsMode::Off => ts!("server-graphics-off"),
+        })
+    }
+}
+
+/// Every graphics mode, most capable first.
+const GRAPHICS_CHOICES: [GraphicsChoice; 3] = [
+    GraphicsChoice(GraphicsMode::Full),
+    GraphicsChoice(GraphicsMode::DisplayOnly),
+    GraphicsChoice(GraphicsMode::Off),
+];
 
 /// The independent inbound-compression checkboxes for the server form.
 fn compression_field(state: &State) -> Element<'_, Message> {
@@ -135,6 +156,49 @@ fn encoding_field(state: &State) -> Element<'_, Message> {
     ]
     .spacing(4)
     .into()
+}
+
+/// The `Terminal graphics` field for the server form: a dropdown over
+/// [`GRAPHICS_CHOICES`] with one line on when to step down from `Full`, then
+/// the "Local image files" checkbox while graphics are on at all.
+fn graphics_field(state: &State) -> Element<'_, Message> {
+    let mut col = column![
+        text(t!("server-graphics"))
+            .size(13)
+            .style(builtins::text::muted),
+        pick_list(
+            &GRAPHICS_CHOICES[..],
+            Some(GraphicsChoice(state.server_form_data.graphics)),
+            |choice: GraphicsChoice| Message::UpdateServerGraphics(choice.0),
+        )
+        .width(Length::Fixed(220.0)),
+        text(t!("server-graphics-help"))
+            .size(12)
+            .style(builtins::text::muted),
+    ]
+    .spacing(4);
+    if shows_graphics_local_files(state) {
+        col = col.push(
+            column![
+                checkbox(state.server_form_data.graphics_local_files)
+                    .label(t!("server-graphics-local-files"))
+                    .on_toggle(Message::ToggleServerGraphicsLocalFiles)
+                    .size(16),
+                text(t!("server-graphics-local-files-help"))
+                    .size(12)
+                    .style(builtins::text::muted),
+            ]
+            .spacing(2)
+            .padding(iced::Padding::default().top(4.0)),
+        );
+    }
+    col.into()
+}
+
+/// Whether the form offers the "Local image files" checkbox: only while the
+/// graphics mode lets images through. Hiding it leaves the choice as it was.
+pub(super) fn shows_graphics_local_files(state: &State) -> bool {
+    state.server_form_data.graphics != GraphicsMode::Off
 }
 
 // --- Server CRUD Async Wrappers ---
@@ -265,6 +329,8 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             let mut config = ServerConfig::new(host, port);
             config.wss_url = wss_url;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
+            config.graphics = state.server_form_data.graphics;
+            config.graphics_local_files = state.server_form_data.graphics_local_files;
             config.compression = state.server_form_data.compression;
             config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
             config.tls = config.wss_url.is_some() || state.server_form_data.tls;
@@ -316,6 +382,8 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             config.port = port;
             config.wss_url = wss_url;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
+            config.graphics = state.server_form_data.graphics;
+            config.graphics_local_files = state.server_form_data.graphics_local_files;
             config.compression = state.server_form_data.compression;
             config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
             config.tls = config.wss_url.is_some() || state.server_form_data.tls;
@@ -467,6 +535,7 @@ pub(super) fn view_server_form<'a>(
                         port_field
                     },
                     encoding_field(state),
+                    graphics_field(state),
                     compression_field(state),
                     tls_field(state),
                     server_error(state),
@@ -544,6 +613,7 @@ pub(super) fn view_server_form<'a>(
                         port_field
                     },
                     encoding_field(state),
+                    graphics_field(state),
                     compression_field(state),
                     tls_field(state),
                     server_error(state),

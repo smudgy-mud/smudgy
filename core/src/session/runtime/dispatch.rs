@@ -462,6 +462,8 @@ impl Inner<'_> {
                 encoding,
                 compression,
                 tls,
+                graphics,
+                graphics_local_files,
             } => {
                 // Every `Connect` is the daemon acting on online intent — the
                 // user's Connect, a session restored online, or the answer to
@@ -528,9 +530,15 @@ impl Inner<'_> {
                     self.ui_tx.clone(),
                     self.trigger_manager.raw_wanted_flag(),
                     self.window_size.clone(),
+                    self.cell_size.clone(),
                     connection_generation,
                 );
                 connection.set_marker_armed_flag(self.send_on_connect_armed.clone());
+                connection.set_graphics_mode(graphics);
+                connection.set_graphics_local_files(graphics_local_files);
+                if let Some(decoder) = &self.graphics_decoder {
+                    connection.set_graphics_decoder(decoder.clone());
+                }
 
                 // Resolve the configured encoding label; an unresolvable one falls back
                 // to UTF-8 loudly — in the session view, not just the log, since the
@@ -1856,11 +1864,21 @@ impl Inner<'_> {
                     Ok(ActionResult::None)
                 }
             }
-            RuntimeAction::WindowSizeChanged { cols, rows } => {
+            RuntimeAction::WindowSizeChanged {
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+            } => {
                 // Store first, then wake: the socket task re-reads the cell on the
                 // wakeup, so it can never observe the wakeup without the new value,
                 // and it decides in write order whether NAWS is negotiated and a
-                // report is due.
+                // report is due. The cell size has no wakeup of its own: nothing
+                // is sent for it unasked, and a size query reads it live.
+                self.cell_size.store(
+                    crate::session::connection::responders::pack_dims(cell_width, cell_height),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.window_size.store(
                     crate::session::connection::responders::pack_dims(cols, rows),
                     std::sync::atomic::Ordering::Relaxed,

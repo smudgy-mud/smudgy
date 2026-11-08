@@ -26,6 +26,7 @@ use crate::{connect_manager, wire::SessionUpdate};
 use smudgy_ui_shared::hide_flight;
 use smudgy_ui_shared::layout_menu;
 use smudgy_ui_shared::pane_provenance::{self, PaneCreator};
+use smudgy_ui_shared::split_terminal_pane::GridReport;
 use smudgy_ui_shared::{
     assets::GEIST,
     bounds_probe::BoundsProbe,
@@ -1390,8 +1391,9 @@ pub fn view<'a>(
                                 ui.grid_change.as_ref().map(|handler| {
                                     let handler = Rc::clone(handler);
                                     let id = member.id;
-                                    Rc::new(move |columns, rows| handler(id, columns, rows))
-                                        as Rc<dyn Fn(u16, u16)>
+                                    Rc::new(move |report: GridReport| {
+                                        handler(id, report.cols, report.rows)
+                                    }) as Rc<dyn Fn(GridReport)>
                                 }),
                                 None,
                                 ScrolledLayout::SplitWithLiveTail,

@@ -43,6 +43,7 @@ mod discord_presence;
 mod frame_probe;
 mod i18n;
 mod images;
+pub use images::image_store;
 mod package_requirements;
 mod package_update_checker;
 mod pane_drag;

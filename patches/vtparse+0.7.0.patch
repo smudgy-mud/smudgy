@@ -1,8 +1,8 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index dd90002c..3d21a8d3 100644
+index dd90002c..0779fb1d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -177,6 +177,11 @@ pub trait VTActor {
+@@ -177,10 +177,27 @@ pub trait VTActor {
      /// system command.
      fn osc_dispatch(&mut self, params: &[&[u8]]);
  
@@ -11,10 +11,26 @@ index dd90002c..3d21a8d3 100644
 +    /// state that an incomplete OSC string must not leave active.
 +    fn osc_dispatch_truncated(&mut self, _params: &[&[u8]]) {}
 +
++    /// Called when an APC string begins (`ESC _`), before any of its bytes
++    /// are stored, so an implementation that mirrors the byte stream
++    /// elsewhere can note where the string started.
++    fn apc_start(&mut self) {}
++
      /// Called when an APC string is terminated by ST
      /// `data` is the data contained within the APC sequence.
      #[cfg(any(feature = "std", feature = "alloc"))]
-@@ -311,6 +316,8 @@ impl VTActor for CollectingVTActor {
+     fn apc_dispatch(&mut self, data: Vec<u8>);
++
++    /// Called instead of [`VTActor::apc_dispatch`] when the APC string exceeded
++    /// the parser's bounded storage. `prefix` is the stored leading portion, so
++    /// implementations can tell which protocol the oversized string belonged
++    /// to and discard any state it must not leave half-applied.
++    #[cfg(any(feature = "std", feature = "alloc"))]
++    fn apc_dispatch_truncated(&mut self, _prefix: &[u8]) {}
+ }
+ 
+ /// `VTAction` is an alternative way to work with the parser; rather
+@@ -311,6 +328,8 @@ impl VTActor for CollectingVTActor {
  const MAX_INTERMEDIATES: usize = 2;
  const MAX_OSC: usize = 64;
  const MAX_PARAMS: usize = 32;
@@ -23,7 +39,7 @@ index dd90002c..3d21a8d3 100644
  
  struct OscState {
      #[cfg(any(feature = "std", feature = "alloc"))]
-@@ -319,41 +326,52 @@ struct OscState {
+@@ -319,41 +338,52 @@ struct OscState {
      buffer: heapless::Vec<u8, { MAX_OSC * 16 }>,
      param_indices: [usize; MAX_OSC],
      num_params: usize,
@@ -102,7 +118,7 @@ index dd90002c..3d21a8d3 100644
      }
  }
  
-@@ -373,6 +391,8 @@ pub struct VTParser {
+@@ -373,6 +403,8 @@ pub struct VTParser {
      params_full: bool,
      #[cfg(any(feature = "std", feature = "alloc"))]
      apc_data: Vec<u8>,
@@ -111,7 +127,7 @@ index dd90002c..3d21a8d3 100644
  
      utf8_parser: Utf8Parser,
      utf8_return_state: State,
-@@ -449,7 +469,9 @@ impl VTParser {
+@@ -449,7 +481,9 @@ impl VTParser {
                  buffer: Vec::new(),
                  param_indices,
                  num_params: 0,
@@ -122,7 +138,7 @@ index dd90002c..3d21a8d3 100644
              },
  
              params: Default::default(),
-@@ -460,6 +482,8 @@ impl VTParser {
+@@ -460,6 +494,8 @@ impl VTParser {
              utf8_parser: Utf8Parser::new(),
              #[cfg(any(feature = "std", feature = "alloc"))]
              apc_data: Vec::new(),
@@ -131,7 +147,7 @@ index dd90002c..3d21a8d3 100644
          }
      }
  
-@@ -519,7 +543,11 @@ impl VTParser {
+@@ -519,7 +555,11 @@ impl VTParser {
                  self.num_intermediates = 0;
                  self.ignored_excess_intermediates = false;
                  self.osc.num_params = 0;
@@ -144,7 +160,7 @@ index dd90002c..3d21a8d3 100644
                  self.num_params = 0;
                  self.params_full = false;
                  self.current_param.take();
-@@ -605,7 +633,11 @@ impl VTParser {
+@@ -605,7 +645,11 @@ impl VTParser {
                  #[cfg(any(feature = "std", feature = "alloc"))]
                  self.osc.buffer.shrink_to_fit();
                  self.osc.num_params = 0;
@@ -157,7 +173,7 @@ index dd90002c..3d21a8d3 100644
              }
              Action::OscPut => self.osc.put(param as char),
  
-@@ -625,7 +657,11 @@ impl VTParser {
+@@ -625,24 +669,43 @@ impl VTParser {
                          offset = self.osc.param_indices[i];
                      }
                      params[limit - 1] = slice;
@@ -170,7 +186,9 @@ index dd90002c..3d21a8d3 100644
                  }
              }
  
-@@ -634,15 +670,26 @@ impl VTParser {
+             Action::ApcStart => {
++                actor.apc_start();
+                 #[cfg(any(feature = "std", feature = "alloc"))]
                  {
                      self.apc_data.clear();
                      self.apc_data.shrink_to_fit();
@@ -192,14 +210,74 @@ index dd90002c..3d21a8d3 100644
                  #[cfg(any(feature = "std", feature = "alloc"))]
 -                actor.apc_dispatch(core::mem::take(&mut self.apc_data));
 +                {
-+                    if !self.apc_full {
++                    if self.apc_full {
++                        actor.apc_dispatch_truncated(&self.apc_data);
++                        self.apc_data.clear();
++                    } else {
 +                        actor.apc_dispatch(core::mem::take(&mut self.apc_data));
 +                    }
 +                }
              }
  
              Action::Utf8 => self.next_utf8(actor, param),
-@@ -841,12 +888,47 @@ mod test {
+@@ -660,6 +723,7 @@ impl VTParser {
+     fn next_utf8(&mut self, actor: &mut dyn VTActor, byte: u8) {
+         struct Decoder {
+             codepoint: Option<char>,
++            invalid: bool,
+         }
+ 
+         impl utf8parse::Receiver for Decoder {
+@@ -668,11 +732,15 @@ impl VTParser {
+             }
+ 
+             fn invalid_sequence(&mut self) {
++                self.invalid = true;
+                 self.codepoint(char::REPLACEMENT_CHARACTER);
+             }
+         }
+ 
+-        let mut decoder = Decoder { codepoint: None };
++        let mut decoder = Decoder {
++            codepoint: None,
++            invalid: false,
++        };
+ 
+         self.utf8_parser.advance(&mut decoder, byte);
+         if let Some(c) = decoder.codepoint {
+@@ -704,9 +772,31 @@ impl VTParser {
+                 state => panic!("unreachable state {:?}", state),
+             };
+             self.state = self.utf8_return_state;
++
++            // A byte that cannot continue a sequence (one outside
++            // 0x80..=0xbf) cut the sequence short: the replacement
++            // character stands for the truncated sequence alone, and the
++            // byte is parsed again as the fresh byte it is, so an ESC
++            // begins its sequence and text prints (Unicode's "maximal
++            // subpart" practice). The utf-8 parser consumed the byte and is
++            // back in its ground state, as is this parser, so parsing it
++            // afresh cannot come back here with the same byte.
++            if decoder.invalid && byte & 0xc0 != 0x80 {
++                self.parse_cut_short(byte, actor);
++            }
+         }
+     }
+ 
++    /// Parse afresh the byte that cut a utf-8 sequence short (see
++    /// [`Self::next_utf8`]). Out of line: [`Self::parse_byte`] is always
++    /// inlined, and the whole state machine must not land in the path
++    /// every multi-byte character takes.
++    #[cold]
++    #[inline(never)]
++    fn parse_cut_short(&mut self, byte: u8, actor: &mut dyn VTActor) {
++        self.parse_byte(byte, actor);
++    }
++
+     /// Parse a single byte.  This may result in a call to one of the
+     /// methods on the provided `actor`.
+     #[inline(always)]
+@@ -841,12 +931,47 @@ mod test {
          match &actions[0] {
              VTAction::OscDispatch(parsed_fields) => {
                  let fields: Vec<_> = fields.into_iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -247,4 +325,67 @@ index dd90002c..3d21a8d3 100644
 +
      #[test]
      fn test_osc_with_no_params() {
+         assert_eq!(
+@@ -1046,6 +1171,62 @@ mod test {
+         );
+     }
+ 
++    #[test]
++    fn a_byte_cutting_a_utf8_sequence_short_is_parsed_afresh() {
++        // An ESC after a lone lead byte begins its sequence.
++        assert_eq!(
++            parse_as_vec(b"\xe3\x1b[31m"),
++            vec![
++                VTAction::Print('\u{fffd}'),
++                VTAction::CsiDispatch {
++                    params: vec![CsiParam::Integer(31)],
++                    parameters_truncated: false,
++                    byte: b'm',
++                }
++            ]
++        );
++        // So does one after a sequence two bytes in, and ASCII prints.
++        assert_eq!(
++            parse_as_vec(b"\xf0\x9f\x1b_x\x1b\\\xe3\x81a"),
++            vec![
++                VTAction::Print('\u{fffd}'),
++                VTAction::ApcDispatch(b"x".to_vec()),
++                VTAction::EscDispatch {
++                    params: vec![],
++                    intermediates: vec![],
++                    ignored_excess_intermediates: false,
++                    byte: b'\\',
++                },
++                VTAction::Print('\u{fffd}'),
++                VTAction::Print('a'),
++            ]
++        );
++        // A lead byte cutting a sequence short begins its own.
++        assert_eq!(
++            parse_as_vec(b"\xe3\xe3\x81\x82"),
++            vec![VTAction::Print('\u{fffd}'), VTAction::Print('\u{3042}')]
++        );
++        // A continuation byte the sequence cannot take is still dropped
++        // with it.
++        assert_eq!(
++            parse_as_vec(b"\xe0\x80a"),
++            vec![VTAction::Print('\u{fffd}'), VTAction::Print('a')]
++        );
++        // Inside an OSC string the same ESC ends the string.
++        assert_eq!(
++            parse_as_vec(b"\x1b]0;\xe3\x1b\\"),
++            vec![
++                VTAction::OscDispatch(vec![b"0".to_vec(), "\u{fffd}".as_bytes().to_vec()]),
++                VTAction::EscDispatch {
++                    params: vec![],
++                    intermediates: vec![],
++                    ignored_excess_intermediates: false,
++                    byte: b'\\',
++                },
++            ]
++        );
++    }
++
+     #[test]
+     fn tmux_control() {
          assert_eq!(

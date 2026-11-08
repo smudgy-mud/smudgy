@@ -19,6 +19,8 @@ smudgy_cloud = { workspace = true }
 smudgy_theme = { workspace = true }
 smudgy_ui_shared = { workspace = true }
 smudgy_session_model = { workspace = true }
+# Kitty graphics decode requests and results (ui/src/images/graphics.rs).
+smudgy_protocol = { workspace = true }
 smudgy_map_widget = { workspace = true }
 smudgy_palette = { workspace = true }
 smudgy_i18n = { workspace = true, features = ["all-locales"] }

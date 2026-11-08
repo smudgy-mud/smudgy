@@ -197,6 +197,7 @@ async fn a_secret_reads_as_an_area_in_scripts() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
     let mut lines = Vec::new();

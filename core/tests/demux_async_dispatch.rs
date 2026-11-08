@@ -86,6 +86,7 @@ async fn alias_scheduled_promise_chain_drains_under_demux() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

@@ -138,6 +138,7 @@ async fn speedwalk_direct_send_burst_does_not_stall_the_runtime() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn_with_package_provider(params, factory_for(package)));
     let tx = loop {

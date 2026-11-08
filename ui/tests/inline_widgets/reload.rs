@@ -1,5 +1,6 @@
 //! Native resources and retained UI state across isolate generations.
 use super::*;
+use smudgy_ui_shared::inline_object::ObjectMetrics;
 
 #[tokio::test]
 // Keep creation, retained UI state, reload and shutdown in one ordered scenario.
@@ -53,7 +54,7 @@ echo(button);createWidget("retained",button);echo("CALLBACK_READY:{generation}")
     let sender = sender.unwrap();
     let old_line = current.take().unwrap();
     let object = &old_line.objects.as_ref().unwrap()[0];
-    let mut old_tree = smudgy_widgets::inline_element(object).unwrap();
+    let mut old_tree = smudgy_widgets::inline_element(object, &ObjectMetrics::default()).unwrap();
     let queued = click_button(&mut old_tree);
     let retained_root = root.view(
         |_| true,
@@ -84,12 +85,15 @@ echo(button);createWidget("retained",button);echo("CALLBACK_READY:{generation}")
         }
     }
     assert!(!object.owner.active());
-    assert!(smudgy_widgets::inline_element(object).is_none());
+    assert!(smudgy_widgets::inline_element(object, &ObjectMetrics::default()).is_none());
     // A tree already handed to iced can still emit a press after retirement.
     let late = click_button(&mut old_tree);
     let current = current.unwrap();
-    let mut live_tree =
-        smudgy_widgets::inline_element(&current.objects.as_ref().unwrap()[0]).unwrap();
+    let mut live_tree = smudgy_widgets::inline_element(
+        &current.objects.as_ref().unwrap()[0],
+        &ObjectMetrics::default(),
+    )
+    .unwrap();
     for message in [queued, late, click_button(&mut live_tree)] {
         let smudgy_widgets::WidgetMessage::InvokeCallback {
             callback,

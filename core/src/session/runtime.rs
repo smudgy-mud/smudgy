@@ -111,7 +111,7 @@ use crate::session::{
 
 use super::{
     SessionId, TaggedSessionEvent,
-    connection::Connection,
+    connection::{Connection, GraphicsDecoder},
     styled_line::{AppLink, LineFragments, LinkAction, StyledLine},
 };
 
@@ -1609,6 +1609,8 @@ impl Runtime {
         ui_tx: Sender<TaggedSessionEvent>,
         ui_commands: Option<UiCommandBus>,
     ) -> Self {
+        // The compatibility constructor keeps its signature, so it has no graphics
+        // decoder to hand on; `SessionParams` carries one through `try_new`.
         Self::try_new(
             session_id,
             server_name,
@@ -1619,6 +1621,7 @@ impl Runtime {
             package_provider_override,
             extra_script_extensions,
             on_engine_rebuild,
+            None,
             audio_scope,
             ui_tx,
             ui_commands,
@@ -1643,6 +1646,9 @@ impl Runtime {
         // Embedder reset for engine-generation-coupled state (see `EngineResetHook`), invoked
         // on the session thread before every `ScriptEngine::new` below.
         on_engine_rebuild: Option<crate::session::EngineResetHook>,
+        // The embedder's terminal graphics decoder, handed to every connection; `None`
+        // parses graphics commands and drops them.
+        graphics_decoder: Option<Arc<dyn GraphicsDecoder>>,
         // Opaque application/session Web Audio authority. `None` preserves the
         // legacy no-audio runtime even when the feature is compiled.
         audio_scope: Option<crate::session::RuntimeAudioScope>,
@@ -1933,6 +1939,8 @@ impl Runtime {
                         super::connection::responders::DEFAULT_DIMS.1,
                     ),
                 )),
+                cell_size: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                graphics_decoder: graphics_decoder.clone(),
                 pending_buffer_updates: Vec::new(),
                 pending_line_operations: pending_line_operations.clone(),
                 ledger: {
@@ -2048,6 +2056,7 @@ impl Runtime {
                 // surviving connection's socket task was seeded from this cell, and
                 // the UI only re-reports on actual grid changes.
                 let old_window_size = inner.window_size.clone();
+                let old_cell_size = inner.cell_size.clone();
                 // The surviving connection's VtProcessor holds a clone of the OLD
                 // manager's raw-wanted flag; the new manager must keep writing to
                 // that same cell or raw capture goes dead across a reload.
@@ -2142,6 +2151,7 @@ impl Runtime {
                         old_pending_send_on_connect,
                         old_send_on_connect_armed,
                         old_window_size,
+                        old_cell_size,
                         old_raw_wanted,
                         old_gmcp,
                         old_msdp,
@@ -2350,6 +2360,8 @@ impl Runtime {
                     pending_send_on_connect: old_pending_send_on_connect,
                     send_on_connect_armed: old_send_on_connect_armed,
                     window_size: old_window_size,
+                    cell_size: old_cell_size,
+                    graphics_decoder: graphics_decoder.clone(),
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
                     ledger: old_ledger, // Count + recent-lines ring + open row survive reload
@@ -2691,6 +2703,15 @@ struct Inner<'a> {
     /// session creates, so a connect after a resize seeds its NAWS responder with
     /// the real size. Session-lifetime (survives reloads, like the connection).
     window_size: Arc<std::sync::atomic::AtomicU32>,
+    /// The main pane's cell size in fixed point (see
+    /// `RuntimeAction::WindowSizeChanged`), packed like `window_size` and
+    /// updated by the same action. Read by the connection's VT processor to
+    /// lay placements out and when a server asks for pixel sizes.
+    /// Session-lifetime, like the grid.
+    cell_size: Arc<std::sync::atomic::AtomicU32>,
+    /// The embedder's terminal graphics decoder, handed to each [`Connection`]
+    /// at `Connect`. Session-lifetime, from `SessionParams`.
+    graphics_decoder: Option<Arc<dyn GraphicsDecoder>>,
     pending_buffer_updates: Vec<BufferUpdate>,
     /// Registered hotkeys: the isolate that runs the action, the action, and the state
     /// exposures bound for it (`None` for the common no-exposure case).

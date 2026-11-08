@@ -904,6 +904,8 @@ fn connect_action_from_snapshot(
             server.config.tls,
             server.config.tls_verify,
         ),
+        graphics: server.config.graphics,
+        graphics_local_files: server.config.graphics_local_files,
     }
 }
 

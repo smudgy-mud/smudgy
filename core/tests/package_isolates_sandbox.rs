@@ -489,6 +489,7 @@ async fn run_scenario_inner(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = {
@@ -999,6 +1000,7 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut sibling_events = Box::pin(
         smudgy_core::session::spawn_with_audio(sibling_params, sibling_registration.scope())
@@ -1067,6 +1069,7 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: Some(Arc::clone(&on_engine_rebuild)),
+        graphics_decoder: None,
     });
     let mut reload_events = Box::pin(
         spawn_with_package_provider_and_audio(reload_params, package_factory, reload_scope.clone())
@@ -1573,6 +1576,7 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut sibling_events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = Box::pin(
         smudgy_core::session::spawn_with_audio(sibling_params, sibling_scope.clone())
@@ -1640,6 +1644,7 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: Some(Arc::clone(&on_engine_rebuild)),
+        graphics_decoder: None,
     });
     let mut target_events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = Box::pin(
         spawn_with_package_provider_and_audio(target_params, package_factory, target_scope.clone())
@@ -2317,6 +2322,7 @@ async fn run_with_factory(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn_with_package_provider(params, factory));

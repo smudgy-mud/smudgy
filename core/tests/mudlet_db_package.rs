@@ -237,6 +237,7 @@ async fn drive_session(
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let started = Instant::now();

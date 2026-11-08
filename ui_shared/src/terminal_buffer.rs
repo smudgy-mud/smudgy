@@ -2768,6 +2768,60 @@ mod tests {
         Arc::new(StyledLine::new(s, Vec::<VtSpan>::new()))
     }
 
+    /// An object the socket thread attached to a partial line keeps its id —
+    /// and so its `(row, id)` mount key in the inline-object host — when the
+    /// completion fragment glues onto the open row and when a transformed
+    /// completion replaces the row with the joined whole.
+    #[test]
+    fn an_open_row_s_object_keeps_its_id_through_extension_and_replacement() {
+        use smudgy_session_model::inline_content::{InlineObject, InlineOwner};
+        let object_line = |text: &str, id: Option<u64>| {
+            let mut line = StyledLine::new(text, Vec::<VtSpan>::new());
+            let mut object = InlineObject::new(3..6, Arc::new(()), InlineOwner::default());
+            if let Some(id) = id {
+                object.id = id;
+            }
+            line.objects = Some(Arc::new(vec![object]));
+            Arc::new(line)
+        };
+        let last = |buffer: &TerminalBuffer| {
+            let (number, line) = buffer.iter_rev_with_line_number(None).next().unwrap();
+            let objects = line.styled_line.objects.as_ref().unwrap();
+            (
+                number,
+                line.styled_line.text.clone(),
+                objects[0].id,
+                objects[0].range.clone(),
+            )
+        };
+        let mut buffer = TerminalBuffer::new();
+        let partial = object_line("abc   def", None);
+        let id = partial.objects.as_ref().unwrap()[0].id;
+        buffer.extend_line(partial);
+        assert!(buffer.has_inline_objects());
+        assert_eq!(last(&buffer), (1, "abc   def".into(), id, 3..6));
+
+        // The completion fragment glues on: same row, same object, same id.
+        buffer.extend_line(sl("ghi"));
+        assert_eq!(last(&buffer), (1, "abc   defghi".into(), id, 3..6));
+        assert!(buffer.has_inline_objects());
+
+        // A transformed completion replaces the open row with the joined
+        // whole; the row number is reused, so the mount key is unchanged.
+        buffer.begin_open_line_replacement();
+        assert!(
+            !buffer.has_inline_objects(),
+            "the detached row leaves the index"
+        );
+        buffer.finish_open_line_replacement(Some(object_line("abc   def!", Some(id))));
+        assert_eq!(last(&buffer), (1, "abc   def!".into(), id, 3..6));
+        assert!(buffer.has_inline_objects());
+        buffer.commit_current_line();
+        buffer.extend_line(sl("next"));
+        assert_eq!(buffer.last_line_number(), 2);
+        assert!(buffer.has_inline_objects(), "row 1 keeps its object");
+    }
+
     mod system_rows {
         use super::*;
         use smudgy_session_model::{AppLink, Progress, SystemText};

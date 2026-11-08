@@ -190,6 +190,7 @@ async fn merge_areas_folds_sources_into_the_destination() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

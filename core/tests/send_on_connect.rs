@@ -99,6 +99,7 @@ async fn profile_text_waits_for_first_processed_display_packet() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
 
@@ -134,6 +135,8 @@ async fn profile_text_waits_for_first_processed_display_packet() {
         encoding: None,
         compression: InboundCompression::NONE,
         tls: TlsMode::Off,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     })
     .expect("connect session");
 
@@ -208,6 +211,7 @@ async fn replaced_sockets_late_disconnected_keeps_the_new_pending_send() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
     let mut events = Box::pin(spawn(params));
 
@@ -231,6 +235,8 @@ async fn replaced_sockets_late_disconnected_keeps_the_new_pending_send() {
         encoding: None,
         compression: InboundCompression::NONE,
         tls: TlsMode::Off,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     })
     .expect("connect first socket");
     loop {
@@ -254,6 +260,8 @@ async fn replaced_sockets_late_disconnected_keeps_the_new_pending_send() {
         encoding: None,
         compression: InboundCompression::NONE,
         tls: TlsMode::Off,
+        graphics: smudgy_core::models::server::GraphicsMode::default(),
+        graphics_local_files: false,
     })
     .expect("connect second socket");
 

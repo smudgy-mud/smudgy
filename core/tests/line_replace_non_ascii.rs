@@ -66,6 +66,7 @@ async fn line_replace_uses_utf8_byte_offsets_after_multibyte_prefix() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

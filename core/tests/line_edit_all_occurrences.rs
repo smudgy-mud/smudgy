@@ -97,6 +97,7 @@ async fn line_text_search_edits_apply_to_every_occurrence() {
         package_client: None,
         extra_script_extensions: Arc::new(Vec::new),
         on_engine_rebuild: None,
+        graphics_decoder: None,
     });
 
     let mut events = Box::pin(spawn(params));

@@ -103,6 +103,7 @@ impl LiveSession {
             package_client: None,
             extra_script_extensions: Arc::new(Vec::new),
             on_engine_rebuild: None,
+            graphics_decoder: None,
         });
         let events: Pin<Box<dyn Stream<Item = TaggedSessionEvent>>> = match provider {
             Some(provider) => Box::pin(spawn_with_package_provider(params, provider)),
